@@ -56,6 +56,46 @@ people the most time. Consequences:
 
 ---
 
+## Tested environment / version requirements
+
+Verified on the configuration below. It is **not tightly version-locked** — the
+real requirement is simply an L4T install that provides the `nvv4l2camerasrc`,
+`nvvidconv`, and `nvjpegenc` GStreamer elements plus a working camera driver — but
+this is the exact stack it was developed and validated against.
+
+| Component | Tested version | How to check on your board |
+|---|---|---|
+| Board | Jetson Orin Nano Developer Kit | — |
+| JetPack | **6.2** (L4T **R36.4.3**, kernel **5.15.148-tegra**) | `cat /etc/nv_tegra_release` |
+| OS | Ubuntu **22.04** (jammy), arm64 | `lsb_release -a` |
+| Python | **3.10** | `python3 --version` |
+| GStreamer | **1.20.3** | `gst-launch-1.0 --version` |
+| Flask | **2.0.1** (`python3-flask`) | `python3 -c "import flask; print(flask.__version__)"` |
+| v4l-utils | **1.22.1** | `v4l2-ctl --version` |
+| Camera | Arducam **B0577** dual global-shutter (2.3 MP × 2, onboard ISP) | `v4l2-ctl --list-formats-ext` |
+| Arducam driver | `arducam-nvidia-l4t-kernel` **5.15.148-tegra-36.4.3-20250205154721** | `dpkg -l \| grep -i arducam` |
+
+**Notes**
+
+- **JetPack/L4T:** R36.4 ships GStreamer 1.20 and the NVIDIA multimedia elements
+  this project depends on. Older L4T (e.g. R35.x / JetPack 5) also has them but is
+  untested here. The camera driver **must match your JetPack version** — install
+  the Arducam release built for your exact JetPack (see below).
+- **CUDA / cuDNN / TensorRT** are part of JetPack (12.6 / 9.3 / 10.3 on this build)
+  but are **not used** by this project — no GPU compute is involved, only the VIC
+  and the NVJPG hardware JPEG engine. You don't need them for recording.
+- **Arducam driver:** the B0577 needs Arducam's kernel driver + device-tree overlay
+  installed *before* this will see the camera. Follow Arducam's instructions for the
+  B0577 on your JetPack version, then confirm the camera enumerates with
+  `v4l2-ctl --list-formats-ext` (you should see `UYVY 3840x1200`).
+- **Kernel pinning (important):** the Arducam driver here is a *kernel package*
+  (`arducam-nvidia-l4t-kernel`) built for the exact kernel **5.15.148-tegra /
+  L4T 36.4.3**. Do **not** `apt upgrade` the kernel without installing a matching
+  Arducam build, or the camera will stop enumerating after reboot. Pin/hold the
+  kernel, or upgrade kernel + Arducam driver together as a set.
+
+---
+
 ## Install
 
 ```bash
