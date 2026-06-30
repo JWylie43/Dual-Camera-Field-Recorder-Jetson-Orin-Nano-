@@ -1,0 +1,16 @@
+# Recordings and logs (never commit captured video)
+*.mkv
+*.avi
+*.raw
+*.yuv
+*.tegrastats.log
+thermal_*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
