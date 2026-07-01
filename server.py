@@ -3,7 +3,7 @@
 server.py - Web control panel for record.py (Jetson Orin Nano camera rig)
 
 Mobile-friendly LAN page: live camera preview, Start/Stop, status, live thermal
-readout, and an optional thermal-log toggle. Drives the existing record.py.
+readout, calibration snapshots, and an optional thermal-log toggle. Drives record.py.
 
   START -> stop idle preview, launch `record.py --preview-port <P> ...`
   STOP  -> SIGINT the recorder (clean EOS), then restart idle preview
@@ -45,6 +45,7 @@ PREVIEW_TCP = 8090            # local port the gst preview pipeline serves on
 PREVIEW_BOUNDARY = "spinframe"  # MUST match record.py
 PREVIEW_W, PREVIEW_H = 1280, 400
 SETTLE = 0.6                  # seconds to let the camera/port free during a swap
+CALIB_DIR = os.path.join(OUTPUT_DIR, "calib")  # calibration snapshots land here
 
 app = Flask(__name__)
 
@@ -219,6 +220,55 @@ def stop():
         return jsonify(ok=True, file=f)
 
 
+def _snapshot_cmd(pattern):
+    # Full-res (3840x1200), high quality for sharp ChArUco corners. num-buffers=15
+    # lets the ISP auto-exposure settle; we keep the last frame.
+    return [
+        "gst-launch-1.0",
+        "nvv4l2camerasrc", f"device={DEVICE}", "num-buffers=15",
+        "!", "video/x-raw(memory:NVMM),format=UYVY,width=3840,height=1200,framerate=30/1",
+        "!", "nvvidconv", "!", "video/x-raw,format=I420",
+        "!", "nvjpegenc", "quality=95",
+        "!", "multifilesink", f"location={pattern}",
+    ]
+
+
+@app.route("/snapshot", methods=["POST"])
+def snapshot():
+    """Grab one full-res still into CALIB_DIR (for camera calibration). The frame
+    holds BOTH cameras (3840x1200); crop halves per-camera in your calib script."""
+    with _lock:
+        if _is_running():
+            return jsonify(ok=False, error="stop recording first"), 409
+        os.makedirs(CALIB_DIR, exist_ok=True)
+        _stop_idle_preview()
+        time.sleep(SETTLE)
+        tmp = os.path.join(CALIB_DIR, "_tmp_%03d.jpg")
+        try:
+            subprocess.run(_snapshot_cmd(tmp), stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15)
+        except Exception:                            # noqa: BLE001
+            pass
+        temps = sorted(glob.glob(os.path.join(CALIB_DIR, "_tmp_*.jpg")))
+        saved = None
+        if temps:
+            n = 1
+            while os.path.exists(os.path.join(CALIB_DIR, f"calib_{n:03d}.jpg")):
+                n += 1
+            saved = os.path.join(CALIB_DIR, f"calib_{n:03d}.jpg")
+            os.replace(temps[-1], saved)             # keep the last (AE-settled) frame
+            for t in temps[:-1]:
+                try:
+                    os.remove(t)
+                except OSError:
+                    pass
+        _start_idle_preview()
+        if not saved:
+            return jsonify(ok=False, error="capture failed (no frame)"), 500
+        count = len(glob.glob(os.path.join(CALIB_DIR, "calib_*.jpg")))
+        return jsonify(ok=True, file=os.path.basename(saved), count=count)
+
+
 PAGE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -237,7 +287,7 @@ PAGE = """<!doctype html>
  @keyframes pulse { 50% { opacity:.3; } }
  button { width:100%; padding:22px; font-size:1.3rem; font-weight:700; border:0;
           border-radius:12px; margin:8px 0; color:#fff; }
- #start { background:#1f8a3b; } #stop { background:#b3271e; }
+ #start { background:#1f8a3b; } #stop { background:#b3271e; } #snap { background:#2a6f9e; }
  button:disabled { opacity:.35; }
  label { display:block; margin:8px 0; }
  input[type=number] { width:70px; background:#222; color:#eee; border:1px solid #444;
@@ -268,6 +318,10 @@ PAGE = """<!doctype html>
  </div>
  <button id="start">&#9679; Start Recording</button>
  <button id="stop" disabled>&#9632; Stop Recording</button>
+ <div class="card">
+   <button id="snap">&#128247; Snapshot (calibration)</button>
+   <div id="snapnote" class="muted">Full-res stills &rarr; /mnt/video/calib</div>
+ </div>
  <div class="card">
    <label><input type="checkbox" id="showth"> Show live thermals</label>
    <div id="thermals" style="display:none">
@@ -302,6 +356,7 @@ async function refreshStatus(){
     $('detail').textContent = s.running && s.file ? s.file : '';
     $('start').disabled = s.running;
     $('stop').disabled  = !s.running;
+    $('snap').disabled  = s.running;
     $('rootnote').textContent = (!s.server_root && $('logth').checked)
       ? 'Note: logging to file needs the server run under sudo.' : '';
     // camera handed over on a state change -> nudge the preview to reconnect
@@ -313,6 +368,15 @@ $('start').onclick = async () => { $('start').disabled=true;
   await post('/start',{log_thermals:$('logth').checked, quality:+$('quality').value});
   refreshStatus(); };
 $('stop').onclick  = async () => { $('stop').disabled=true; await post('/stop'); refreshStatus(); };
+$('snap').onclick  = async () => {
+  $('snap').disabled=true; $('snapnote').textContent='Capturing…';
+  const r = await post('/snapshot');
+  $('snapnote').textContent = r.ok
+    ? 'Saved '+r.file+' — '+r.count+' shots in /mnt/video/calib'
+    : 'Error: '+(r.error||'failed');
+  $('snap').disabled=false;
+  setTimeout(reconnectPreview, 1500);   // preview blinked during the grab
+};
 $('logth').onchange = refreshStatus;
 $('showth').onchange = () => { $('thermals').style.display = $('showth').checked?'block':'none'; };
 
