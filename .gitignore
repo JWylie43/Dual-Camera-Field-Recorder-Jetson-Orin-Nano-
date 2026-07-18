@@ -9,6 +9,17 @@ thermal_*.log
 # Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+
+# Generated calibration artifacts
+# (keep *_intrinsics.json and stereo_extrinsics.json; ignore images/scratch)
+calib/
+calib_out/
+calib_new/
+charuco_board.png
+*_undistort_sample.jpg
+*_rectified_sample.jpg
 
 # Editor / OS
 .vscode/

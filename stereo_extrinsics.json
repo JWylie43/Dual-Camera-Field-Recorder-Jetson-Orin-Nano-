@@ -1,0 +1,43 @@
+{
+  "rms_reproj_error_px": 0.1754,
+  "stereo_views_used": 14,
+  "image_width": 1920,
+  "image_height": 1200,
+  "baseline_mm": 43.327,
+  "translation_mm": [
+    -36.1448,
+    1.9347,
+    -23.8131
+  ],
+  "rotation_matrix": [
+    [
+      0.2758862747456753,
+      -0.014985682468031256,
+      -0.9610734585493041
+    ],
+    [
+      0.02204342143293209,
+      0.999714125454577,
+      -0.009260396218329931
+    ],
+    [
+      0.9609374854684793,
+      -0.01863053105946392,
+      0.27613774159639687
+    ]
+  ],
+  "rotation_euler_deg": {
+    "pitch_x": -3.86,
+    "yaw_toe_y": -73.933,
+    "roll_z": 4.568
+  },
+  "toe_in_angle_deg": 73.933,
+  "total_rotation_deg": 73.986,
+  "board": {
+    "squares_x": 7,
+    "squares_y": 10,
+    "square_mm": 66.5,
+    "marker_mm": 48.5,
+    "dictionary": "DICT_5X5_1000"
+  }
+}

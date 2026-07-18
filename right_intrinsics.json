@@ -1,0 +1,40 @@
+{
+  "camera": "right",
+  "image_width": 1920,
+  "image_height": 1200,
+  "rms_reproj_error_px": 0.4392,
+  "camera_matrix": [
+    [
+      870.2589862505142,
+      0.0,
+      967.2651025951125
+    ],
+    [
+      0.0,
+      872.179560614041,
+      601.9396920400013
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "distortion_coefficients": [
+    0.002700210565132464,
+    -0.02817673091756884,
+    -0.0010512253602273562,
+    -0.0013712439013796253,
+    0.009852851852531572
+  ],
+  "fov_horizontal_deg": 95.61,
+  "fov_vertical_deg": 69.05,
+  "images_used": 17,
+  "board": {
+    "squares_x": 7,
+    "squares_y": 10,
+    "square_mm": 66.5,
+    "marker_mm": 48.5,
+    "dictionary": "DICT_5X5_1000"
+  }
+}
