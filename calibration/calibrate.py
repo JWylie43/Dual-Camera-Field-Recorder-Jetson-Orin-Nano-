@@ -14,8 +14,8 @@ Workflow:
      angles/distances. Cover each camera's whole frame (edges/corners) AND get a
      good batch with the board centered where BOTH cameras see it (that overlap
      set is what the extrinsics are solved from).
-  2. Pull the shots to your Mac:  scp -r joe@joe-desktop.local:/mnt/video/calib ./calib
-  3. Run this:  python3 calibrate.py --images ./calib
+  2. Pull the shots to your Mac:  scp -r joe@joe-desktop.local:/mnt/video/calib ./images
+  3. Run this (from the calibration/ folder):  python3 calibrate.py
 
 Each snapshot is the COMBINED 3840x1200 frame (both cameras). This splits every
 image into left (0:1920) and right (1920:3840) halves. Intrinsics are solved per
@@ -308,7 +308,7 @@ def load_intrinsics(dirpath, name):
 def main():
     ap = argparse.ArgumentParser(
         description="Full ChArUco calibration: intrinsics (L+R) + stereo extrinsics.")
-    ap.add_argument("--images", default="calib", help="folder of calibration JPG/PNG snapshots")
+    ap.add_argument("--images", default="images", help="folder of calibration JPG/PNG snapshots")
     ap.add_argument("--out", default=".", help="where to write results")
     ap.add_argument("--use-intrinsics", default=None, metavar="DIR",
                     help="load left_intrinsics.json & right_intrinsics.json from DIR and "
@@ -330,7 +330,7 @@ def main():
     files = sorted(set(files))
     if not files:
         sys.exit(f"No images found in '{args.images}'. "
-                 f"Pull them first:  scp -r joe@joe-desktop.local:/mnt/video/calib ./calib")
+                 f"Pull them first:  scp -r joe@joe-desktop.local:/mnt/video/calib ./images")
     os.makedirs(args.out, exist_ok=True)
 
     print(f"Found {len(files)} images in {args.images}")

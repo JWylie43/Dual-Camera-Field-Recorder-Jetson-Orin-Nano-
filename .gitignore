@@ -12,17 +12,22 @@ __pycache__/
 .venv/
 venv/
 
-# Generated calibration artifacts
-# (keep *_intrinsics.json and stereo_extrinsics.json; ignore images/scratch)
-calib/
-calib_out/
-calib_new/
+# Calibration: keep the scripts + *_intrinsics.json + stereo_extrinsics.json;
+# ignore the snapshot images and the generated board image
+calibration/images/
 charuco_board.png
 *_undistort_sample.jpg
 *_rectified_sample.jpg
 
-# 3D model source folder (commit the zipped snapshot "3d Model.zip" instead)
-3d Model/
+# Stitching: keep source (main.cpp/main.py/stitch_test.py/CMakeLists/include);
+# ignore build output, generated remap dumps, and test renders
+stitching/build/
+stitching/stitch_out/
+*.bin
+
+# 3D model: commit only the zip; ignore the loose CAD files (incl. the 53 MB STEP)
+3d-housing-model/*
+!3d-housing-model/Housing.zip
 
 # Editor / OS
 .vscode/
