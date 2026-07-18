@@ -21,6 +21,9 @@ charuco_board.png
 *_undistort_sample.jpg
 *_rectified_sample.jpg
 
+# 3D model source folder (commit the zipped snapshot "3d Model.zip" instead)
+3d Model/
+
 # Editor / OS
 .vscode/
 .idea/
