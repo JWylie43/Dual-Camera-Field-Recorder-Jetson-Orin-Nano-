@@ -19,9 +19,10 @@ charuco_board.png
 *_undistort_sample.jpg
 *_rectified_sample.jpg
 
-# Stitching: keep source (main.cpp/main.py/stitch_test.py/CMakeLists/include);
+# Stitching: keep source (main.cpp/stitch_pipeline.{py,cpp}/CMakeLists/include);
 # ignore build output, generated remap dumps, and test renders
 stitching/build/
+stitching/pipeline_out*/
 stitching/stitch_out/
 *.bin
 

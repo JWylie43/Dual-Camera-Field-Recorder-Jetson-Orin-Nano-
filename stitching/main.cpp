@@ -518,7 +518,7 @@ void testWarpPipeline2(
          Point(seam_x, debugOverlapped.rows), Scalar(0, 0, 255), 3);
     rectangle(debugOverlapped, Rect(box_x, box_y, box_w, box_h), Scalar(0, 255, 0), 3);
 
-    imwrite(output_directory + "\\debugOverlapped.jpg", debugOverlapped);
+    imwrite(output_directory + "/debugOverlapped.jpg", debugOverlapped);
 
     int shiftedSeam = seam_x - box_x;
     // ========== 2. One-pass undistort + warp + rotate & crop ==========
@@ -532,14 +532,14 @@ void testWarpPipeline2(
     // addWeighted(finalWarpedLeft, 0.5, finalWarpedRight, 0.5, 0.0, finalOverlappedCropped);
     // line(finalOverlappedCropped, Point(shiftedSeam, 0),
     //      Point(shiftedSeam, box_h), Scalar(0, 0, 255), 3);
-    // imwrite(output_directory + "\\finalOverlappedCropped.jpg", finalOverlappedCropped);
+    // imwrite(output_directory + "/finalOverlappedCropped.jpg", finalOverlappedCropped);
     // Mat finalStitched;
     // finalStitched = cv::Mat(cv::Size(box_w, box_h), finalWarpedLeft.type());
     // finalWarpedLeft(cv::Rect(0, 0, shiftedSeam, box_h))
     //     .copyTo(finalStitched(cv::Rect(0, 0, shiftedSeam, box_h)));
     // finalWarpedRight(cv::Rect(shiftedSeam, 0, box_w - shiftedSeam, box_h))
     //     .copyTo(finalStitched(cv::Rect(shiftedSeam, 0, box_w - shiftedSeam, box_h)));
-    // imwrite(output_directory + "\\finalStitched.jpg", finalStitched);
+    // imwrite(output_directory + "/finalStitched.jpg", finalStitched);
 
     // ========== 3. One-pass undistort + warp + rotate + crop ==========
     Mat warpedCroppedLeft, warpedCroppedRight;
@@ -547,12 +547,12 @@ void testWarpPipeline2(
     cv::Rect roiRight(shiftedSeam, 0, box_w - shiftedSeam, box_h);
     remap(distortedL, warpedCroppedLeft, leftComboMap.first(roiLeft), leftComboMap.second(roiLeft), INTER_LINEAR, BORDER_CONSTANT);
     remap(distortedR, warpedCroppedRight, rightComboMap.first(roiRight), rightComboMap.second(roiRight), INTER_LINEAR, BORDER_CONSTANT);
-    // imwrite(output_directory + "\\warpedCroppedLeft.jpg", warpedCroppedLeft);
-    // imwrite(output_directory + "\\warpedCroppedRight.jpg", warpedCroppedRight);
+    // imwrite(output_directory + "/warpedCroppedLeft.jpg", warpedCroppedLeft);
+    // imwrite(output_directory + "/warpedCroppedRight.jpg", warpedCroppedRight);
     cv::Mat stitched(box_h, box_w, warpedCroppedLeft.type(), cv::Scalar::all(0));
     warpedCroppedLeft.copyTo(stitched(cv::Rect(0, 0, warpedCroppedLeft.cols, box_h)));
     warpedCroppedRight.copyTo(stitched(cv::Rect(shiftedSeam, 0, warpedCroppedRight.cols, box_h)));
-    imwrite(output_directory + "\\stitchedFrame.jpg", stitched);
+    imwrite(output_directory + "/stitchedFrame.jpg", stitched);
 
     std::cout << "[testWarpPipeline] Complete — wrote all intermediate images.\n";
 }
@@ -630,7 +630,7 @@ void testWarpPipeline(
          Point(seam_x, rows * 2), Scalar(0, 0, 255), 3);
     rectangle(debugOverlapped, Rect(box_x, box_y, box_w, box_h), Scalar(0, 255, 0), 3);
 
-    imwrite(output_directory + "\\debugOverlapped.jpg", debugOverlapped);
+    imwrite(output_directory + "/debugOverlapped.jpg", debugOverlapped);
 
     // ========== 6. One-pass undistort + warp + rotate + crop ==========
     Mat finalWarpedLeft, finalWarpedRight;
@@ -643,7 +643,7 @@ void testWarpPipeline(
     addWeighted(finalWarpedLeft, 0.5, finalWarpedRight, 0.5, 0.0, finalOverlappedCropped);
     line(finalOverlappedCropped, Point(shiftedSeam, 0),
          Point(shiftedSeam, box_h), Scalar(0, 0, 255), 3);
-    imwrite(output_directory + "\\finalOverlappedCropped.jpg", finalOverlappedCropped);
+    imwrite(output_directory + "/finalOverlappedCropped.jpg", finalOverlappedCropped);
 
     // testing warp and crop together
     Mat warpedCroppedLeft, warpedCroppedRight;
@@ -651,12 +651,12 @@ void testWarpPipeline(
     cv::Rect roiRight(shiftedSeam, 0, box_w - shiftedSeam, box_h);
     remap(distortedL, warpedCroppedLeft, leftComboMap.first(roiLeft), leftComboMap.second(roiLeft), INTER_LINEAR, BORDER_CONSTANT);
     remap(distortedR, warpedCroppedRight, rightComboMap.first(roiRight), rightComboMap.second(roiRight), INTER_LINEAR, BORDER_CONSTANT);
-    imwrite(output_directory + "\\warpedCroppedLeft.jpg", warpedCroppedLeft);
-    imwrite(output_directory + "\\warpedCroppedRight.jpg", warpedCroppedRight);
+    imwrite(output_directory + "/warpedCroppedLeft.jpg", warpedCroppedLeft);
+    imwrite(output_directory + "/warpedCroppedRight.jpg", warpedCroppedRight);
     cv::Mat stitched(box_h, box_w, warpedCroppedLeft.type(), cv::Scalar::all(0));
     warpedCroppedLeft.copyTo(stitched(cv::Rect(0, 0, warpedCroppedLeft.cols, box_h)));
     warpedCroppedRight.copyTo(stitched(cv::Rect(shiftedSeam, 0, warpedCroppedRight.cols, box_h)));
-    imwrite(output_directory + "\\stitchedFrame.jpg", stitched);
+    imwrite(output_directory + "/stitchedFrame.jpg", stitched);
 
     // final stitched frame
     Mat finalStitched;
@@ -665,7 +665,7 @@ void testWarpPipeline(
         .copyTo(finalStitched(cv::Rect(0, 0, shiftedSeam, box_h)));
     finalWarpedRight(cv::Rect(shiftedSeam, 0, box_w - shiftedSeam, box_h))
         .copyTo(finalStitched(cv::Rect(shiftedSeam, 0, box_w - shiftedSeam, box_h)));
-    imwrite(output_directory + "\\finalStitched.jpg", finalStitched);
+    imwrite(output_directory + "/finalStitched.jpg", finalStitched);
 
     // Mat finalStitchedBlended;
     // finalStitchedBlended = cv::Mat(cv::Size(box_w, box_h), finalWarpedLeft.type());
@@ -705,7 +705,7 @@ void testWarpPipeline(
 
     //     blendedStrip.copyTo(finalStitchedBlended(Rect(leftEnd, 0, blendWidthActual, box_h)));
     // }
-    // imwrite(output_directory + "\\finalStitched_blended.jpg", finalStitchedBlended);
+    // imwrite(output_directory + "/finalStitched_blended.jpg", finalStitchedBlended);
 
     std::cout << "[testWarpPipeline] Complete — wrote all intermediate images.\n";
 }
@@ -1229,7 +1229,7 @@ int main(int argc, char *argv[])
         processAndStitchVideos(
             leftVideoPath,
             rightVideoPath,
-            output_directory + "\\stitched_video.mp4",
+            output_directory + "/stitched_video.mp4",
             leftComboMap,
             rightComboMap,
             seam_x,
@@ -1245,7 +1245,7 @@ int main(int argc, char *argv[])
         // processAndStitchVideos(
         //     leftVideoPath,
         //     rightVideoPath,
-        //     output_directory + "\\stitched_video.mp4",
+        //     output_directory + "/stitched_video.mp4",
         //     warpMapsResults.leftComboMap,
         //     warpMapsResults.rightComboMap,
         //     seam_x,
