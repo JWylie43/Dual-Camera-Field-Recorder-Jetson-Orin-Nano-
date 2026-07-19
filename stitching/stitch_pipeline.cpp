@@ -7,22 +7,24 @@
 // Modes:
 //   image source (.jpg/.png/...) -> stitch the single frame  -> pano.jpg
 //   video source (.mp4/.mkv/...)  -> loop frames [start..end] -> stitched_video.mp4
-//   --tune  -> launch an interactive tuner: opens a browser UI where you nudge the
-//              right image (--shift-x) and the seam over a live preview, then click
-//              "Stitch" to run the full stitch on all frames. One command, UI opens
-//              itself, click to finish. (Runs a tiny localhost web server.)
+//   --tune  -> launch an interactive browser tuner (see below)
 //
-// --shift-x N nudges the RIGHT image N px horizontally (+ = right) before the
-// hard-seam composite (rotation-only aligns at infinity; a small shift sharpens a
-// chosen plane at finite distance).
+// Right-image alignment (applied as one affine before the hard-seam composite):
+//   --shift-top N     horizontal shift of the TOP rows   (aligns the FAR edge)
+//   --shift-bottom N  horizontal shift of the BOTTOM rows (aligns the NEAR edge)
+//   --shift-y N       vertical shift of the whole image
+// If top != bottom this is a vertical SHEAR: the per-row horizontal shift is
+// interpolated between the two, so a receding field (near at the bottom, far at the
+// top) lines up along a straight vertical seam. (--shift-x N sets top=bottom=N.)
+//
+// --tune warps the first frame once, starts a localhost web server, opens a browser
+// to a live tuner where you adjust those values and click "Stitch all frames" to run
+// the full stitch (progress bar + done). One command; UI opens itself.
 //
 // GPU: per-frame work runs on cv::UMat (OpenCL when available, CPU fallback).
 // Uses core/imgproc/imgcodecs/videoio; builds on OpenCV 4.x and 5.x.
 //
 // Build:  cmake -S . -B build && cmake --build build
-// Run:    ./build/StitchPipeline --source <image-or-video> [--calib-dir ../calibration]
-//                     [--out DIR] [--start N] [--end N] [--degrees D] [--seam X]
-//                     [--shift-x N] [--tune] [--port N]
 
 #include <opencv2/core.hpp>
 #include <opencv2/core/ocl.hpp>
@@ -68,6 +70,12 @@ struct StitchMaps
     UMat mapLx, mapLy, mapRx, mapRy;
     int OW = 0, OH = 0;
     int seam = 0;
+};
+
+// Right-image alignment (per-row horizontal shear + vertical shift).
+struct Align
+{
+    double shiftTop = 0, shiftBottom = 0, shiftY = 0;
 };
 
 // Shared progress state for the --tune server (stitch runs on a worker thread).
@@ -209,12 +217,14 @@ static void warpHalves(const UMat &frame, const StitchMaps &m, UMat &warpL, UMat
 }
 
 static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
-                      double degrees, double shiftX)
+                      double degrees, const Align &a)
 {
     UMat right = warpR;
-    if (shiftX != 0.0)
+    if (a.shiftTop != 0.0 || a.shiftBottom != 0.0 || a.shiftY != 0.0)
     {
-        Mat T = (Mat_<double>(2, 3) << 1, 0, shiftX, 0, 1, 0);
+        // per-row horizontal shear (top->bottom) + vertical shift, as one affine.
+        double k = (m.OH > 1) ? (a.shiftBottom - a.shiftTop) / (m.OH - 1) : 0.0;
+        Mat T = (Mat_<double>(2, 3) << 1, k, a.shiftTop, 0, 1, a.shiftY);
         warpAffine(warpR, right, T, Size(m.OW, m.OH));
     }
     UMat pano(m.OH, m.OW, warpL.type(), Scalar::all(0));
@@ -223,25 +233,23 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
     if (degrees != 0.0)
     {
         double ang = degrees * CV_PI / 180.0;
-        double a = cos(ang), b = sin(ang), ccx = m.OW / 2.0, ccy = m.OH / 2.0;
-        Mat M = (Mat_<double>(2, 3) << a, b, (1 - a) * ccx - b * ccy,
-                 -b, a, b * ccx + (1 - a) * ccy);
+        double c = cos(ang), s = sin(ang), ccx = m.OW / 2.0, ccy = m.OH / 2.0;
+        Mat M = (Mat_<double>(2, 3) << c, s, (1 - c) * ccx - s * ccy,
+                 -s, c, s * ccx + (1 - c) * ccy);
         warpAffine(pano, pano, M, Size(m.OW, m.OH));
     }
     return pano;
 }
 
-// ---- full-stitch entry points (shared by CLI and the tuner's Stitch button) ----
-
 static string stitchImageFile(const string &source, StitchMaps &m, double degrees,
-                              double shiftX, const string &outDir)
+                              const Align &a, const string &outDir)
 {
     Mat img = imread(source);
     if (img.empty()) return "ERROR: cannot read image";
     UMat uImg, wL, wR;
     img.copyTo(uImg);
     warpHalves(uImg, m, wL, wR);
-    UMat uPano = composite(wL, wR, m, degrees, shiftX);
+    UMat uPano = composite(wL, wR, m, degrees, a);
     Mat pano; uPano.copyTo(pano);
     string out = outDir + "/pano.jpg";
     imwrite(out, pano);
@@ -249,7 +257,7 @@ static string stitchImageFile(const string &source, StitchMaps &m, double degree
 }
 
 static string stitchVideoFile(const string &source, StitchMaps &m, double degrees,
-                              double shiftX, int startFrame, int endFrame, const string &outDir,
+                              const Align &a, int startFrame, int endFrame, const string &outDir,
                               std::atomic<int> *prog = nullptr)
 {
     VideoCapture cap(source);
@@ -271,7 +279,7 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
         if (!cap.read(frame) || frame.empty()) break;
         frame.copyTo(uFrame);
         warpHalves(uFrame, m, wL, wR);
-        composite(wL, wR, m, degrees, shiftX).copyTo(pano);
+        composite(wL, wR, m, degrees, a).copyTo(pano);
         writer.write(pano);
         int pct = (int)(100.0 * (i - s + 1) / (e - s + 1));
         if (prog) prog->store(pct);
@@ -313,75 +321,82 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
       << "const IMGR='data:image/jpeg;base64," << base64(bR) << "';</script>"
       << R"HTML(<style>
  body{margin:0;font-family:system-ui,sans-serif;background:#111;color:#eee}
- #bar{padding:10px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;background:#1b1b1b;position:sticky;top:0;z-index:2}
- button{font-size:16px;padding:6px 12px;border:0;border-radius:6px;background:#2a6f9e;color:#fff;cursor:pointer}
- #stitch{background:#1f8a3b;font-weight:700} #quit{background:#8a3b1f}
- .grp{display:flex;gap:8px;align-items:center;border:1px solid #333;padding:6px 10px;border-radius:8px}
- .val{min-width:46px;text-align:center;font-variant-numeric:tabular-nums;font-size:18px}
+ #bar{padding:10px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#1b1b1b;position:sticky;top:0;z-index:2}
+ button{font-size:15px;padding:5px 10px;border:0;border-radius:6px;background:#2a6f9e;color:#fff;cursor:pointer}
+ #stitch{background:#1f8a3b;font-weight:700} #quit{background:#8a3b1f} #finish{background:#555}
+ .grp{display:flex;gap:6px;align-items:center;border:1px solid #333;padding:5px 9px;border-radius:8px;font-size:14px}
+ .val{min-width:40px;text-align:center;font-variant-numeric:tabular-nums;font-size:16px}
  #wrap{overflow:auto} canvas{display:block;max-width:100%;background:#000}
  #status{padding:6px 10px;color:#9cf} .hint{color:#888;font-size:12px}
 </style></head><body>
 <div id="bar">
-  <div class="grp">Shift-x <button id="sl">&#9664;</button><span class="val" id="sv">0</span><button id="sr">&#9654;</button></div>
+  <div class="grp">Shift far (top) <button id="tl">&#9664;</button><span class="val" id="tv">0</span><button id="tr">&#9654;</button></div>
+  <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><span class="val" id="bv">0</span><button id="br">&#9654;</button></div>
+  <div class="grp">Shift-y <button id="yl">&#9664;</button><span class="val" id="yv">0</span><button id="yr">&#9654;</button></div>
   <div class="grp">Seam <button id="ml">&#9664;</button><span class="val" id="mv">0</span><button id="mr">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
   <div class="grp">step <select id="step"><option>1</option><option>2</option><option>5</option><option>10</option></select></div>
   <button id="stitch">Stitch all frames</button>
   <button id="quit">Quit</button>
-  <span class="hint">&#8592;/&#8594; shift &nbsp; [ / ] seam</span>
+  <span class="hint">&#8592;/&#8594; shift both &nbsp; [ / ] seam</span>
 </div>
-<div id="status">Ready. Adjust, then click &ldquo;Stitch all frames&rdquo;.</div>
+<div id="status">Ready. Align the far (top) and near (bottom) edges, then Stitch.</div>
 <div id="prog" style="padding:0 10px 10px;display:none">
   <progress id="pb" max="100" value="0" style="width:280px;height:16px;vertical-align:middle"></progress>
   <span id="pct" style="margin-left:8px">0%</span>
-  <button id="finish" style="display:none;background:#555;margin-left:12px">Finish &amp; stop</button>
+  <button id="finish" style="display:none;margin-left:12px">Finish &amp; stop</button>
 </div>
 <div id="wrap"><canvas id="c"></canvas></div>
 <script>
 const cv=document.getElementById('c'), ctx=cv.getContext('2d');
 cv.width=OW; cv.height=OH;
-let shiftX=0, seam=SEAM0, loaded=0;
+let sTop=0, sBot=0, sY=0, seam=SEAM0, loaded=0;
 const imgL=new Image(), imgR=new Image();
 imgL.onload=imgR.onload=()=>{ if(++loaded===2) render(); };
 imgL.src=IMGL; imgR.src=IMGR;
 const stepv=()=>parseInt(document.getElementById('step').value)||1;
 const st=t=>document.getElementById('status').textContent=t;
+function drawRight(){
+  const k=(OH>1)?(sBot-sTop)/(OH-1):0;         // per-row shear slope
+  ctx.save(); ctx.transform(1,0,k,1,sTop,sY); ctx.drawImage(imgR,0,0); ctx.restore();
+}
 function render(){
-  ctx.clearRect(0,0,OW,OH);
+  ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=1; ctx.clearRect(0,0,OW,OH);
   if(document.getElementById('blend').checked){
-    ctx.globalAlpha=0.5; ctx.drawImage(imgL,0,0); ctx.drawImage(imgR,shiftX,0); ctx.globalAlpha=1;
+    ctx.globalAlpha=0.5; ctx.drawImage(imgL,0,0); drawRight(); ctx.globalAlpha=1;
   } else {
     ctx.drawImage(imgL,0,0);
-    ctx.save(); ctx.beginPath(); ctx.rect(seam,0,OW-seam,OH); ctx.clip();
-    ctx.drawImage(imgR,shiftX,0); ctx.restore();
+    ctx.save(); ctx.beginPath(); ctx.rect(seam,0,OW-seam,OH); ctx.clip(); drawRight(); ctx.restore();
   }
   ctx.strokeStyle='#f33'; ctx.lineWidth=2;
   ctx.beginPath(); ctx.moveTo(seam,0); ctx.lineTo(seam,OH); ctx.stroke();
-  document.getElementById('sv').textContent=shiftX;
-  document.getElementById('mv').textContent=seam;
+  tv.textContent=sTop; bv.textContent=sBot; yv.textContent=sY; mv.textContent=seam;
 }
 const clampSeam=v=>Math.max(0,Math.min(OW,v));
-document.getElementById('sl').onclick=()=>{shiftX-=stepv();render();};
-document.getElementById('sr').onclick=()=>{shiftX+=stepv();render();};
-document.getElementById('ml').onclick=()=>{seam=clampSeam(seam-stepv());render();};
-document.getElementById('mr').onclick=()=>{seam=clampSeam(seam+stepv());render();};
+tl.onclick=()=>{sTop-=stepv();render();};  tr.onclick=()=>{sTop+=stepv();render();};
+bl.onclick=()=>{sBot-=stepv();render();};  br.onclick=()=>{sBot+=stepv();render();};
+yl.onclick=()=>{sY-=stepv();render();};    yr.onclick=()=>{sY+=stepv();render();};
+ml.onclick=()=>{seam=clampSeam(seam-stepv());render();};
+mr.onclick=()=>{seam=clampSeam(seam+stepv());render();};
 document.getElementById('blend').onchange=render;
 addEventListener('keydown',e=>{
-  if(e.key==='ArrowLeft'){shiftX-=stepv();render();e.preventDefault();}
-  else if(e.key==='ArrowRight'){shiftX+=stepv();render();e.preventDefault();}
-  else if(e.key==='['){seam=clampSeam(seam-stepv());render();}
-  else if(e.key===']'){seam=clampSeam(seam+stepv());render();}
+  const d=stepv();
+  if(e.key==='ArrowLeft'){sTop-=d;sBot-=d;render();e.preventDefault();}
+  else if(e.key==='ArrowRight'){sTop+=d;sBot+=d;render();e.preventDefault();}
+  else if(e.key==='['){seam=clampSeam(seam-d);render();}
+  else if(e.key===']'){seam=clampSeam(seam+d);render();}
 });
 let polling=null;
 const pb=document.getElementById('pb'), pct=document.getElementById('pct');
+const params=()=>'shifttop='+sTop+'&shiftbottom='+sBot+'&shifty='+sY+'&seam='+seam;
 document.getElementById('stitch').onclick=async()=>{
   if(polling) return;
   document.getElementById('stitch').disabled=true;
   document.getElementById('prog').style.display='block';
   document.getElementById('finish').style.display='none';
   pb.value=0; pct.textContent='0%';
-  st('Stitching all frames (shift-x='+shiftX+', seam='+seam+') …');
-  try{ const r=await fetch('/stitch?shiftx='+shiftX+'&seam='+seam);
+  st('Stitching all frames ('+params()+') …');
+  try{ const r=await fetch('/stitch?'+params());
        if((await r.text())==='busy'){ st('Already stitching…'); return; } }
   catch(e){ st('Error starting: '+e); document.getElementById('stitch').disabled=false; return; }
   polling=setInterval(async()=>{
@@ -400,8 +415,7 @@ document.getElementById('stitch').onclick=async()=>{
 };
 document.getElementById('finish').onclick=async()=>{
   try{await fetch('/quit');}catch(e){}
-  st('Finished — server stopped. You can close this tab.');
-  try{window.close();}catch(e){}
+  st('Finished — server stopped. You can close this tab.'); try{window.close();}catch(e){}
 };
 document.getElementById('quit').onclick=async()=>{ try{await fetch('/quit');}catch(e){} st('Stopped. You can close this tab.'); };
 </script></body></html>)HTML";
@@ -428,7 +442,6 @@ static void openBrowser(const string &url)
 #endif
 }
 
-// Minimal localhost HTTP server: serve the tuner, and on /stitch run the full stitch.
 static void runTuneServer(const string &source, bool video, StitchMaps &m,
                           const UMat &warpL, const UMat &warpR, double degrees,
                           int startFrame, int endFrame, const string &outDir, int port)
@@ -444,7 +457,7 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // localhost only
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     int bound = -1;
     for (int p = port; p < port + 10; ++p)
     {
@@ -488,17 +501,21 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
             if (g_busy) { body = "busy"; }
             else
             {
-                double sx = query.find("shiftx=") != string::npos ? stod(qparam(query, "shiftx")) : 0;
+                Align a;
+                a.shiftTop = query.find("shifttop=") != string::npos ? stod(qparam(query, "shifttop")) : 0;
+                a.shiftBottom = query.find("shiftbottom=") != string::npos ? stod(qparam(query, "shiftbottom")) : 0;
+                a.shiftY = query.find("shifty=") != string::npos ? stod(qparam(query, "shifty")) : 0;
                 string ss = qparam(query, "seam");
                 StitchMaps mm = m;
                 if (!ss.empty()) mm.seam = stoi(ss);
                 g_busy = true; g_done = false; g_percent = 0;
                 { lock_guard<mutex> lk(g_mu); g_result.clear(); }
-                cout << "[stitch] shift-x=" << sx << " seam=" << mm.seam << " ...\n";
-                std::thread([mm, sx, source, video, degrees, startFrame, endFrame, outDir]() mutable {
+                cout << "[stitch] top=" << a.shiftTop << " bottom=" << a.shiftBottom
+                     << " y=" << a.shiftY << " seam=" << mm.seam << " ...\n";
+                std::thread([mm, a, source, video, degrees, startFrame, endFrame, outDir]() mutable {
                     string res = video
-                        ? stitchVideoFile(source, mm, degrees, sx, startFrame, endFrame, outDir, &g_percent)
-                        : stitchImageFile(source, mm, degrees, sx, outDir);
+                        ? stitchVideoFile(source, mm, degrees, a, startFrame, endFrame, outDir, &g_percent)
+                        : stitchImageFile(source, mm, degrees, a, outDir);
                     { lock_guard<mutex> lk(g_mu); g_result = res; }
                     g_percent = 100; g_done = true; g_busy = false;
                     cout << "[stitch] done -> " << res << "\n";
@@ -568,13 +585,18 @@ int main(int argc, char **argv)
     int seamArg = stoi(argVal(argc, argv, "--seam", "-1"));
     int startFrame = stoi(argVal(argc, argv, "--start", "0"));
     int endFrame = stoi(argVal(argc, argv, "--end", "-1"));
-    double shiftX = stod(argVal(argc, argv, "--shift-x", "0"));
+    string sx = argVal(argc, argv, "--shift-x", "0");   // convenience: sets top=bottom
+    Align a;
+    a.shiftTop = stod(argVal(argc, argv, "--shift-top", sx));
+    a.shiftBottom = stod(argVal(argc, argv, "--shift-bottom", sx));
+    a.shiftY = stod(argVal(argc, argv, "--shift-y", "0"));
     int port = stoi(argVal(argc, argv, "--port", "8090"));
     bool tune = hasArg(argc, argv, "--tune");
     if (source.empty())
     {
         cerr << "Usage: StitchPipeline --source <image-or-video> [--calib-dir ..] [--out ..]\n"
-             << "        [--start N] [--end N] [--degrees D] [--seam X] [--shift-x N] [--tune]\n";
+             << "        [--start N] [--end N] [--degrees D] [--seam X] [--tune] [--port N]\n"
+             << "        [--shift-top N] [--shift-bottom N] [--shift-y N]  (--shift-x N sets top=bottom)\n";
         return 1;
     }
     fs::create_directories(outDir);
@@ -590,7 +612,6 @@ int main(int argc, char **argv)
 
     bool video = isVideoFile(source);
 
-    // first frame (single image, or first/--start frame of a video) drives map sizing
     Mat frame;
     if (!video) frame = imread(source);
     else
@@ -616,8 +637,8 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    string result = video ? stitchVideoFile(source, m, degrees, shiftX, startFrame, endFrame, outDir)
-                          : stitchImageFile(source, m, degrees, shiftX, outDir);
+    string result = video ? stitchVideoFile(source, m, degrees, a, startFrame, endFrame, outDir)
+                          : stitchImageFile(source, m, degrees, a, outDir);
     cout << (video ? "video -> " : "image -> ") << result << "\n";
     return 0;
 }

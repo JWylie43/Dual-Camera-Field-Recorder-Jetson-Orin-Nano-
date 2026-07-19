@@ -210,9 +210,17 @@ reused for every frame.
 | `--start N` / `--end N` | `0` / `-1` | Video frame range (`-1` = end) |
 | `--degrees D` | `0` | Horizon roll correction |
 | `--seam X` | auto | Hard-seam column (default: overlap centre) |
-| `--shift-x N` | `0` | Nudge the right image N px horizontally (+ = right) |
+| `--shift-top N` | `0` | Horizontal shift of the right image's **top** rows (aligns the **far** edge) |
+| `--shift-bottom N` | `0` | Horizontal shift of the **bottom** rows (aligns the **near** edge) |
+| `--shift-y N` | `0` | Vertical shift of the right image |
+| `--shift-x N` | `0` | Convenience: sets both top and bottom to N (plain horizontal shift) |
 | `--tune` | off | Launch the interactive browser tuner (see below) |
 | `--port N` | `8090` | Port for the `--tune` web server |
+
+If `--shift-top` ≠ `--shift-bottom`, the right image is **sheared** — the per-row
+horizontal shift is interpolated between them. This aligns a **receding field**
+(near edge at the bottom, far edge at the top) along a straight vertical seam:
+dial `--shift-bottom` for the front of the field and `--shift-top` for the back.
 
 ### Interactive tuning (`--tune`)
 
@@ -226,8 +234,10 @@ a one-command visual tuner:
 
 This warps the first frame, starts a tiny localhost web server, and **opens your
 browser** to a live tuner. There you:
-- click the **◀ ▶** arrows (or ←/→ for shift, `[` `]` for seam) to nudge the right
-  image and move the seam over a live stitched preview,
+- adjust **Shift far (top)**, **Shift near (bottom)**, **Shift-y**, and **Seam** with
+  the **◀ ▶** arrows (←/→ shifts both top & bottom together; `[` `]` moves the seam)
+  over a live stitched preview — align the far and near edges of the field so the
+  whole thing lines up under a straight vertical seam,
 - toggle **overlap blend** (50/50) to check alignment,
 - click **Stitch all frames** to run the full stitch on the whole image/video with
   the current values — a **progress bar** tracks it and a **✅ Done** message shows
