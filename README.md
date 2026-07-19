@@ -239,9 +239,10 @@ browser** to a live tuner. There you:
   over a live stitched preview — align the far and near edges of the field so the
   whole thing lines up under a straight vertical seam,
 - **for a video**, use the **Frame** slider, its ◀ ▶, or the frame box to jump to
-  any frame and align on it — handy when the first frame doesn't show the detail you
-  need (works even for MJPEG-MKV that doesn't report a frame count — just type the
-  number),
+  any frame and align on it — the current frame and total (`N / 1591`) are shown.
+  The total comes from `ffprobe` packet-counting (fast, exact for MJPEG even when the
+  container reports no frame count); if `ffprobe` isn't available, the frame box +
+  prev/next still work, just without a fixed slider range,
 - every value is a **typeable box** — click the ◀ ▶ arrows or just type a number,
 - toggle **overlap blend** (50/50) to check alignment,
 - click **Stitch all frames** to run the full stitch on the whole image/video with

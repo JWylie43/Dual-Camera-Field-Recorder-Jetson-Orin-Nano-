@@ -39,6 +39,7 @@
 #include <string>
 #include <sstream>
 #include <cstdlib>
+#include <cstdio>
 #include <algorithm>
 #include <thread>
 #include <atomic>
@@ -58,6 +59,11 @@
   using socket_t = int;
   #define CLOSESOCK close
   #define INVALID_SOCKET (-1)
+#endif
+
+#ifdef _WIN32
+  #define popen _popen
+  #define pclose _pclose
 #endif
 
 using json = nlohmann::json;
@@ -337,7 +343,7 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
   <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
   <div class="grp">Shift-y <button id="yl">&#9664;</button><input class="val" id="yv" type="number" value="0"><button id="yr">&#9654;</button></div>
   <div class="grp">Seam <button id="ml">&#9664;</button><input class="val" id="mv" type="number" value="0"><button id="mr">&#9654;</button></div>
-  <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><button id="fnext">&#9654;</button></div>
+  <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
   <div class="grp">step <select id="step"><option>1</option><option>2</option><option>5</option><option>10</option></select></div>
   <button id="stitch">Stitch all frames</button>
@@ -399,15 +405,18 @@ addEventListener('keydown',e=>{
 pending=2; imgL.src=IMGL; imgR.src=IMGR;   // initial frame
 // frame scrubbing (video only)
 const frange=document.getElementById('frange'), fval=document.getElementById('fval');
-const FMAX = TOTAL>1 ? TOTAL-1 : 100000;
+const known = TOTAL>1;
+const FMAX = known ? TOTAL-1 : 100000;
 frange.max=FMAX; frange.value=FRAME0; fval.value=FRAME0; fval.max=FMAX;
+document.getElementById('ftot').textContent = known ? ('/ '+TOTAL) : '/ ?';
 if(!VIDEO) document.getElementById('framegrp').style.display='none';
+const ftxt=n=>'Frame '+n+(known?(' / '+TOTAL):'');
 function loadFrame(n){
   n=Math.max(0,Math.min(FMAX,parseInt(n)||0)); frange.value=n; fval.value=n;
-  st('Loading frame '+n+'…');
+  st('Loading '+ftxt(n)+'…');
   fetch('/frame?n='+n).then(r=>r.json()).then(d=>{
     if(d.error){ st('frame error: '+d.error); return; }
-    pending=2; imgL.src=d.left; imgR.src=d.right; st('Frame '+n);
+    pending=2; imgL.src=d.left; imgR.src=d.right; st(ftxt(n));
   }).catch(e=>st('frame load error: '+e));
 }
 document.getElementById('fprev').onclick=()=>loadFrame((+frange.value||0)-1);
@@ -628,6 +637,30 @@ static bool isVideoFile(const string &path)
     return find(vids.begin(), vids.end(), ext) != vids.end();
 }
 
+// Robust frame count when OpenCV's CAP_PROP_FRAME_COUNT is bogus (e.g. MJPEG-MKV).
+// Prefer counting demuxed video packets via ffprobe: fast (no decode) and exact for
+// intra-only streams like MJPEG (1 packet = 1 frame). Fall back to duration x fps.
+static string runCmd(const string &cmd)
+{
+    FILE *p = popen((cmd + " 2>/dev/null").c_str(), "r");
+    if (!p) return "";
+    char buf[128]; string out;
+    while (fgets(buf, sizeof(buf), p)) out += buf;
+    pclose(p);
+    return out;
+}
+
+static int probeFrames(const string &source, double fps)
+{
+    string packets = runCmd("ffprobe -v error -count_packets -select_streams v:0 "
+                            "-show_entries stream=nb_read_packets "
+                            "-of default=nokey=1:noprint_wrappers=1 \"" + source + "\"");
+    try { int n = stoi(packets); if (n > 0) return n; } catch (...) {}
+    string dur = runCmd("ffprobe -v error -show_entries format=duration "
+                        "-of default=nokey=1:noprint_wrappers=1 \"" + source + "\"");
+    try { return (int)llround(stod(dur) * fps); } catch (...) { return 0; }
+}
+
 int main(int argc, char **argv)
 {
     string source = argVal(argc, argv, "--source", argVal(argc, argv, "--image", ""));
@@ -674,8 +707,12 @@ int main(int argc, char **argv)
         {
             totalFrames = (int)cap.get(CAP_PROP_FRAME_COUNT);
             // some containers (e.g. MJPEG-in-MKV) don't report a valid count;
-            // 0 tells the tuner to fall back to a typeable frame box + prev/next.
-            if (totalFrames < 1 || totalFrames > 100000000) totalFrames = 0;
+            // fall back to ffprobe (duration x fps), or 0 -> typeable frame box.
+            if (totalFrames < 1 || totalFrames > 100000000)
+            {
+                double fps = cap.get(CAP_PROP_FPS);
+                totalFrames = probeFrames(source, fps > 0 ? fps : 30.0);
+            }
             if (startFrame > 0) cap.set(CAP_PROP_POS_FRAMES, startFrame);
             cap.read(frame);
             cap.release();
