@@ -1,21 +1,55 @@
-# Orin Nano Stereo Recorder
+# Orin Nano Stereo Recorder & Stitcher
 
-Live 30 fps recording of a side-by-side stereo camera on a **Jetson Orin Nano**,
-plus a phone/laptop web control panel with live preview. Built for a field rig
-(Arducam B0577 dual global-shutter kit, 3840×1200 combined) that runs for hours
-outdoors, so it's tuned for **30 fps sustained with the CPU near-idle** (maximum
-thermal headroom).
+An end-to-end field rig for a side-by-side stereo camera on a **Jetson Orin Nano**:
+**record** a wide dual-camera feed, **calibrate** the two cameras, and **stitch** the
+result into a single cylindrical panorama.
 
-- `record.py` — the recorder (hardware-MJPEG → MKV on the NVMe)
-- `server.py` — a Flask web control panel (Start/Stop, live preview, status, thermals)
+Built around the Arducam B0577 dual global-shutter kit (3840×1200 combined) in a
+3D-printed housing, tuned to run for hours outdoors at **30 fps with the CPU
+near-idle** (maximum thermal headroom).
 
 ---
+
+## Project layout
+
+```
+orin-nano-recorder/
+├── recorder/            Runs ON THE ORIN — capture + web control panel
+│   ├── record.py          hardware-MJPEG → MKV recorder (GStreamer)
+│   └── server.py          Flask web panel (Start/Stop, live preview, thermals, snapshots)
+├── calibration/         Runs ON YOUR MAC/DESKTOP — ChArUco stereo calibration
+│   ├── show_board.py      generate/display the ChArUco board
+│   ├── calibrate.py       intrinsics (L+R) + stereo extrinsics from snapshots
+│   ├── images/            calibration snapshots (git-ignored)
+│   └── *_intrinsics.json, stereo_extrinsics.json   calibration results
+├── stitching/           Runs ON YOUR MAC/DESKTOP — panorama stitcher (C++)
+│   ├── stitch_pipeline.cpp   calibration-driven cylindrical stitch (image or video)
+│   ├── CMakeLists.txt
+│   └── include/json.hpp
+├── 3d-housing-model/    Printable enclosure (Housing.zip)
+└── setup.sh             Orin dependency install / L4T element check
+```
+
+## The workflow
+
+1. **Record** on the Orin (`recorder/`) → combined `3840×1200` MKV on the NVMe, and
+   full-res calibration snapshots via the web panel's Snapshot button.
+2. **Calibrate** on your computer (`calibration/`) → per-camera intrinsics +
+   the stereo extrinsic rotation between the two cameras (JSON files).
+3. **Stitch** on your computer (`stitching/`) → feed a frame or video + the
+   calibration and get a cylindrical panorama. Alignment is driven purely by the
+   calibration — no feature matching.
+
+---
+
+# 1. Recorder (on the Orin)
+
+`recorder/record.py` (CLI) and `recorder/server.py` (web panel).
 
 ## The one thing to understand first
 
 **The Jetson Orin Nano (and Orin NX) have no hardware video encoder (no NVENC).**
-That single fact drives every design decision here, and it's the thing that costs
-people the most time. Consequences:
+That single fact drives every design decision here:
 
 1. **No `nvv4l2h264enc` / `nvv4l2h265enc`** — they don't exist on this board. H.264/
    H.265 must be done in *software* (x264, CPU-heavy) or you use the **hardware JPEG
@@ -24,175 +58,230 @@ people the most time. Consequences:
    ~40 GB/hr vs ~7 for H.264. A 500 GB drive holds ~12 hours.)
 
 2. **Capture with `nvv4l2camerasrc`, never `v4l2src`.** Plain `v4l2src` copies every
-   9 MB frame on one CPU thread, which pegs a core and caps the *entire* pipeline at
-   ~28 fps regardless of the encoder. `nvv4l2camerasrc` captures zero-copy into NVMM
-   (GPU memory); with it you get a clean, sustained 30 fps and the CPU barely moves.
-   **This was the single fix that unblocked everything.**
+   9 MB frame on one CPU thread, pegging a core and capping the pipeline at ~28 fps.
+   `nvv4l2camerasrc` captures zero-copy into NVMM (GPU memory) → clean, sustained
+   30 fps with the CPU barely moving. **This was the single fix that unblocked everything.**
 
 3. **Every queue is `leaky=downstream`.** `nvvidconv` (the VIC) owns a tiny output
-   buffer pool; a normal (non-leaky) queue behind it grabs all the buffers and
-   *deadlocks* the pipeline (one core spins at 100%, no frames flow). Leaky queues
-   drop a frame under pressure instead of stalling.
+   buffer pool; a non-leaky queue behind it grabs all the buffers and *deadlocks* the
+   pipeline. Leaky queues drop a frame under pressure instead of stalling.
 
 4. **Stop with SIGINT, never SIGTERM/SIGKILL.** The MKV gets its duration + seek
-   index only on a clean end-of-stream, which `gst-launch -e` emits on SIGINT. Kill
-   it any other way and you get an unfinalized file (`Duration: N/A`, won't scrub).
-
----
-
-## Hardware / prerequisites
-
-- Jetson Orin Nano (or NX) with JetPack / L4T installed.
-- Arducam B0577 stereo kit (or any V4L2 camera that outputs **UYVY** over CSI).
-  Install the vendor camera driver per Arducam's instructions first — confirm with
-  `v4l2-ctl --list-formats-ext`.
-- An NVMe (or fast storage) mounted at **`/mnt/video`** and writable by your user.
-- The NVIDIA L4T GStreamer elements (`nvv4l2camerasrc`, `nvvidconv`, `nvjpegenc`) —
-  these ship with JetPack.
-
-> **Different camera or resolution?** Edit `width`/`height`/`fps`/`pixel_format` in
-> the `Config` class in `record.py` (and the preview caps in `server.py`). The
-> design is camera-agnostic as long as the source is a V4L2 YUV device.
-
----
-
-## Tested environment / version requirements
-
-Verified on the configuration below. It is **not tightly version-locked** — the
-real requirement is simply an L4T install that provides the `nvv4l2camerasrc`,
-`nvvidconv`, and `nvjpegenc` GStreamer elements plus a working camera driver — but
-this is the exact stack it was developed and validated against.
-
-| Component | Tested version | How to check on your board |
-|---|---|---|
-| Board | Jetson Orin Nano Developer Kit | — |
-| JetPack | **6.2** (L4T **R36.4.3**, kernel **5.15.148-tegra**) | `cat /etc/nv_tegra_release` |
-| OS | Ubuntu **22.04** (jammy), arm64 | `lsb_release -a` |
-| Python | **3.10** | `python3 --version` |
-| GStreamer | **1.20.3** | `gst-launch-1.0 --version` |
-| Flask | **2.0.1** (`python3-flask`) | `python3 -c "import flask; print(flask.__version__)"` |
-| v4l-utils | **1.22.1** | `v4l2-ctl --version` |
-| Camera | Arducam **B0577** dual global-shutter (2.3 MP × 2, onboard ISP) | `v4l2-ctl --list-formats-ext` |
-| Arducam driver | `arducam-nvidia-l4t-kernel` **5.15.148-tegra-36.4.3-20250205154721** | `dpkg -l \| grep -i arducam` |
-
-**Notes**
-
-- **JetPack/L4T:** R36.4 ships GStreamer 1.20 and the NVIDIA multimedia elements
-  this project depends on. Older L4T (e.g. R35.x / JetPack 5) also has them but is
-  untested here. The camera driver **must match your JetPack version** — install
-  the Arducam release built for your exact JetPack (see below).
-- **CUDA / cuDNN / TensorRT** are part of JetPack (12.6 / 9.3 / 10.3 on this build)
-  but are **not used** by this project — no GPU compute is involved, only the VIC
-  and the NVJPG hardware JPEG engine. You don't need them for recording.
-- **Arducam driver:** the B0577 needs Arducam's kernel driver + device-tree overlay
-  installed *before* this will see the camera. Follow Arducam's instructions for the
-  B0577 on your JetPack version, then confirm the camera enumerates with
-  `v4l2-ctl --list-formats-ext` (you should see `UYVY 3840x1200`).
-- **Kernel pinning (important):** the Arducam driver here is a *kernel package*
-  (`arducam-nvidia-l4t-kernel`) built for the exact kernel **5.15.148-tegra /
-  L4T 36.4.3**. Do **not** `apt upgrade` the kernel without installing a matching
-  Arducam build, or the camera will stop enumerating after reboot. Pin/hold the
-  kernel, or upgrade kernel + Arducam driver together as a set.
-
----
-
-## Install
-
-```bash
-git clone <your-repo-url> orin-recorder
-cd orin-recorder
-./setup.sh          # apt deps + checks the L4T elements are present
-```
-
-`setup.sh` installs `v4l-utils`, `python3-flask`, and the GStreamer good/base
-plugins, then verifies the NVIDIA elements exist.
-
----
+   index only on a clean end-of-stream (`gst-launch -e` on SIGINT). Kill it any other
+   way and you get an unfinalized file (`Duration: N/A`, won't scrub).
 
 ## Usage
 
-### Recorder (CLI)
-
 ```bash
+cd recorder
+# CLI recorder
 python3 record.py                 # record until Enter / Ctrl+C
 python3 record.py --seconds 30    # fixed duration
 python3 record.py --measure --seconds 20         # benchmark fps, no disk write
 python3 record.py --seconds 600 --log-thermals   # soak test + tegrastats log
-python3 record.py --quality 90    # higher MJPEG quality (bigger files)
 python3 record.py --dry-run       # print the pipeline, don't run
-```
 
-Stop a running recording with **Enter** or **Ctrl-C** — both finalize cleanly.
-
-### Web control panel
-
-```bash
+# Web control panel
 sudo python3 server.py            # sudo enables the "log thermals to file" toggle
-hostname -I                       # find the Orin's LAN IP
 ```
 
-Browse from your phone/laptop on the same network to **`http://<orin-ip>:8080`**.
-You get: live preview (before *and* during recording), Start/Stop, elapsed time,
-a live on-screen thermal readout, a show/hide-preview toggle, and an optional
-thermal-log-to-file toggle.
+Browse from a phone/laptop on the same network to **`http://<orin-ip>:8080`** (find
+the IP with `hostname -I`, or use `http://<hostname>.local:8080`). The panel gives you
+live preview (idle *and* recording), Start/Stop, elapsed time, live thermals, and a
+**Snapshot** button that writes full-res stills to `/mnt/video/calib` for calibration.
 
-Install Flask via apt (no pip needed): `sudo apt install -y python3-flask`.
+## How it works
+
+```
+record.py builds & runs a GStreamer pipeline:
+  nvv4l2camerasrc → NVMM,UYVY → nvvidconv → I420 → queue(leaky)
+    → nvjpegenc → jpegparse → matroskamux → filesink            (the MKV)
+  with --preview-port it tees a second branch to a tcpserversink (MJPEG preview)
+
+server.py owns an idle-preview pipeline when stopped, hands the camera to record.py
+  on Start, and relays the MJPEG to the browser at /preview.mjpg. Stop = SIGINT =
+  clean finalize. The camera is single-open, so one pipeline holds it at a time.
+```
+
+## Auto-start on boot (systemd)
+
+Run the panel as a service so it survives reboots. Point it at `recorder/server.py`
+and use **`KillSignal=SIGINT`** so `systemctl stop` finalizes the current recording:
+
+```ini
+# /etc/systemd/system/camera-rig.service
+[Unit]
+After=network-online.target
+Wants=network-online.target
+[Service]
+WorkingDirectory=/home/<user>/orin-nano-recorder/recorder
+ExecStart=/usr/bin/python3 /home/<user>/orin-nano-recorder/recorder/server.py
+Restart=on-failure
+User=root
+[Install]
+WantedBy=multi-user.target
+```
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now camera-rig
+```
+
+For a **portable** rig, the Orin can broadcast its own Wi-Fi hotspot (NetworkManager
+`ipv4.method shared`), so a phone/laptop connects directly at a fixed address with no
+router. Give the Orin higher auto-connect priority on your home Wi-Fi so it rejoins
+that when in range and falls back to the hotspot in the field.
 
 ---
 
-## How it works (architecture)
+# 2. Calibration (on your computer)
 
-```
-record.py  ── builds & runs a GStreamer pipeline:
-  nvv4l2camerasrc → NVMM,UYVY → nvvidconv → I420 → queue(leaky)
-    → nvjpegenc → jpegparse → matroskamux → filesink           (the MKV)
+ChArUco-based stereo calibration. **Run on your Mac/desktop, not the Orin** — it needs
+`opencv-contrib-python` (the `aruco` module):
 
-  with --preview-port it tees a second branch:
-    → tee ─┬→ [record branch above]                            (NVJPG engine)
-           └→ queue(leaky) → downscale → nvjpegenc → tcpserversink   (NVJPG1 engine)
-
-server.py  ── owns an idle-preview pipeline when stopped, hands the camera to
-  record.py (with its preview tee) on Start, and relays the MJPEG to the browser
-  at /preview.mjpg. State lives in the server; the page is a thin client that polls
-  /status and /thermals. Stop = SIGINT to record.py = clean finalize.
+```bash
+pip install -U opencv-contrib-python numpy
 ```
 
-The camera is single-open, so only one pipeline holds it at a time; the idle and
-recording previews serve on the same port, so the browser sees one continuous
-viewfinder that just blinks once on Start/Stop.
+## Steps
+
+1. **Board.** `python3 calibration/show_board.py` generates/opens `charuco_board.png`
+   (7×10, `DICT_5X5_1000`). **Print it** (matte, glued flat) — printing beats a screen
+   (screens add glare/moiré that break detection). **Measure one black square with
+   calipers** — you'll pass that size.
+2. **Capture.** From the web panel, tap **Snapshot** ~30–40× with the board at varied
+   angles/distances. Cover each camera's whole frame **and** get a good batch with the
+   board centred where **both** cameras see it (that overlap set drives the extrinsics).
+3. **Pull the shots** to `calibration/images/`:
+   ```bash
+   scp -r <user>@<orin-host>:/mnt/video/calib ./calibration/images
+   ```
+4. **Calibrate** (from `calibration/`, pass your measured board sizes in mm):
+   ```bash
+   python3 calibrate.py --square-mm 66.5 --marker-mm 48.5
+   ```
+
+Outputs `left_intrinsics.json`, `right_intrinsics.json`, `stereo_extrinsics.json`
+(baseline in mm + rotation), plus undistort/rectified sample images.
+
+- Intrinsics are **mount-independent**; extrinsics describe the **fixed housing** —
+  re-run if the cameras are disturbed.
+- To re-solve only the extrinsics from a fresh overlap batch without recomputing
+  intrinsics: `python3 calibrate.py --use-intrinsics . --square-mm 66.5 --marker-mm 48.5`.
+- Good result: RMS < ~1 px per camera and for the stereo solve, ≥80% frame coverage,
+  ≥10 stereo views, and a baseline matching your real lens spacing.
+
+---
+
+# 3. Stitching (on your computer)
+
+`stitching/stitch_pipeline.cpp` — a calibration-driven **cylindrical** stitcher. Reads
+the calibration JSON and stitches the combined LEFT|RIGHT feed into one panorama.
+**No feature detection** (no BRISK / findHomography); alignment is the extrinsic
+rotation `R`. Per-frame work runs on `cv::UMat`, so it uses the **GPU via OpenCL**
+when available and falls back to CPU otherwise — same source on macOS and desktop,
+OpenCV 4.x or 5.x.
+
+## Build
+
+```bash
+# macOS: brew install cmake opencv
+cd stitching
+cmake -S . -B build && cmake --build build
+```
+
+## Run
+
+```bash
+# single image → pipeline_out/pano.jpg (+ overlap_5050.jpg)
+./build/StitchPipeline --source ../calibration/images/calib_114.jpg
+
+# video → pipeline_out/stitched_video.mp4
+./build/StitchPipeline --source recording.mp4 --start 300 --end 900
+```
+
+Source type is auto-detected: images stitch one frame; videos (`.mp4/.mkv/.mov/...`)
+loop frames. The remap maps depend only on the calibration, so they're built once and
+reused for every frame.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--source PATH` | (required) | Combined LEFT\|RIGHT image or video (alias `--image`) |
+| `--calib-dir DIR` | `../calibration` | Folder with the intrinsics/extrinsics JSON |
+| `--out DIR` | `pipeline_out` | Output folder |
+| `--start N` / `--end N` | `0` / `-1` | Video frame range (`-1` = end) |
+| `--degrees D` | `0` | Horizon roll correction |
+| `--seam X` | auto | Hard-seam column (default: overlap centre) |
+
+> **Exposure/seam:** in high-contrast scenes the seam can show a brightness step (one
+> camera facing a bright window). Exposure compensation + seam feathering are future
+> additions; on evenly-lit footage it isn't an issue.
+
+---
+
+## Hardware / prerequisites (Orin)
+
+- Jetson Orin Nano (or NX) with JetPack / L4T.
+- Arducam B0577 stereo kit (or any V4L2 camera that outputs **UYVY** over CSI). Install
+  the vendor driver first — confirm with `v4l2-ctl --list-formats-ext` (expect
+  `UYVY 3840x1200`).
+- An NVMe mounted at **`/mnt/video`**, writable by your user.
+- NVIDIA L4T GStreamer elements (`nvv4l2camerasrc`, `nvvidconv`, `nvjpegenc`) — ship
+  with JetPack.
+
+Install on the Orin:
+```bash
+git clone <your-repo-url> orin-nano-recorder
+cd orin-nano-recorder
+./setup.sh          # apt deps + checks the L4T elements are present
+```
+
+> **Different camera/resolution?** Edit the `Config` in `recorder/record.py` (and the
+> preview caps in `recorder/server.py`). Camera-agnostic as long as the source is a
+> V4L2 YUV device.
+
+### Tested environment
+
+| Component | Tested version |
+|---|---|
+| Board | Jetson Orin Nano Developer Kit |
+| JetPack | 6.2 (L4T R36.4.3, kernel 5.15.148-tegra) |
+| OS | Ubuntu 22.04 (jammy), arm64 |
+| Python / GStreamer / Flask | 3.10 / 1.20.3 / 2.0.1 |
+| Camera | Arducam B0577 dual global-shutter (2.3 MP × 2, onboard ISP) |
+| Stitcher OpenCV | 4.x or 5.x (built per machine) |
+
+**Kernel pinning (important):** the Arducam driver is a kernel package built for the
+exact kernel/L4T. Don't `apt upgrade` the kernel without a matching Arducam build, or
+the camera stops enumerating after reboot. Pin the kernel, or upgrade both together.
 
 ---
 
 ## Playback
 
 MJPEG-in-MKV doesn't open in some default players. **Use VLC:**
-
 ```bash
 sudo apt install -y vlc
-xdg-mime default vlc.desktop video/x-matroska   # double-click .mkv opens VLC
+xdg-mime default vlc.desktop video/x-matroska
 ```
 
----
-
-## Troubleshooting
+## Troubleshooting (recorder)
 
 | Symptom | Cause / fix |
 |---|---|
 | Caps "not-negotiated" at start | Camera doesn't offer that format/res — check `v4l2-ctl --list-formats-ext`. |
 | One core at 100%, ~26–28 fps | You're using `v4l2src`. Switch to `nvv4l2camerasrc`. |
-| Pipeline freezes, one core spinning | A non-leaky `queue` after `nvvidconv` deadlocked the VIC pool. Make queues `leaky=downstream`. |
-| `Duration: N/A`, won't scrub in VLC | File wasn't finalized — it was killed with SIGTERM. Stop with SIGINT (Enter/Ctrl-C). |
+| Pipeline freezes, one core spinning | Non-leaky `queue` after `nvvidconv` deadlocked the VIC pool. Use `leaky=downstream`. |
+| `Duration: N/A`, won't scrub in VLC | File wasn't finalized — killed with SIGTERM. Stop with SIGINT (Enter/Ctrl-C). |
 | Green / tiny file | No real camera signal — check the ribbon and driver. |
 | `nvv4l2h265enc` missing | Expected on Orin Nano/NX (no NVENC). Use MJPEG. |
-| Preview pane black | Confirm `multipartmux` exists (`gst-inspect-1.0 multipartmux`, in plugins-good). |
 
----
+## Troubleshooting (calibration / stitching)
 
-## Auto-start on boot (optional)
-
-Run the control panel as a service so it survives reboots/logout. See
-`systemd/` if present, or create a unit with **`KillSignal=SIGINT`** so
-`systemctl stop` finalizes the current recording cleanly.
+| Symptom | Cause / fix |
+|---|---|
+| `No module named cv2.aruco` | `pip install -U opencv-contrib-python` (calibration needs contrib). |
+| 0 stereo views / no overlap | Board never fully visible to both cameras at once — get it centred and big in **both** preview halves; print it (screens fail). |
+| Baseline scale looks wrong | `--square-mm`/`--marker-mm` must match the **measured** printed board. |
+| Stitch seam ghosting on near objects | Parallax from the baseline — unavoidable rotation-only; minimal on distant scenes. |
 
 ---
 
