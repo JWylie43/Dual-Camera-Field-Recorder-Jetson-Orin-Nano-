@@ -247,6 +247,15 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
     return pano;
 }
 
+// POS_FRAMES seeking is unreliable on un-indexed MJPEG-MKV, so step sequentially:
+// grab n frames (0..n-1) so the NEXT read() returns frame n.
+static bool seekFrame(VideoCapture &cap, int n)
+{
+    for (int i = 0; i < n; i++)
+        if (!cap.grab()) return false;
+    return true;
+}
+
 static string stitchImageFile(const string &source, StitchMaps &m, double degrees,
                               const Align &a, const string &outDir)
 {
@@ -276,7 +285,7 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
     string out = outDir + "/stitched_video.mp4";
     VideoWriter writer(out, VideoWriter::fourcc('m', 'p', '4', 'v'), fps, Size(m.OW, m.OH));
     if (!writer.isOpened()) return "ERROR: cannot open output video";
-    cap.set(CAP_PROP_POS_FRAMES, s);
+    seekFrame(cap, s);
     Mat frame, pano;
     UMat uFrame, wL, wR;
     int written = 0;
@@ -508,6 +517,9 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
     cout << "\nTuner running at " << url << "  (opening browser; Ctrl+C or Quit to stop)\n";
     openBrowser(url);
 
+    VideoCapture frameCap;   // persistent for /frame scrubbing (forward = fast grab)
+    int frameCapPos = -1;    // index of the last frame retrieved into frameCap
+
     bool running = true;
     while (running)
     {
@@ -566,9 +578,14 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
             ctype = "application/json";
             int n = 0; string ns = qparam(query, "n");
             if (!ns.empty()) n = stoi(ns);
-            VideoCapture cap(source);
+            if (n < 0) n = 0;
             Mat frame;
-            if (cap.isOpened()) { if (n > 0) cap.set(CAP_PROP_POS_FRAMES, n); cap.read(frame); cap.release(); }
+            // sequential positioning (seeking is unreliable). Grab forward from the
+            // current position; only re-open when scrubbing backward.
+            if (!frameCap.isOpened() || n < frameCapPos)
+            { frameCap.release(); frameCap.open(source); frameCapPos = -1; }
+            while (frameCapPos < n) { if (!frameCap.grab()) break; frameCapPos++; }
+            if (frameCapPos == n) frameCap.retrieve(frame);
             if (frame.empty()) { body = "{\"error\":\"cannot read frame\"}"; }
             else
             {
@@ -608,6 +625,7 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
         send(cl, resp.data(), (int)resp.size(), 0);
         CLOSESOCK(cl);
     }
+    frameCap.release();
     CLOSESOCK(srv);
 #ifdef _WIN32
     WSACleanup();
@@ -713,7 +731,7 @@ int main(int argc, char **argv)
                 double fps = cap.get(CAP_PROP_FPS);
                 totalFrames = probeFrames(source, fps > 0 ? fps : 30.0);
             }
-            if (startFrame > 0) cap.set(CAP_PROP_POS_FRAMES, startFrame);
+            if (startFrame > 0) seekFrame(cap, startFrame);
             cap.read(frame);
             cap.release();
         }

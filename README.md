@@ -242,7 +242,9 @@ browser** to a live tuner. There you:
   any frame and align on it — the current frame and total (`N / 1591`) are shown.
   The total comes from `ffprobe` packet-counting (fast, exact for MJPEG even when the
   container reports no frame count); if `ffprobe` isn't available, the frame box +
-  prev/next still work, just without a fixed slider range,
+  prev/next still work, just without a fixed slider range. (These recordings can't be
+  seeked, so frames are reached by reading sequentially — scrubbing **forward** is
+  fast; a big jump **backward** re-reads from the start and takes a moment.)
 - every value is a **typeable box** — click the ◀ ▶ arrows or just type a number,
 - toggle **overlap blend** (50/50) to check alignment,
 - click **Stitch all frames** to run the full stitch on the whole image/video with
