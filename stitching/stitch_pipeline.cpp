@@ -9,8 +9,10 @@
 //   * image source (.jpg/.png/...) -> stitch the single frame  -> pano.jpg
 //   * video source (.mp4/.mkv/...)  -> loop frames [start..end] -> stitched_video.mp4
 //
-// Per camera it folds distortion + cylindrical projection + rotation into one remap,
-// then hard-seam composites the two halves.
+// GPU: the per-frame work (remap + composite) runs on cv::UMat, so OpenCV's
+// Transparent API uses the GPU via OpenCL when available (e.g. the desktop) and
+// falls back to CPU otherwise (e.g. Apple Silicon) - same code either way. The maps
+// are uploaded to the GPU once; per frame only the frame in / panorama out move.
 //
 // Uses only core/imgproc/imgcodecs/videoio, so it builds on both OpenCV 4.x and 5.x.
 //
@@ -19,6 +21,7 @@
 //                                [--out DIR] [--start N] [--end N] [--degrees D] [--seam X]
 
 #include <opencv2/core.hpp>
+#include <opencv2/core/ocl.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
@@ -36,12 +39,13 @@ using namespace std;
 using namespace cv;
 namespace fs = std::filesystem;
 
-// Precomputed, frame-independent stitch geometry.
+// Precomputed, frame-independent stitch geometry. Maps are held both as CPU Mats
+// (built once) and as UMats uploaded to the GPU for the per-frame remap.
 struct StitchMaps
 {
-    Mat mapLx, mapLy, mapRx, mapRy;   // per-camera combined remap (undistort+cyl+rotation)
-    int OW = 0, OH = 0;               // panorama size
-    int seam = 0;                     // hard-seam column
+    UMat mapLx, mapLy, mapRx, mapRy;   // per-camera combined remap (undistort+cyl+rotation)
+    int OW = 0, OH = 0;                // panorama size
+    int seam = 0;                      // hard-seam column
 };
 
 static void loadIntrinsics(const string &path, Mat &K, vector<double> &D)
@@ -125,7 +129,8 @@ static void buildCylMap(const Mat &K, const vector<double> &D, const Mat &R_cam_
     }
 }
 
-// Build the frame-independent maps + canvas + seam from calibration and frame size.
+// Build the frame-independent maps + canvas + seam from calibration and frame size,
+// then upload the maps to the GPU (UMat) once for the per-frame remap.
 static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
                                   const Mat &KR, const vector<double> &DR,
                                   const Mat &R, int w, int h, int seamArg)
@@ -145,9 +150,9 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
     for (int i = 0; i < m.OW; i++) theta[i] = thetaMin + i / fcyl;
     for (int i = 0; i < m.OH; i++) hval[i] = (i - m.OH / 2.0) / fcyl;
 
-    Mat okL, okR;
-    buildCylMap(KL, DL, Mat::eye(3, 3, CV_64F), theta, hval, w, h, m.mapLx, m.mapLy, okL);
-    buildCylMap(KR, DR, R, theta, hval, w, h, m.mapRx, m.mapRy, okR);
+    Mat mapLx, mapLy, mapRx, mapRy, okL, okR;
+    buildCylMap(KL, DL, Mat::eye(3, 3, CV_64F), theta, hval, w, h, mapLx, mapLy, okL);
+    buildCylMap(KR, DR, R, theta, hval, w, h, mapRx, mapRy, okR);
 
     vector<int> overlapCols;
     for (int x = 0; x < m.OW; x++)
@@ -159,25 +164,30 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
     }
     m.seam = seamArg >= 0 ? seamArg
              : (overlapCols.empty() ? m.OW / 2 : overlapCols[overlapCols.size() / 2]);
+
+    // upload the maps to the GPU once (reused for every frame)
+    mapLx.copyTo(m.mapLx); mapLy.copyTo(m.mapLy);
+    mapRx.copyTo(m.mapRx); mapRy.copyTo(m.mapRy);
+
     cout << "panorama " << m.OW << "x" << m.OH
          << ", right yaw " << yawR * 180.0 / CV_PI << " deg, hard seam @ " << m.seam
          << (overlapCols.empty() ? "  [!! no overlap]" : "") << "\n";
     return m;
 }
 
-// Warp both halves of a combined frame onto the cylinder (before compositing).
-static void warpHalves(const Mat &frame, const StitchMaps &m, Mat &warpL, Mat &warpR)
+// Warp both halves of a combined frame onto the cylinder (GPU via UMat).
+static void warpHalves(const UMat &frame, const StitchMaps &m, UMat &warpL, UMat &warpR)
 {
     int w = frame.cols / 2, h = frame.rows;
-    Mat left = frame(Rect(0, 0, w, h));
-    Mat right = frame(Rect(w, 0, frame.cols - w, h));
+    UMat left = frame(Rect(0, 0, w, h)).clone();
+    UMat right = frame(Rect(w, 0, frame.cols - w, h)).clone();
     remap(left, warpL, m.mapLx, m.mapLy, INTER_LINEAR, BORDER_CONSTANT);
     remap(right, warpR, m.mapRx, m.mapRy, INTER_LINEAR, BORDER_CONSTANT);
 }
 
-static Mat composite(const Mat &warpL, const Mat &warpR, const StitchMaps &m, double degrees)
+static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m, double degrees)
 {
-    Mat pano = Mat::zeros(m.OH, m.OW, warpL.type());
+    UMat pano(m.OH, m.OW, warpL.type(), Scalar::all(0));
     warpL(Rect(0, 0, m.seam, m.OH)).copyTo(pano(Rect(0, 0, m.seam, m.OH)));
     warpR(Rect(m.seam, 0, m.OW - m.seam, m.OH)).copyTo(pano(Rect(m.seam, 0, m.OW - m.seam, m.OH)));
     if (degrees != 0.0)
@@ -224,6 +234,10 @@ int main(int argc, char **argv)
     }
     fs::create_directories(outDir);
 
+    ocl::setUseOpenCL(true);   // enable GPU path when OpenCL is present (else CPU fallback)
+    cout << "OpenCL available: " << ocl::haveOpenCL()
+         << ", using GPU: " << ocl::useOpenCL() << "\n";
+
     Mat KL, KR, R;
     vector<double> DL, DR;
     loadIntrinsics(calibDir + "/left_intrinsics.json", KL, DL);
@@ -236,11 +250,15 @@ int main(int argc, char **argv)
         Mat img = imread(source);
         if (img.empty()) { cerr << "Cannot read image: " << source << endl; return 1; }
         StitchMaps m = buildStitchMaps(KL, DL, KR, DR, R, img.cols / 2, img.rows, seamArg);
-        Mat warpL, warpR;
-        warpHalves(img, m, warpL, warpR);
-        Mat pano = composite(warpL, warpR, m, degrees);
-        Mat overlap;
-        addWeighted(warpL, 0.5, warpR, 0.5, 0.0, overlap);
+        UMat uImg, warpL, warpR;
+        img.copyTo(uImg);
+        warpHalves(uImg, m, warpL, warpR);
+        UMat uPano = composite(warpL, warpR, m, degrees);
+        UMat uOverlap;
+        addWeighted(warpL, 0.5, warpR, 0.5, 0.0, uOverlap);
+        Mat pano, overlap;
+        uPano.copyTo(pano);
+        uOverlap.copyTo(overlap);
         imwrite(outDir + "/pano.jpg", pano);
         imwrite(outDir + "/overlap_5050.jpg", overlap);
         cout << "image -> " << outDir << "/pano.jpg (+ overlap_5050.jpg)\n";
@@ -267,18 +285,22 @@ int main(int argc, char **argv)
     if (!writer.isOpened()) { cerr << "Cannot open output video for writing: " << outPath << endl; return 1; }
 
     cap.set(CAP_PROP_POS_FRAMES, startFrame);
-    Mat frame, warpL, warpR;
+    Mat frame, pano;
+    UMat uFrame, warpL, warpR;
     int written = 0;
     for (int i = startFrame; i <= endFrame; i++)
     {
         if (!cap.read(frame) || frame.empty()) break;
-        warpHalves(frame, m, warpL, warpR);
-        Mat pano = composite(warpL, warpR, m, degrees);
+        frame.copyTo(uFrame);                       // upload to GPU
+        warpHalves(uFrame, m, warpL, warpR);        // remap on GPU
+        UMat uPano = composite(warpL, warpR, m, degrees);
+        uPano.copyTo(pano);                         // download to write
         writer.write(pano);
-        if (i == startFrame)   // first-frame alignment debug
+        if (i == startFrame)                        // first-frame alignment debug
         {
-            Mat overlap;
-            addWeighted(warpL, 0.5, warpR, 0.5, 0.0, overlap);
+            UMat uOverlap; Mat overlap;
+            addWeighted(warpL, 0.5, warpR, 0.5, 0.0, uOverlap);
+            uOverlap.copyTo(overlap);
             imwrite(outDir + "/overlap_5050.jpg", overlap);
         }
         written++;
