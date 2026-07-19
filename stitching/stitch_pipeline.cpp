@@ -307,7 +307,8 @@ static string base64(const vector<uchar> &data)
     return out;
 }
 
-static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &m)
+static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
+                        int total, int startIdx)
 {
     Mat mL, mR;
     warpL.copyTo(mL); warpR.copyTo(mR);
@@ -316,7 +317,8 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
     imencode(".jpg", mR, bR, q);
     ostringstream h;
     h << "<!doctype html><html><head><meta charset='utf-8'><title>Stitch tuner</title>"
-      << "<script>const OW=" << m.OW << ",OH=" << m.OH << ",SEAM0=" << m.seam << ";"
+      << "<script>const OW=" << m.OW << ",OH=" << m.OH << ",SEAM0=" << m.seam
+      << ",TOTAL=" << total << ",FRAME0=" << startIdx << ";"
       << "const IMGL='data:image/jpeg;base64," << base64(bL) << "';"
       << "const IMGR='data:image/jpeg;base64," << base64(bR) << "';</script>"
       << R"HTML(<style>
@@ -334,6 +336,7 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
   <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><span class="val" id="bv">0</span><button id="br">&#9654;</button></div>
   <div class="grp">Shift-y <button id="yl">&#9664;</button><span class="val" id="yv">0</span><button id="yr">&#9654;</button></div>
   <div class="grp">Seam <button id="ml">&#9664;</button><span class="val" id="mv">0</span><button id="mr">&#9654;</button></div>
+  <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:150px"><span class="val" id="fval">0</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
   <div class="grp">step <select id="step"><option>1</option><option>2</option><option>5</option><option>10</option></select></div>
   <button id="stitch">Stitch all frames</button>
@@ -350,12 +353,28 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
 <script>
 const cv=document.getElementById('c'), ctx=cv.getContext('2d');
 cv.width=OW; cv.height=OH;
-let sTop=0, sBot=0, sY=0, seam=SEAM0, loaded=0;
+let sTop=0, sBot=0, sY=0, seam=SEAM0, pending=0;
 const imgL=new Image(), imgR=new Image();
-imgL.onload=imgR.onload=()=>{ if(++loaded===2) render(); };
-imgL.src=IMGL; imgR.src=IMGR;
+function both(){ if(--pending<=0){ pending=0; render(); } }
+imgL.onload=imgR.onload=both;
+pending=2; imgL.src=IMGL; imgR.src=IMGR;
 const stepv=()=>parseInt(document.getElementById('step').value)||1;
 const st=t=>document.getElementById('status').textContent=t;
+// frame scrubbing (video only)
+const frange=document.getElementById('frange'), fval=document.getElementById('fval');
+frange.max=Math.max(0,TOTAL-1); frange.value=FRAME0; fval.textContent=FRAME0;
+if(TOTAL<=1) document.getElementById('framegrp').style.display='none';
+function loadFrame(n){
+  n=Math.max(0,Math.min(TOTAL-1,n)); frange.value=n; fval.textContent=n;
+  st('Loading frame '+n+'…');
+  fetch('/frame?n='+n).then(r=>r.json()).then(d=>{
+    if(d.error){ st('frame error: '+d.error); return; }
+    pending=2; imgL.src=d.left; imgR.src=d.right; st('Frame '+n);
+  }).catch(e=>st('frame load error: '+e));
+}
+document.getElementById('fprev').onclick=()=>loadFrame(parseInt(frange.value)-1);
+document.getElementById('fnext').onclick=()=>loadFrame(parseInt(frange.value)+1);
+frange.onchange=()=>loadFrame(parseInt(frange.value));
 function drawRight(){
   const k=(OH>1)?(sBot-sTop)/(OH-1):0;         // per-row shear slope
   ctx.save(); ctx.transform(1,0,k,1,sTop,sY); ctx.drawImage(imgR,0,0); ctx.restore();
@@ -444,12 +463,13 @@ static void openBrowser(const string &url)
 
 static void runTuneServer(const string &source, bool video, StitchMaps &m,
                           const UMat &warpL, const UMat &warpR, double degrees,
-                          int startFrame, int endFrame, const string &outDir, int port)
+                          int startFrame, int endFrame, const string &outDir,
+                          int totalFrames, int port)
 {
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
-    string html = tunerHtml(warpL, warpR, m);
+    string html = tunerHtml(warpL, warpR, m, totalFrames, startFrame);
 
     socket_t srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv == INVALID_SOCKET) { cerr << "socket() failed\n"; return; }
@@ -521,6 +541,29 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
                     cout << "[stitch] done -> " << res << "\n";
                 }).detach();
                 body = "started";
+            }
+        }
+        else if (path == "/frame")
+        {
+            ctype = "application/json";
+            int n = 0; string ns = qparam(query, "n");
+            if (!ns.empty()) n = stoi(ns);
+            VideoCapture cap(source);
+            Mat frame;
+            if (cap.isOpened()) { if (n > 0) cap.set(CAP_PROP_POS_FRAMES, n); cap.read(frame); cap.release(); }
+            if (frame.empty()) { body = "{\"error\":\"cannot read frame\"}"; }
+            else
+            {
+                UMat uF, wL, wR; frame.copyTo(uF);
+                warpHalves(uF, m, wL, wR);
+                Mat mL, mR; wL.copyTo(mL); wR.copyTo(mR);
+                vector<uchar> bL, bR; vector<int> q = {IMWRITE_JPEG_QUALITY, 85};
+                imencode(".jpg", mL, bL, q);
+                imencode(".jpg", mR, bR, q);
+                ostringstream j;
+                j << "{\"left\":\"data:image/jpeg;base64," << base64(bL)
+                  << "\",\"right\":\"data:image/jpeg;base64," << base64(bR) << "\"}";
+                body = j.str();
             }
         }
         else if (path == "/progress")
@@ -613,12 +656,14 @@ int main(int argc, char **argv)
     bool video = isVideoFile(source);
 
     Mat frame;
+    int totalFrames = 1;
     if (!video) frame = imread(source);
     else
     {
         VideoCapture cap(source);
         if (cap.isOpened())
         {
+            totalFrames = (int)cap.get(CAP_PROP_FRAME_COUNT);
             if (startFrame > 0) cap.set(CAP_PROP_POS_FRAMES, startFrame);
             cap.read(frame);
             cap.release();
@@ -633,7 +678,8 @@ int main(int argc, char **argv)
         UMat uFrame, warpL, warpR;
         frame.copyTo(uFrame);
         warpHalves(uFrame, m, warpL, warpR);
-        runTuneServer(source, video, m, warpL, warpR, degrees, startFrame, endFrame, outDir, port);
+        runTuneServer(source, video, m, warpL, warpR, degrees, startFrame, endFrame, outDir,
+                      totalFrames, port);
         return 0;
     }
 

@@ -238,6 +238,8 @@ browser** to a live tuner. There you:
   the **◀ ▶** arrows (←/→ shifts both top & bottom together; `[` `]` moves the seam)
   over a live stitched preview — align the far and near edges of the field so the
   whole thing lines up under a straight vertical seam,
+- **for a video**, use the **Frame** slider (or its ◀ ▶) to jump to any frame and
+  align on it — handy when the first frame doesn't show the detail you need,
 - toggle **overlap blend** (50/50) to check alignment,
 - click **Stitch all frames** to run the full stitch on the whole image/video with
   the current values — a **progress bar** tracks it and a **✅ Done** message shows
