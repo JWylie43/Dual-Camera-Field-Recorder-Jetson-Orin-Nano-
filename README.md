@@ -230,8 +230,10 @@ browser** to a live tuner. There you:
   image and move the seam over a live stitched preview,
 - toggle **overlap blend** (50/50) to check alignment,
 - click **Stitch all frames** to run the full stitch on the whole image/video with
-  the current values — no need to re-run anything,
-- click **Quit** (or Ctrl+C the terminal) when done.
+  the current values — a **progress bar** tracks it and a **✅ Done** message shows
+  the saved path when finished (no need to re-run anything),
+- click **Finish & stop** (appears when done) or **Quit** to stop the server so the
+  terminal command exits; then close the tab.
 
 For a video it previews/​tunes on the first frame (or `--start N`), then applies your
 chosen shift/seam to every frame. You can also skip the UI and pass the values

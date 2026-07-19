@@ -38,6 +38,9 @@
 #include <sstream>
 #include <cstdlib>
 #include <algorithm>
+#include <thread>
+#include <atomic>
+#include <mutex>
 #include "json.hpp"
 
 #ifdef _WIN32
@@ -66,6 +69,13 @@ struct StitchMaps
     int OW = 0, OH = 0;
     int seam = 0;
 };
+
+// Shared progress state for the --tune server (stitch runs on a worker thread).
+static std::atomic<int> g_percent{0};
+static std::atomic<bool> g_busy{false};
+static std::atomic<bool> g_done{false};
+static std::mutex g_mu;
+static string g_result;
 
 static void loadIntrinsics(const string &path, Mat &K, vector<double> &D)
 {
@@ -239,7 +249,8 @@ static string stitchImageFile(const string &source, StitchMaps &m, double degree
 }
 
 static string stitchVideoFile(const string &source, StitchMaps &m, double degrees,
-                              double shiftX, int startFrame, int endFrame, const string &outDir)
+                              double shiftX, int startFrame, int endFrame, const string &outDir,
+                              std::atomic<int> *prog = nullptr)
 {
     VideoCapture cap(source);
     if (!cap.isOpened()) return "ERROR: cannot open video";
@@ -262,8 +273,10 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
         warpHalves(uFrame, m, wL, wR);
         composite(wL, wR, m, degrees, shiftX).copyTo(pano);
         writer.write(pano);
+        int pct = (int)(100.0 * (i - s + 1) / (e - s + 1));
+        if (prog) prog->store(pct);
         if (++written % 30 == 0 || i == e)
-            cout << "  " << (int)(100.0 * (i - s + 1) / (e - s + 1)) << "%  (frame " << i << ")\n";
+            cout << "  " << pct << "%  (frame " << i << ")\n";
     }
     cap.release();
     writer.release();
@@ -313,11 +326,16 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
   <div class="grp">Seam <button id="ml">&#9664;</button><span class="val" id="mv">0</span><button id="mr">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
   <div class="grp">step <select id="step"><option>1</option><option>2</option><option>5</option><option>10</option></select></div>
-  <button id="stitch">&#9632; Stitch all frames</button>
+  <button id="stitch">Stitch all frames</button>
   <button id="quit">Quit</button>
   <span class="hint">&#8592;/&#8594; shift &nbsp; [ / ] seam</span>
 </div>
-<div id="status">Ready. Adjust, then click Stitch.</div>
+<div id="status">Ready. Adjust, then click &ldquo;Stitch all frames&rdquo;.</div>
+<div id="prog" style="padding:0 10px 10px;display:none">
+  <progress id="pb" max="100" value="0" style="width:280px;height:16px;vertical-align:middle"></progress>
+  <span id="pct" style="margin-left:8px">0%</span>
+  <button id="finish" style="display:none;background:#555;margin-left:12px">Finish &amp; stop</button>
+</div>
 <div id="wrap"><canvas id="c"></canvas></div>
 <script>
 const cv=document.getElementById('c'), ctx=cv.getContext('2d');
@@ -354,10 +372,36 @@ addEventListener('keydown',e=>{
   else if(e.key==='['){seam=clampSeam(seam-stepv());render();}
   else if(e.key===']'){seam=clampSeam(seam+stepv());render();}
 });
+let polling=null;
+const pb=document.getElementById('pb'), pct=document.getElementById('pct');
 document.getElementById('stitch').onclick=async()=>{
-  st('Stitching all frames with shift-x='+shiftX+', seam='+seam+' … (this can take a while)');
-  try{ const r=await fetch('/stitch?shiftx='+shiftX+'&seam='+seam); st('Done - '+await r.text()); }
-  catch(e){ st('Error: '+e); }
+  if(polling) return;
+  document.getElementById('stitch').disabled=true;
+  document.getElementById('prog').style.display='block';
+  document.getElementById('finish').style.display='none';
+  pb.value=0; pct.textContent='0%';
+  st('Stitching all frames (shift-x='+shiftX+', seam='+seam+') …');
+  try{ const r=await fetch('/stitch?shiftx='+shiftX+'&seam='+seam);
+       if((await r.text())==='busy'){ st('Already stitching…'); return; } }
+  catch(e){ st('Error starting: '+e); document.getElementById('stitch').disabled=false; return; }
+  polling=setInterval(async()=>{
+    try{
+      const p=await (await fetch('/progress')).json();
+      pb.value=p.percent; pct.textContent=p.percent+'%';
+      if(p.done){
+        clearInterval(polling); polling=null;
+        document.getElementById('stitch').disabled=false;
+        pb.value=100; pct.textContent='100%';
+        st('✅ Done — saved to '+p.result);
+        document.getElementById('finish').style.display='inline-block';
+      }
+    }catch(e){}
+  },400);
+};
+document.getElementById('finish').onclick=async()=>{
+  try{await fetch('/quit');}catch(e){}
+  st('Finished — server stopped. You can close this tab.');
+  try{window.close();}catch(e){}
 };
 document.getElementById('quit').onclick=async()=>{ try{await fetch('/quit');}catch(e){} st('Stopped. You can close this tab.'); };
 </script></body></html>)HTML";
@@ -441,13 +485,37 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
         }
         else if (path == "/stitch")
         {
-            double sx = query.find("shiftx=") != string::npos ? stod(qparam(query, "shiftx")) : 0;
-            string ss = qparam(query, "seam");
-            if (!ss.empty()) m.seam = stoi(ss);
-            cout << "[stitch] shift-x=" << sx << " seam=" << m.seam << " ...\n";
-            body = video ? stitchVideoFile(source, m, degrees, sx, startFrame, endFrame, outDir)
-                         : stitchImageFile(source, m, degrees, sx, outDir);
-            cout << "[stitch] " << body << "\n";
+            if (g_busy) { body = "busy"; }
+            else
+            {
+                double sx = query.find("shiftx=") != string::npos ? stod(qparam(query, "shiftx")) : 0;
+                string ss = qparam(query, "seam");
+                StitchMaps mm = m;
+                if (!ss.empty()) mm.seam = stoi(ss);
+                g_busy = true; g_done = false; g_percent = 0;
+                { lock_guard<mutex> lk(g_mu); g_result.clear(); }
+                cout << "[stitch] shift-x=" << sx << " seam=" << mm.seam << " ...\n";
+                std::thread([mm, sx, source, video, degrees, startFrame, endFrame, outDir]() mutable {
+                    string res = video
+                        ? stitchVideoFile(source, mm, degrees, sx, startFrame, endFrame, outDir, &g_percent)
+                        : stitchImageFile(source, mm, degrees, sx, outDir);
+                    { lock_guard<mutex> lk(g_mu); g_result = res; }
+                    g_percent = 100; g_done = true; g_busy = false;
+                    cout << "[stitch] done -> " << res << "\n";
+                }).detach();
+                body = "started";
+            }
+        }
+        else if (path == "/progress")
+        {
+            ctype = "application/json";
+            string res; { lock_guard<mutex> lk(g_mu); res = g_result; }
+            ostringstream j;
+            j << "{\"busy\":" << (g_busy ? "true" : "false")
+              << ",\"done\":" << (g_done ? "true" : "false")
+              << ",\"percent\":" << g_percent.load()
+              << ",\"result\":\"" << res << "\"}";
+            body = j.str();
         }
         else if (path == "/quit")
         {
