@@ -221,7 +221,7 @@ int main(int argc, char **argv)
     // --source is the new name; --image kept as an alias for back-compat.
     string source = argVal(argc, argv, "--source", argVal(argc, argv, "--image", ""));
     string calibDir = argVal(argc, argv, "--calib-dir", "../calibration");
-    string outDir = argVal(argc, argv, "--out", "pipeline_out_cpp");
+    string outDir = argVal(argc, argv, "--out", "pipeline_out");
     double degrees = stod(argVal(argc, argv, "--degrees", "0"));
     int seamArg = stoi(argVal(argc, argv, "--seam", "-1"));
     int startFrame = stoi(argVal(argc, argv, "--start", "0"));
