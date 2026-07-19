@@ -308,7 +308,7 @@ static string base64(const vector<uchar> &data)
 }
 
 static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
-                        int total, int startIdx)
+                        int total, int startIdx, bool video)
 {
     Mat mL, mR;
     warpL.copyTo(mL); warpR.copyTo(mR);
@@ -318,7 +318,8 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
     ostringstream h;
     h << "<!doctype html><html><head><meta charset='utf-8'><title>Stitch tuner</title>"
       << "<script>const OW=" << m.OW << ",OH=" << m.OH << ",SEAM0=" << m.seam
-      << ",TOTAL=" << total << ",FRAME0=" << startIdx << ";"
+      << ",TOTAL=" << total << ",FRAME0=" << startIdx
+      << ",VIDEO=" << (video ? "true" : "false") << ";"
       << "const IMGL='data:image/jpeg;base64," << base64(bL) << "';"
       << "const IMGR='data:image/jpeg;base64," << base64(bR) << "';</script>"
       << R"HTML(<style>
@@ -327,16 +328,16 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
  button{font-size:15px;padding:5px 10px;border:0;border-radius:6px;background:#2a6f9e;color:#fff;cursor:pointer}
  #stitch{background:#1f8a3b;font-weight:700} #quit{background:#8a3b1f} #finish{background:#555}
  .grp{display:flex;gap:6px;align-items:center;border:1px solid #333;padding:5px 9px;border-radius:8px;font-size:14px}
- .val{min-width:40px;text-align:center;font-variant-numeric:tabular-nums;font-size:16px}
+ .val{width:60px;text-align:center;font-variant-numeric:tabular-nums;font-size:15px;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:3px}
  #wrap{overflow:auto} canvas{display:block;max-width:100%;background:#000}
  #status{padding:6px 10px;color:#9cf} .hint{color:#888;font-size:12px}
 </style></head><body>
 <div id="bar">
-  <div class="grp">Shift far (top) <button id="tl">&#9664;</button><span class="val" id="tv">0</span><button id="tr">&#9654;</button></div>
-  <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><span class="val" id="bv">0</span><button id="br">&#9654;</button></div>
-  <div class="grp">Shift-y <button id="yl">&#9664;</button><span class="val" id="yv">0</span><button id="yr">&#9654;</button></div>
-  <div class="grp">Seam <button id="ml">&#9664;</button><span class="val" id="mv">0</span><button id="mr">&#9654;</button></div>
-  <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:150px"><span class="val" id="fval">0</span><button id="fnext">&#9654;</button></div>
+  <div class="grp">Shift far (top) <button id="tl">&#9664;</button><input class="val" id="tv" type="number" value="0"><button id="tr">&#9654;</button></div>
+  <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
+  <div class="grp">Shift-y <button id="yl">&#9664;</button><input class="val" id="yv" type="number" value="0"><button id="yr">&#9654;</button></div>
+  <div class="grp">Seam <button id="ml">&#9664;</button><input class="val" id="mv" type="number" value="0"><button id="mr">&#9654;</button></div>
+  <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
   <div class="grp">step <select id="step"><option>1</option><option>2</option><option>5</option><option>10</option></select></div>
   <button id="stitch">Stitch all frames</button>
@@ -353,33 +354,23 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
 <script>
 const cv=document.getElementById('c'), ctx=cv.getContext('2d');
 cv.width=OW; cv.height=OH;
+const clampSeam=v=>Math.max(0,Math.min(OW,v));
+const stepv=()=>parseInt(document.getElementById('step').value)||1;
+const st=t=>document.getElementById('status').textContent=t;
+// number inputs are the source of truth
+const tv=document.getElementById('tv'), bv=document.getElementById('bv'),
+      yv=document.getElementById('yv'), mv=document.getElementById('mv');
+mv.value=SEAM0;
 let sTop=0, sBot=0, sY=0, seam=SEAM0, pending=0;
 const imgL=new Image(), imgR=new Image();
 function both(){ if(--pending<=0){ pending=0; render(); } }
 imgL.onload=imgR.onload=both;
-pending=2; imgL.src=IMGL; imgR.src=IMGR;
-const stepv=()=>parseInt(document.getElementById('step').value)||1;
-const st=t=>document.getElementById('status').textContent=t;
-// frame scrubbing (video only)
-const frange=document.getElementById('frange'), fval=document.getElementById('fval');
-frange.max=Math.max(0,TOTAL-1); frange.value=FRAME0; fval.textContent=FRAME0;
-if(TOTAL<=1) document.getElementById('framegrp').style.display='none';
-function loadFrame(n){
-  n=Math.max(0,Math.min(TOTAL-1,n)); frange.value=n; fval.textContent=n;
-  st('Loading frame '+n+'…');
-  fetch('/frame?n='+n).then(r=>r.json()).then(d=>{
-    if(d.error){ st('frame error: '+d.error); return; }
-    pending=2; imgL.src=d.left; imgR.src=d.right; st('Frame '+n);
-  }).catch(e=>st('frame load error: '+e));
-}
-document.getElementById('fprev').onclick=()=>loadFrame(parseInt(frange.value)-1);
-document.getElementById('fnext').onclick=()=>loadFrame(parseInt(frange.value)+1);
-frange.onchange=()=>loadFrame(parseInt(frange.value));
 function drawRight(){
   const k=(OH>1)?(sBot-sTop)/(OH-1):0;         // per-row shear slope
   ctx.save(); ctx.transform(1,0,k,1,sTop,sY); ctx.drawImage(imgR,0,0); ctx.restore();
 }
 function render(){
+  sTop=+tv.value||0; sBot=+bv.value||0; sY=+yv.value||0; seam=clampSeam(+mv.value||0);
   ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=1; ctx.clearRect(0,0,OW,OH);
   if(document.getElementById('blend').checked){
     ctx.globalAlpha=0.5; ctx.drawImage(imgL,0,0); drawRight(); ctx.globalAlpha=1;
@@ -389,25 +380,43 @@ function render(){
   }
   ctx.strokeStyle='#f33'; ctx.lineWidth=2;
   ctx.beginPath(); ctx.moveTo(seam,0); ctx.lineTo(seam,OH); ctx.stroke();
-  tv.textContent=sTop; bv.textContent=sBot; yv.textContent=sY; mv.textContent=seam;
 }
-const clampSeam=v=>Math.max(0,Math.min(OW,v));
-tl.onclick=()=>{sTop-=stepv();render();};  tr.onclick=()=>{sTop+=stepv();render();};
-bl.onclick=()=>{sBot-=stepv();render();};  br.onclick=()=>{sBot+=stepv();render();};
-yl.onclick=()=>{sY-=stepv();render();};    yr.onclick=()=>{sY+=stepv();render();};
-ml.onclick=()=>{seam=clampSeam(seam-stepv());render();};
-mr.onclick=()=>{seam=clampSeam(seam+stepv());render();};
+const nudge=(el,d)=>{ el.value=(+el.value||0)+d; render(); };
+tl.onclick=()=>nudge(tv,-stepv()); tr.onclick=()=>nudge(tv,stepv());
+bl.onclick=()=>nudge(bv,-stepv()); br.onclick=()=>nudge(bv,stepv());
+yl.onclick=()=>nudge(yv,-stepv()); yr.onclick=()=>nudge(yv,stepv());
+ml.onclick=()=>nudge(mv,-stepv()); mr.onclick=()=>nudge(mv,stepv());
+[tv,bv,yv,mv].forEach(el=>el.oninput=render);
 document.getElementById('blend').onchange=render;
 addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT') return;      // let typing in the boxes work normally
   const d=stepv();
-  if(e.key==='ArrowLeft'){sTop-=d;sBot-=d;render();e.preventDefault();}
-  else if(e.key==='ArrowRight'){sTop+=d;sBot+=d;render();e.preventDefault();}
-  else if(e.key==='['){seam=clampSeam(seam-d);render();}
-  else if(e.key===']'){seam=clampSeam(seam+d);render();}
+  if(e.key==='ArrowLeft'){tv.value=(+tv.value||0)-d; bv.value=(+bv.value||0)-d; render(); e.preventDefault();}
+  else if(e.key==='ArrowRight'){tv.value=(+tv.value||0)+d; bv.value=(+bv.value||0)+d; render(); e.preventDefault();}
+  else if(e.key==='['){mv.value=clampSeam((+mv.value||0)-d); render();}
+  else if(e.key===']'){mv.value=clampSeam((+mv.value||0)+d); render();}
 });
+pending=2; imgL.src=IMGL; imgR.src=IMGR;   // initial frame
+// frame scrubbing (video only)
+const frange=document.getElementById('frange'), fval=document.getElementById('fval');
+const FMAX = TOTAL>1 ? TOTAL-1 : 100000;
+frange.max=FMAX; frange.value=FRAME0; fval.value=FRAME0; fval.max=FMAX;
+if(!VIDEO) document.getElementById('framegrp').style.display='none';
+function loadFrame(n){
+  n=Math.max(0,Math.min(FMAX,parseInt(n)||0)); frange.value=n; fval.value=n;
+  st('Loading frame '+n+'…');
+  fetch('/frame?n='+n).then(r=>r.json()).then(d=>{
+    if(d.error){ st('frame error: '+d.error); return; }
+    pending=2; imgL.src=d.left; imgR.src=d.right; st('Frame '+n);
+  }).catch(e=>st('frame load error: '+e));
+}
+document.getElementById('fprev').onclick=()=>loadFrame((+frange.value||0)-1);
+document.getElementById('fnext').onclick=()=>loadFrame((+frange.value||0)+1);
+frange.onchange=()=>loadFrame(frange.value);
+fval.onchange=()=>loadFrame(fval.value);
 let polling=null;
 const pb=document.getElementById('pb'), pct=document.getElementById('pct');
-const params=()=>'shifttop='+sTop+'&shiftbottom='+sBot+'&shifty='+sY+'&seam='+seam;
+const params=()=>'shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty='+(+yv.value||0)+'&seam='+clampSeam(+mv.value||0);
 document.getElementById('stitch').onclick=async()=>{
   if(polling) return;
   document.getElementById('stitch').disabled=true;
@@ -469,7 +478,7 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
-    string html = tunerHtml(warpL, warpR, m, totalFrames, startFrame);
+    string html = tunerHtml(warpL, warpR, m, totalFrames, startFrame, video);
 
     socket_t srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv == INVALID_SOCKET) { cerr << "socket() failed\n"; return; }
@@ -664,6 +673,9 @@ int main(int argc, char **argv)
         if (cap.isOpened())
         {
             totalFrames = (int)cap.get(CAP_PROP_FRAME_COUNT);
+            // some containers (e.g. MJPEG-in-MKV) don't report a valid count;
+            // 0 tells the tuner to fall back to a typeable frame box + prev/next.
+            if (totalFrames < 1 || totalFrames > 100000000) totalFrames = 0;
             if (startFrame > 0) cap.set(CAP_PROP_POS_FRAMES, startFrame);
             cap.read(frame);
             cap.release();
