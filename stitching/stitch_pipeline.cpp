@@ -8,17 +8,25 @@
 // The remap maps depend only on the calibration, so they are built ONCE and reused:
 //   * image source (.jpg/.png/...) -> stitch the single frame  -> pano.jpg
 //   * video source (.mp4/.mkv/...)  -> loop frames [start..end] -> stitched_video.mp4
+//   * --tune                        -> write an interactive tune.html (see below)
 //
-// GPU: the per-frame work (remap + composite) runs on cv::UMat, so OpenCV's
-// Transparent API uses the GPU via OpenCL when available (e.g. the desktop) and
-// falls back to CPU otherwise (e.g. Apple Silicon) - same code either way. The maps
-// are uploaded to the GPU once; per frame only the frame in / panorama out move.
+// --shift-x N nudges the RIGHT image N pixels horizontally (+ = right) before the
+// hard-seam composite. Rotation-only alignment is exact only at infinity; a small
+// shift lets you sharpen a chosen plane (e.g. a screen) at finite distance. Dial the
+// value in visually with --tune, then pass it to a normal run.
 //
-// Uses only core/imgproc/imgcodecs/videoio, so it builds on both OpenCV 4.x and 5.x.
+// --tune writes a self-contained tune.html: it warps the first frame once, embeds the
+// two cylinder halves, and lets you click arrows to shift the right image / move the
+// seam and watch the stitch update live (arrow keys too). It prints the matching
+// "--shift-x N --seam N" to use.
+//
+// GPU: per-frame work runs on cv::UMat (OpenCL when available, CPU fallback).
+// Uses only core/imgproc/imgcodecs/videoio, so it builds on OpenCV 4.x and 5.x.
 //
 // Build:  cmake -S . -B build && cmake --build build
 // Run:    ./build/StitchPipeline --source <image-or-video> [--calib-dir ../calibration]
-//                                [--out DIR] [--start N] [--end N] [--degrees D] [--seam X]
+//                     [--out DIR] [--start N] [--end N] [--degrees D] [--seam X]
+//                     [--shift-x N] [--tune]
 
 #include <opencv2/core.hpp>
 #include <opencv2/core/ocl.hpp>
@@ -31,6 +39,7 @@
 #include <vector>
 #include <cmath>
 #include <string>
+#include <sstream>
 #include <algorithm>
 #include "json.hpp"
 
@@ -39,13 +48,12 @@ using namespace std;
 using namespace cv;
 namespace fs = std::filesystem;
 
-// Precomputed, frame-independent stitch geometry. Maps are held both as CPU Mats
-// (built once) and as UMats uploaded to the GPU for the per-frame remap.
+// Precomputed, frame-independent stitch geometry. Maps held as UMats (uploaded once).
 struct StitchMaps
 {
-    UMat mapLx, mapLy, mapRx, mapRy;   // per-camera combined remap (undistort+cyl+rotation)
-    int OW = 0, OH = 0;                // panorama size
-    int seam = 0;                      // hard-seam column
+    UMat mapLx, mapLy, mapRx, mapRy;
+    int OW = 0, OH = 0;
+    int seam = 0;
 };
 
 static void loadIntrinsics(const string &path, Mat &K, vector<double> &D)
@@ -74,7 +82,6 @@ static Mat loadRotation(const string &path)
     return R;
 }
 
-// Forward Brown-Conrady: undistorted normalized (x,y) -> distorted (xd,yd).
 static inline void applyDistortion(double x, double y, const vector<double> &D,
                                    double &xd, double &yd)
 {
@@ -89,7 +96,6 @@ static inline void applyDistortion(double x, double y, const vector<double> &D,
     yd = y * radial + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y;
 }
 
-// One combined remap: common-cylinder pixel -> source pixel in this camera's frame.
 static void buildCylMap(const Mat &K, const vector<double> &D, const Mat &R_cam_from_left,
                         const vector<double> &theta, const vector<double> &hval,
                         int w, int h, Mat &mapx, Mat &mapy, Mat &valid)
@@ -114,8 +120,8 @@ static void buildCylMap(const Mat &K, const vector<double> &D, const Mat &R_cam_
         for (int xx = 0; xx < OW; xx++)
         {
             double th = theta[xx];
-            double dx = sin(th), dy = hh, dz = cos(th);          // ray in LEFT frame
-            double cxr = r00 * dx + r01 * dy + r02 * dz;         // rotate into camera
+            double dx = sin(th), dy = hh, dz = cos(th);
+            double cxr = r00 * dx + r01 * dy + r02 * dz;
             double cyr = r10 * dx + r11 * dy + r12 * dz;
             double czr = r20 * dx + r21 * dy + r22 * dz;
             if (czr <= 1e-6) { mx[xx] = my[xx] = -1.f; continue; }
@@ -129,8 +135,6 @@ static void buildCylMap(const Mat &K, const vector<double> &D, const Mat &R_cam_
     }
 }
 
-// Build the frame-independent maps + canvas + seam from calibration and frame size,
-// then upload the maps to the GPU (UMat) once for the per-frame remap.
 static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
                                   const Mat &KR, const vector<double> &DR,
                                   const Mat &R, int w, int h, int seamArg)
@@ -139,7 +143,7 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
     double fcyl = KL.at<double>(0, 0);
     double halfL = atan(w / (2 * KL.at<double>(0, 0)));
     double halfR = atan(w / (2 * KR.at<double>(0, 0)));
-    double yawR = atan2(R.at<double>(2, 0), R.at<double>(2, 2));   // right axis yaw in left frame
+    double yawR = atan2(R.at<double>(2, 0), R.at<double>(2, 2));
     double pad = 3.0 * CV_PI / 180.0;
     double thetaMin = min(-halfL, yawR - halfR) - pad;
     double thetaMax = max(halfL, yawR + halfR) + pad;
@@ -165,7 +169,6 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
     m.seam = seamArg >= 0 ? seamArg
              : (overlapCols.empty() ? m.OW / 2 : overlapCols[overlapCols.size() / 2]);
 
-    // upload the maps to the GPU once (reused for every frame)
     mapLx.copyTo(m.mapLx); mapLy.copyTo(m.mapLy);
     mapRx.copyTo(m.mapRx); mapRy.copyTo(m.mapRy);
 
@@ -175,7 +178,6 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
     return m;
 }
 
-// Warp both halves of a combined frame onto the cylinder (GPU via UMat).
 static void warpHalves(const UMat &frame, const StitchMaps &m, UMat &warpL, UMat &warpR)
 {
     int w = frame.cols / 2, h = frame.rows;
@@ -185,11 +187,19 @@ static void warpHalves(const UMat &frame, const StitchMaps &m, UMat &warpL, UMat
     remap(right, warpR, m.mapRx, m.mapRy, INTER_LINEAR, BORDER_CONSTANT);
 }
 
-static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m, double degrees)
+// Hard-seam composite. shiftX nudges the right image horizontally (+ = right).
+static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
+                      double degrees, double shiftX)
 {
+    UMat right = warpR;
+    if (shiftX != 0.0)
+    {
+        Mat T = (Mat_<double>(2, 3) << 1, 0, shiftX, 0, 1, 0);
+        warpAffine(warpR, right, T, Size(m.OW, m.OH));
+    }
     UMat pano(m.OH, m.OW, warpL.type(), Scalar::all(0));
     warpL(Rect(0, 0, m.seam, m.OH)).copyTo(pano(Rect(0, 0, m.seam, m.OH)));
-    warpR(Rect(m.seam, 0, m.OW - m.seam, m.OH)).copyTo(pano(Rect(m.seam, 0, m.OW - m.seam, m.OH)));
+    right(Rect(m.seam, 0, m.OW - m.seam, m.OH)).copyTo(pano(Rect(m.seam, 0, m.OW - m.seam, m.OH)));
     if (degrees != 0.0)
     {
         double ang = degrees * CV_PI / 180.0;
@@ -201,11 +211,116 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
     return pano;
 }
 
+static string base64(const vector<uchar> &data)
+{
+    static const char *t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    string out;
+    int val = 0, bits = -6;
+    for (uchar c : data)
+    {
+        val = (val << 8) + c;
+        bits += 8;
+        while (bits >= 0) { out.push_back(t[(val >> bits) & 0x3F]); bits -= 6; }
+    }
+    if (bits > -6) out.push_back(t[((val << 8) >> (bits + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
+    return out;
+}
+
+// Write a self-contained interactive tuning page for shift-x + seam.
+static void writeTuneHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
+                          const string &outDir)
+{
+    Mat mL, mR;
+    warpL.copyTo(mL);
+    warpR.copyTo(mR);
+    vector<uchar> bufL, bufR;
+    vector<int> q = {IMWRITE_JPEG_QUALITY, 85};
+    imencode(".jpg", mL, bufL, q);
+    imencode(".jpg", mR, bufR, q);
+
+    ostringstream html;
+    html << "<!doctype html><html><head><meta charset='utf-8'><title>Stitch tuner</title>"
+         << "<script>const OW=" << m.OW << ",OH=" << m.OH << ",SEAM0=" << m.seam << ";"
+         << "const IMGL='data:image/jpeg;base64," << base64(bufL) << "';"
+         << "const IMGR='data:image/jpeg;base64," << base64(bufR) << "';</script>"
+         << R"HTML(<style>
+ body{margin:0;font-family:system-ui,sans-serif;background:#111;color:#eee}
+ #bar{padding:10px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+      background:#1b1b1b;position:sticky;top:0;z-index:2}
+ button{font-size:16px;padding:6px 12px;border:0;border-radius:6px;background:#2a6f9e;color:#fff;cursor:pointer}
+ .grp{display:flex;gap:8px;align-items:center;border:1px solid #333;padding:6px 10px;border-radius:8px}
+ .val{min-width:46px;text-align:center;font-variant-numeric:tabular-nums;font-size:18px}
+ #wrap{overflow:auto} canvas{display:block;max-width:100%;background:#000}
+ code{background:#222;padding:3px 8px;border-radius:4px;user-select:all}
+ .hint{color:#888;font-size:12px}
+</style></head><body>
+<div id="bar">
+  <div class="grp">Shift-x <button id="sl">&#9664;</button><span class="val" id="sv">0</span><button id="sr">&#9654;</button></div>
+  <div class="grp">Seam <button id="ml">&#9664;</button><span class="val" id="mv">0</span><button id="mr">&#9654;</button></div>
+  <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
+  <div class="grp">step <select id="step"><option>1</option><option>2</option><option>5</option><option>10</option></select></div>
+  <div>run with: <code id="cmd"></code></div>
+  <div class="hint">&#8592;/&#8594; shift &nbsp; [ / ] seam</div>
+</div>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+cv.width=OW; cv.height=OH;
+let shiftX=0, seam=SEAM0, loaded=0;
+const imgL=new Image(), imgR=new Image();
+imgL.onload=imgR.onload=()=>{ if(++loaded===2) render(); };
+imgL.src=IMGL; imgR.src=IMGR;
+const stepv=()=>parseInt(document.getElementById('step').value)||1;
+function render(){
+  ctx.clearRect(0,0,OW,OH);
+  if(document.getElementById('blend').checked){
+    ctx.globalAlpha=0.5; ctx.drawImage(imgL,0,0);
+    ctx.drawImage(imgR,shiftX,0); ctx.globalAlpha=1;
+  } else {
+    ctx.drawImage(imgL,0,0);
+    ctx.save(); ctx.beginPath(); ctx.rect(seam,0,OW-seam,OH); ctx.clip();
+    ctx.drawImage(imgR,shiftX,0); ctx.restore();
+  }
+  ctx.strokeStyle='#f33'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(seam,0); ctx.lineTo(seam,OH); ctx.stroke();
+  document.getElementById('sv').textContent=shiftX;
+  document.getElementById('mv').textContent=seam;
+  document.getElementById('cmd').textContent='--shift-x '+shiftX+' --seam '+seam;
+}
+const clampSeam=v=>Math.max(0,Math.min(OW,v));
+document.getElementById('sl').onclick=()=>{shiftX-=stepv();render();};
+document.getElementById('sr').onclick=()=>{shiftX+=stepv();render();};
+document.getElementById('ml').onclick=()=>{seam=clampSeam(seam-stepv());render();};
+document.getElementById('mr').onclick=()=>{seam=clampSeam(seam+stepv());render();};
+document.getElementById('blend').onchange=render;
+addEventListener('keydown',e=>{
+  if(e.key==='ArrowLeft'){shiftX-=stepv();render();e.preventDefault();}
+  else if(e.key==='ArrowRight'){shiftX+=stepv();render();e.preventDefault();}
+  else if(e.key==='['){seam=clampSeam(seam-stepv());render();}
+  else if(e.key===']'){seam=clampSeam(seam+stepv());render();}
+});
+</script></body></html>)HTML";
+
+    string path = outDir + "/tune.html";
+    ofstream f(path);
+    f << html.str();
+    f.close();
+    cout << "tuner -> " << path << "  (open in a browser; dial in --shift-x / --seam)\n";
+}
+
 static string argVal(int argc, char **argv, const string &key, const string &def)
 {
     for (int i = 1; i < argc - 1; i++)
         if (key == argv[i]) return argv[i + 1];
     return def;
+}
+
+static bool hasArg(int argc, char **argv, const string &key)
+{
+    for (int i = 1; i < argc; i++)
+        if (key == argv[i]) return true;
+    return false;
 }
 
 static bool isVideoFile(const string &path)
@@ -218,23 +333,24 @@ static bool isVideoFile(const string &path)
 
 int main(int argc, char **argv)
 {
-    // --source is the new name; --image kept as an alias for back-compat.
     string source = argVal(argc, argv, "--source", argVal(argc, argv, "--image", ""));
     string calibDir = argVal(argc, argv, "--calib-dir", "../calibration");
     string outDir = argVal(argc, argv, "--out", "pipeline_out");
     double degrees = stod(argVal(argc, argv, "--degrees", "0"));
     int seamArg = stoi(argVal(argc, argv, "--seam", "-1"));
     int startFrame = stoi(argVal(argc, argv, "--start", "0"));
-    int endFrame = stoi(argVal(argc, argv, "--end", "-1"));   // -1 = last frame
+    int endFrame = stoi(argVal(argc, argv, "--end", "-1"));
+    double shiftX = stod(argVal(argc, argv, "--shift-x", "0"));
+    bool tune = hasArg(argc, argv, "--tune");
     if (source.empty())
     {
         cerr << "Usage: StitchPipeline --source <image-or-video> [--calib-dir ..] [--out ..]\n"
-             << "                      [--start N] [--end N] [--degrees D] [--seam X]\n";
+             << "        [--start N] [--end N] [--degrees D] [--seam X] [--shift-x N] [--tune]\n";
         return 1;
     }
     fs::create_directories(outDir);
 
-    ocl::setUseOpenCL(true);   // enable GPU path when OpenCL is present (else CPU fallback)
+    ocl::setUseOpenCL(true);
     cout << "OpenCL available: " << ocl::haveOpenCL()
          << ", using GPU: " << ocl::useOpenCL() << "\n";
 
@@ -242,10 +358,36 @@ int main(int argc, char **argv)
     vector<double> DL, DR;
     loadIntrinsics(calibDir + "/left_intrinsics.json", KL, DL);
     loadIntrinsics(calibDir + "/right_intrinsics.json", KR, DR);
-    R = loadRotation(calibDir + "/stereo_extrinsics.json");   // LEFT ray -> RIGHT ray
+    R = loadRotation(calibDir + "/stereo_extrinsics.json");
+
+    bool video = isVideoFile(source);
+
+    // grab the first frame (single image, or first/--start frame of a video)
+    auto firstFrame = [&](Mat &frame) -> bool {
+        if (!video) { frame = imread(source); return !frame.empty(); }
+        VideoCapture cap(source);
+        if (!cap.isOpened()) return false;
+        if (startFrame > 0) cap.set(CAP_PROP_POS_FRAMES, startFrame);
+        bool ok = cap.read(frame);
+        cap.release();
+        return ok && !frame.empty();
+    };
+
+    // ---------- TUNE: warp one frame, write the interactive page ----------
+    if (tune)
+    {
+        Mat frame;
+        if (!firstFrame(frame)) { cerr << "Cannot read source: " << source << endl; return 1; }
+        StitchMaps m = buildStitchMaps(KL, DL, KR, DR, R, frame.cols / 2, frame.rows, seamArg);
+        UMat uFrame, warpL, warpR;
+        frame.copyTo(uFrame);
+        warpHalves(uFrame, m, warpL, warpR);
+        writeTuneHtml(warpL, warpR, m, outDir);
+        return 0;
+    }
 
     // ---------- IMAGE: stitch a single frame ----------
-    if (!isVideoFile(source))
+    if (!video)
     {
         Mat img = imread(source);
         if (img.empty()) { cerr << "Cannot read image: " << source << endl; return 1; }
@@ -253,15 +395,10 @@ int main(int argc, char **argv)
         UMat uImg, warpL, warpR;
         img.copyTo(uImg);
         warpHalves(uImg, m, warpL, warpR);
-        UMat uPano = composite(warpL, warpR, m, degrees);
-        UMat uOverlap;
-        addWeighted(warpL, 0.5, warpR, 0.5, 0.0, uOverlap);
-        Mat pano, overlap;
-        uPano.copyTo(pano);
-        uOverlap.copyTo(overlap);
+        UMat uPano = composite(warpL, warpR, m, degrees, shiftX);
+        Mat pano; uPano.copyTo(pano);
         imwrite(outDir + "/pano.jpg", pano);
-        imwrite(outDir + "/overlap_5050.jpg", overlap);
-        cout << "image -> " << outDir << "/pano.jpg (+ overlap_5050.jpg)\n";
+        cout << "image -> " << outDir << "/pano.jpg\n";
         return 0;
     }
 
@@ -291,18 +428,11 @@ int main(int argc, char **argv)
     for (int i = startFrame; i <= endFrame; i++)
     {
         if (!cap.read(frame) || frame.empty()) break;
-        frame.copyTo(uFrame);                       // upload to GPU
-        warpHalves(uFrame, m, warpL, warpR);        // remap on GPU
-        UMat uPano = composite(warpL, warpR, m, degrees);
-        uPano.copyTo(pano);                         // download to write
+        frame.copyTo(uFrame);
+        warpHalves(uFrame, m, warpL, warpR);
+        UMat uPano = composite(warpL, warpR, m, degrees, shiftX);
+        uPano.copyTo(pano);
         writer.write(pano);
-        if (i == startFrame)                        // first-frame alignment debug
-        {
-            UMat uOverlap; Mat overlap;
-            addWeighted(warpL, 0.5, warpR, 0.5, 0.0, uOverlap);
-            uOverlap.copyTo(overlap);
-            imwrite(outDir + "/overlap_5050.jpg", overlap);
-        }
         written++;
         if (written % 30 == 0 || i == endFrame)
             cout << "  " << (int)(100.0 * (i - startFrame + 1) / (endFrame - startFrame + 1))

@@ -22,7 +22,7 @@ charuco_board.png
 # Stitching: keep source (stitch_pipeline.cpp/CMakeLists/include);
 # ignore build output and generated renders
 stitching/build/
-stitching/pipeline_out*/
+stitching/*_out/
 *.bin
 
 # 3D model: commit only the zip; ignore the loose CAD files (incl. the 53 MB STEP)

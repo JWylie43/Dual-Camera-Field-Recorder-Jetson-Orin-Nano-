@@ -210,6 +210,24 @@ reused for every frame.
 | `--start N` / `--end N` | `0` / `-1` | Video frame range (`-1` = end) |
 | `--degrees D` | `0` | Horizon roll correction |
 | `--seam X` | auto | Hard-seam column (default: overlap centre) |
+| `--shift-x N` | `0` | Nudge the right image N px horizontally (+ = right) |
+| `--tune` | off | Write an interactive `tune.html` instead of stitching (see below) |
+
+### Interactive tuning (`--tune`)
+
+Rotation-only alignment is exact only at infinity; at finite distance a small
+horizontal **shift** can sharpen a chosen plane (e.g. a screen). To dial it in
+visually:
+
+```bash
+./build/StitchPipeline --source <image-or-video> --tune --out tune_out
+# open tune_out/tune.html in a browser
+```
+
+`tune.html` is self-contained (the warped halves are embedded). Click the arrows —
+or use ←/→ (shift) and `[` `]` (seam) — to nudge the right image and move the seam,
+with a live stitched preview and an **overlap-blend** toggle for checking alignment.
+It shows the exact `--shift-x N --seam N` to pass to a normal run.
 
 > **Exposure/seam:** in high-contrast scenes the seam can show a brightness step (one
 > camera facing a bright window). Exposure compensation + seam feathering are future
