@@ -1,32 +1,28 @@
 // stitch_pipeline.cpp - calibration-driven cylindrical stitch (C++), NO feature detection.
 //
-// C++ pipeline for the dual-camera rig. Reads the rig calibration (left/right
-// intrinsics + stereo extrinsics) and stitches the combined LEFT|RIGHT feed into a
-// cylindrical panorama, aligning the cameras purely from the extrinsic rotation R.
-// There is no BRISK / matcher / findHomography anywhere.
+// Reads the rig calibration (left/right intrinsics + stereo extrinsics) and stitches
+// the combined LEFT|RIGHT feed into a cylindrical panorama, aligning the cameras from
+// the extrinsic rotation R. No BRISK / matcher / findHomography anywhere.
 //
-// The remap maps depend only on the calibration, so they are built ONCE and reused:
-//   * image source (.jpg/.png/...) -> stitch the single frame  -> pano.jpg
-//   * video source (.mp4/.mkv/...)  -> loop frames [start..end] -> stitched_video.mp4
-//   * --tune                        -> write an interactive tune.html (see below)
+// Modes:
+//   image source (.jpg/.png/...) -> stitch the single frame  -> pano.jpg
+//   video source (.mp4/.mkv/...)  -> loop frames [start..end] -> stitched_video.mp4
+//   --tune  -> launch an interactive tuner: opens a browser UI where you nudge the
+//              right image (--shift-x) and the seam over a live preview, then click
+//              "Stitch" to run the full stitch on all frames. One command, UI opens
+//              itself, click to finish. (Runs a tiny localhost web server.)
 //
-// --shift-x N nudges the RIGHT image N pixels horizontally (+ = right) before the
-// hard-seam composite. Rotation-only alignment is exact only at infinity; a small
-// shift lets you sharpen a chosen plane (e.g. a screen) at finite distance. Dial the
-// value in visually with --tune, then pass it to a normal run.
-//
-// --tune writes a self-contained tune.html: it warps the first frame once, embeds the
-// two cylinder halves, and lets you click arrows to shift the right image / move the
-// seam and watch the stitch update live (arrow keys too). It prints the matching
-// "--shift-x N --seam N" to use.
+// --shift-x N nudges the RIGHT image N px horizontally (+ = right) before the
+// hard-seam composite (rotation-only aligns at infinity; a small shift sharpens a
+// chosen plane at finite distance).
 //
 // GPU: per-frame work runs on cv::UMat (OpenCL when available, CPU fallback).
-// Uses only core/imgproc/imgcodecs/videoio, so it builds on OpenCV 4.x and 5.x.
+// Uses core/imgproc/imgcodecs/videoio; builds on OpenCV 4.x and 5.x.
 //
 // Build:  cmake -S . -B build && cmake --build build
 // Run:    ./build/StitchPipeline --source <image-or-video> [--calib-dir ../calibration]
 //                     [--out DIR] [--start N] [--end N] [--degrees D] [--seam X]
-//                     [--shift-x N] [--tune]
+//                     [--shift-x N] [--tune] [--port N]
 
 #include <opencv2/core.hpp>
 #include <opencv2/core/ocl.hpp>
@@ -40,15 +36,30 @@
 #include <cmath>
 #include <string>
 #include <sstream>
+#include <cstdlib>
 #include <algorithm>
 #include "json.hpp"
+
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  using socket_t = SOCKET;
+  #define CLOSESOCK closesocket
+#else
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <arpa/inet.h>
+  #include <unistd.h>
+  using socket_t = int;
+  #define CLOSESOCK close
+  #define INVALID_SOCKET (-1)
+#endif
 
 using json = nlohmann::json;
 using namespace std;
 using namespace cv;
 namespace fs = std::filesystem;
 
-// Precomputed, frame-independent stitch geometry. Maps held as UMats (uploaded once).
 struct StitchMaps
 {
     UMat mapLx, mapLy, mapRx, mapRy;
@@ -187,7 +198,6 @@ static void warpHalves(const UMat &frame, const StitchMaps &m, UMat &warpL, UMat
     remap(right, warpR, m.mapRx, m.mapRy, INTER_LINEAR, BORDER_CONSTANT);
 }
 
-// Hard-seam composite. shiftX nudges the right image horizontally (+ = right).
 static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
                       double degrees, double shiftX)
 {
@@ -211,6 +221,55 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
     return pano;
 }
 
+// ---- full-stitch entry points (shared by CLI and the tuner's Stitch button) ----
+
+static string stitchImageFile(const string &source, StitchMaps &m, double degrees,
+                              double shiftX, const string &outDir)
+{
+    Mat img = imread(source);
+    if (img.empty()) return "ERROR: cannot read image";
+    UMat uImg, wL, wR;
+    img.copyTo(uImg);
+    warpHalves(uImg, m, wL, wR);
+    UMat uPano = composite(wL, wR, m, degrees, shiftX);
+    Mat pano; uPano.copyTo(pano);
+    string out = outDir + "/pano.jpg";
+    imwrite(out, pano);
+    return out;
+}
+
+static string stitchVideoFile(const string &source, StitchMaps &m, double degrees,
+                              double shiftX, int startFrame, int endFrame, const string &outDir)
+{
+    VideoCapture cap(source);
+    if (!cap.isOpened()) return "ERROR: cannot open video";
+    int total = (int)cap.get(CAP_PROP_FRAME_COUNT);
+    double fps = cap.get(CAP_PROP_FPS);
+    if (fps <= 0) fps = 30.0;
+    int e = (endFrame < 0 || endFrame >= total) ? total - 1 : endFrame;
+    int s = startFrame < 0 ? 0 : startFrame;
+    string out = outDir + "/stitched_video.mp4";
+    VideoWriter writer(out, VideoWriter::fourcc('m', 'p', '4', 'v'), fps, Size(m.OW, m.OH));
+    if (!writer.isOpened()) return "ERROR: cannot open output video";
+    cap.set(CAP_PROP_POS_FRAMES, s);
+    Mat frame, pano;
+    UMat uFrame, wL, wR;
+    int written = 0;
+    for (int i = s; i <= e; i++)
+    {
+        if (!cap.read(frame) || frame.empty()) break;
+        frame.copyTo(uFrame);
+        warpHalves(uFrame, m, wL, wR);
+        composite(wL, wR, m, degrees, shiftX).copyTo(pano);
+        writer.write(pano);
+        if (++written % 30 == 0 || i == e)
+            cout << "  " << (int)(100.0 * (i - s + 1) / (e - s + 1)) << "%  (frame " << i << ")\n";
+    }
+    cap.release();
+    writer.release();
+    return out + "  (" + to_string(written) + " frames)";
+}
+
 static string base64(const vector<uchar> &data)
 {
     static const char *t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -227,42 +286,38 @@ static string base64(const vector<uchar> &data)
     return out;
 }
 
-// Write a self-contained interactive tuning page for shift-x + seam.
-static void writeTuneHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
-                          const string &outDir)
+static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &m)
 {
     Mat mL, mR;
-    warpL.copyTo(mL);
-    warpR.copyTo(mR);
-    vector<uchar> bufL, bufR;
-    vector<int> q = {IMWRITE_JPEG_QUALITY, 85};
-    imencode(".jpg", mL, bufL, q);
-    imencode(".jpg", mR, bufR, q);
-
-    ostringstream html;
-    html << "<!doctype html><html><head><meta charset='utf-8'><title>Stitch tuner</title>"
-         << "<script>const OW=" << m.OW << ",OH=" << m.OH << ",SEAM0=" << m.seam << ";"
-         << "const IMGL='data:image/jpeg;base64," << base64(bufL) << "';"
-         << "const IMGR='data:image/jpeg;base64," << base64(bufR) << "';</script>"
-         << R"HTML(<style>
+    warpL.copyTo(mL); warpR.copyTo(mR);
+    vector<uchar> bL, bR; vector<int> q = {IMWRITE_JPEG_QUALITY, 85};
+    imencode(".jpg", mL, bL, q);
+    imencode(".jpg", mR, bR, q);
+    ostringstream h;
+    h << "<!doctype html><html><head><meta charset='utf-8'><title>Stitch tuner</title>"
+      << "<script>const OW=" << m.OW << ",OH=" << m.OH << ",SEAM0=" << m.seam << ";"
+      << "const IMGL='data:image/jpeg;base64," << base64(bL) << "';"
+      << "const IMGR='data:image/jpeg;base64," << base64(bR) << "';</script>"
+      << R"HTML(<style>
  body{margin:0;font-family:system-ui,sans-serif;background:#111;color:#eee}
- #bar{padding:10px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;
-      background:#1b1b1b;position:sticky;top:0;z-index:2}
+ #bar{padding:10px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;background:#1b1b1b;position:sticky;top:0;z-index:2}
  button{font-size:16px;padding:6px 12px;border:0;border-radius:6px;background:#2a6f9e;color:#fff;cursor:pointer}
+ #stitch{background:#1f8a3b;font-weight:700} #quit{background:#8a3b1f}
  .grp{display:flex;gap:8px;align-items:center;border:1px solid #333;padding:6px 10px;border-radius:8px}
  .val{min-width:46px;text-align:center;font-variant-numeric:tabular-nums;font-size:18px}
  #wrap{overflow:auto} canvas{display:block;max-width:100%;background:#000}
- code{background:#222;padding:3px 8px;border-radius:4px;user-select:all}
- .hint{color:#888;font-size:12px}
+ #status{padding:6px 10px;color:#9cf} .hint{color:#888;font-size:12px}
 </style></head><body>
 <div id="bar">
   <div class="grp">Shift-x <button id="sl">&#9664;</button><span class="val" id="sv">0</span><button id="sr">&#9654;</button></div>
   <div class="grp">Seam <button id="ml">&#9664;</button><span class="val" id="mv">0</span><button id="mr">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
   <div class="grp">step <select id="step"><option>1</option><option>2</option><option>5</option><option>10</option></select></div>
-  <div>run with: <code id="cmd"></code></div>
-  <div class="hint">&#8592;/&#8594; shift &nbsp; [ / ] seam</div>
+  <button id="stitch">&#9632; Stitch all frames</button>
+  <button id="quit">Quit</button>
+  <span class="hint">&#8592;/&#8594; shift &nbsp; [ / ] seam</span>
 </div>
+<div id="status">Ready. Adjust, then click Stitch.</div>
 <div id="wrap"><canvas id="c"></canvas></div>
 <script>
 const cv=document.getElementById('c'), ctx=cv.getContext('2d');
@@ -272,11 +327,11 @@ const imgL=new Image(), imgR=new Image();
 imgL.onload=imgR.onload=()=>{ if(++loaded===2) render(); };
 imgL.src=IMGL; imgR.src=IMGR;
 const stepv=()=>parseInt(document.getElementById('step').value)||1;
+const st=t=>document.getElementById('status').textContent=t;
 function render(){
   ctx.clearRect(0,0,OW,OH);
   if(document.getElementById('blend').checked){
-    ctx.globalAlpha=0.5; ctx.drawImage(imgL,0,0);
-    ctx.drawImage(imgR,shiftX,0); ctx.globalAlpha=1;
+    ctx.globalAlpha=0.5; ctx.drawImage(imgL,0,0); ctx.drawImage(imgR,shiftX,0); ctx.globalAlpha=1;
   } else {
     ctx.drawImage(imgL,0,0);
     ctx.save(); ctx.beginPath(); ctx.rect(seam,0,OW-seam,OH); ctx.clip();
@@ -286,7 +341,6 @@ function render(){
   ctx.beginPath(); ctx.moveTo(seam,0); ctx.lineTo(seam,OH); ctx.stroke();
   document.getElementById('sv').textContent=shiftX;
   document.getElementById('mv').textContent=seam;
-  document.getElementById('cmd').textContent='--shift-x '+shiftX+' --seam '+seam;
 }
 const clampSeam=v=>Math.max(0,Math.min(OW,v));
 document.getElementById('sl').onclick=()=>{shiftX-=stepv();render();};
@@ -300,13 +354,119 @@ addEventListener('keydown',e=>{
   else if(e.key==='['){seam=clampSeam(seam-stepv());render();}
   else if(e.key===']'){seam=clampSeam(seam+stepv());render();}
 });
+document.getElementById('stitch').onclick=async()=>{
+  st('Stitching all frames with shift-x='+shiftX+', seam='+seam+' … (this can take a while)');
+  try{ const r=await fetch('/stitch?shiftx='+shiftX+'&seam='+seam); st('Done - '+await r.text()); }
+  catch(e){ st('Error: '+e); }
+};
+document.getElementById('quit').onclick=async()=>{ try{await fetch('/quit');}catch(e){} st('Stopped. You can close this tab.'); };
 </script></body></html>)HTML";
+    return h.str();
+}
 
-    string path = outDir + "/tune.html";
-    ofstream f(path);
-    f << html.str();
-    f.close();
-    cout << "tuner -> " << path << "  (open in a browser; dial in --shift-x / --seam)\n";
+static string qparam(const string &query, const string &key)
+{
+    string k = key + "=";
+    size_t p = query.find(k);
+    if (p == string::npos) return "";
+    size_t s = p + k.size(), e = query.find('&', s);
+    return query.substr(s, e == string::npos ? string::npos : e - s);
+}
+
+static void openBrowser(const string &url)
+{
+#ifdef _WIN32
+    system(("start \"\" \"" + url + "\"").c_str());
+#elif __APPLE__
+    system(("open \"" + url + "\"").c_str());
+#else
+    system(("xdg-open \"" + url + "\" >/dev/null 2>&1 &").c_str());
+#endif
+}
+
+// Minimal localhost HTTP server: serve the tuner, and on /stitch run the full stitch.
+static void runTuneServer(const string &source, bool video, StitchMaps &m,
+                          const UMat &warpL, const UMat &warpR, double degrees,
+                          int startFrame, int endFrame, const string &outDir, int port)
+{
+#ifdef _WIN32
+    WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+    string html = tunerHtml(warpL, warpR, m);
+
+    socket_t srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv == INVALID_SOCKET) { cerr << "socket() failed\n"; return; }
+    int yes = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // localhost only
+    int bound = -1;
+    for (int p = port; p < port + 10; ++p)
+    {
+        addr.sin_port = htons((unsigned short)p);
+        if (::bind(srv, (sockaddr *)&addr, sizeof(addr)) == 0) { bound = p; break; }
+    }
+    if (bound < 0 || listen(srv, 8) != 0) { cerr << "Could not bind a port\n"; CLOSESOCK(srv); return; }
+
+    string url = "http://127.0.0.1:" + to_string(bound) + "/";
+    cout << "\nTuner running at " << url << "  (opening browser; Ctrl+C or Quit to stop)\n";
+    openBrowser(url);
+
+    bool running = true;
+    while (running)
+    {
+        socket_t cl = accept(srv, nullptr, nullptr);
+        if (cl == INVALID_SOCKET) continue;
+
+        string req; char buf[4096];
+        for (;;)
+        {
+            int n = recv(cl, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            req.append(buf, n);
+            if (req.find("\r\n\r\n") != string::npos) break;
+        }
+        size_t sp1 = req.find(' '), sp2 = req.find(' ', sp1 + 1);
+        string target = (sp1 != string::npos && sp2 != string::npos) ? req.substr(sp1 + 1, sp2 - sp1 - 1) : "/";
+        string path = target, query;
+        size_t qm = target.find('?');
+        if (qm != string::npos) { path = target.substr(0, qm); query = target.substr(qm + 1); }
+
+        string status = "200 OK", ctype = "text/plain", body;
+        if (path == "/")
+        {
+            ctype = "text/html; charset=utf-8";
+            body = html;
+        }
+        else if (path == "/stitch")
+        {
+            double sx = query.find("shiftx=") != string::npos ? stod(qparam(query, "shiftx")) : 0;
+            string ss = qparam(query, "seam");
+            if (!ss.empty()) m.seam = stoi(ss);
+            cout << "[stitch] shift-x=" << sx << " seam=" << m.seam << " ...\n";
+            body = video ? stitchVideoFile(source, m, degrees, sx, startFrame, endFrame, outDir)
+                         : stitchImageFile(source, m, degrees, sx, outDir);
+            cout << "[stitch] " << body << "\n";
+        }
+        else if (path == "/quit")
+        {
+            body = "bye";
+            running = false;
+        }
+        else { status = "404 Not Found"; body = "not found"; }
+
+        string resp = "HTTP/1.1 " + status + "\r\nContent-Type: " + ctype +
+                      "\r\nContent-Length: " + to_string(body.size()) +
+                      "\r\nConnection: close\r\n\r\n" + body;
+        send(cl, resp.data(), (int)resp.size(), 0);
+        CLOSESOCK(cl);
+    }
+    CLOSESOCK(srv);
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    cout << "Tuner stopped.\n";
 }
 
 static string argVal(int argc, char **argv, const string &key, const string &def)
@@ -341,6 +501,7 @@ int main(int argc, char **argv)
     int startFrame = stoi(argVal(argc, argv, "--start", "0"));
     int endFrame = stoi(argVal(argc, argv, "--end", "-1"));
     double shiftX = stod(argVal(argc, argv, "--shift-x", "0"));
+    int port = stoi(argVal(argc, argv, "--port", "8090"));
     bool tune = hasArg(argc, argv, "--tune");
     if (source.empty())
     {
@@ -351,8 +512,7 @@ int main(int argc, char **argv)
     fs::create_directories(outDir);
 
     ocl::setUseOpenCL(true);
-    cout << "OpenCL available: " << ocl::haveOpenCL()
-         << ", using GPU: " << ocl::useOpenCL() << "\n";
+    cout << "OpenCL available: " << ocl::haveOpenCL() << ", using GPU: " << ocl::useOpenCL() << "\n";
 
     Mat KL, KR, R;
     vector<double> DL, DR;
@@ -362,84 +522,34 @@ int main(int argc, char **argv)
 
     bool video = isVideoFile(source);
 
-    // grab the first frame (single image, or first/--start frame of a video)
-    auto firstFrame = [&](Mat &frame) -> bool {
-        if (!video) { frame = imread(source); return !frame.empty(); }
+    // first frame (single image, or first/--start frame of a video) drives map sizing
+    Mat frame;
+    if (!video) frame = imread(source);
+    else
+    {
         VideoCapture cap(source);
-        if (!cap.isOpened()) return false;
-        if (startFrame > 0) cap.set(CAP_PROP_POS_FRAMES, startFrame);
-        bool ok = cap.read(frame);
-        cap.release();
-        return ok && !frame.empty();
-    };
+        if (cap.isOpened())
+        {
+            if (startFrame > 0) cap.set(CAP_PROP_POS_FRAMES, startFrame);
+            cap.read(frame);
+            cap.release();
+        }
+    }
+    if (frame.empty()) { cerr << "Cannot read source: " << source << endl; return 1; }
 
-    // ---------- TUNE: warp one frame, write the interactive page ----------
+    StitchMaps m = buildStitchMaps(KL, DL, KR, DR, R, frame.cols / 2, frame.rows, seamArg);
+
     if (tune)
     {
-        Mat frame;
-        if (!firstFrame(frame)) { cerr << "Cannot read source: " << source << endl; return 1; }
-        StitchMaps m = buildStitchMaps(KL, DL, KR, DR, R, frame.cols / 2, frame.rows, seamArg);
         UMat uFrame, warpL, warpR;
         frame.copyTo(uFrame);
         warpHalves(uFrame, m, warpL, warpR);
-        writeTuneHtml(warpL, warpR, m, outDir);
+        runTuneServer(source, video, m, warpL, warpR, degrees, startFrame, endFrame, outDir, port);
         return 0;
     }
 
-    // ---------- IMAGE: stitch a single frame ----------
-    if (!video)
-    {
-        Mat img = imread(source);
-        if (img.empty()) { cerr << "Cannot read image: " << source << endl; return 1; }
-        StitchMaps m = buildStitchMaps(KL, DL, KR, DR, R, img.cols / 2, img.rows, seamArg);
-        UMat uImg, warpL, warpR;
-        img.copyTo(uImg);
-        warpHalves(uImg, m, warpL, warpR);
-        UMat uPano = composite(warpL, warpR, m, degrees, shiftX);
-        Mat pano; uPano.copyTo(pano);
-        imwrite(outDir + "/pano.jpg", pano);
-        cout << "image -> " << outDir << "/pano.jpg\n";
-        return 0;
-    }
-
-    // ---------- VIDEO: build maps once, loop frames [start..end] ----------
-    VideoCapture cap(source);
-    if (!cap.isOpened()) { cerr << "Cannot open video: " << source << endl; return 1; }
-    int total = (int)cap.get(CAP_PROP_FRAME_COUNT);
-    int fw = (int)cap.get(CAP_PROP_FRAME_WIDTH);
-    int fh = (int)cap.get(CAP_PROP_FRAME_HEIGHT);
-    double fps = cap.get(CAP_PROP_FPS);
-    if (fps <= 0) fps = 30.0;
-    if (endFrame < 0 || endFrame >= total) endFrame = total - 1;
-    if (startFrame < 0) startFrame = 0;
-    cout << "video: " << total << " frames @ " << fps << " fps, " << fw << "x" << fh
-         << " -> frames [" << startFrame << ".." << endFrame << "]\n";
-
-    StitchMaps m = buildStitchMaps(KL, DL, KR, DR, R, fw / 2, fh, seamArg);
-
-    string outPath = outDir + "/stitched_video.mp4";
-    VideoWriter writer(outPath, VideoWriter::fourcc('m', 'p', '4', 'v'), fps, Size(m.OW, m.OH));
-    if (!writer.isOpened()) { cerr << "Cannot open output video for writing: " << outPath << endl; return 1; }
-
-    cap.set(CAP_PROP_POS_FRAMES, startFrame);
-    Mat frame, pano;
-    UMat uFrame, warpL, warpR;
-    int written = 0;
-    for (int i = startFrame; i <= endFrame; i++)
-    {
-        if (!cap.read(frame) || frame.empty()) break;
-        frame.copyTo(uFrame);
-        warpHalves(uFrame, m, warpL, warpR);
-        UMat uPano = composite(warpL, warpR, m, degrees, shiftX);
-        uPano.copyTo(pano);
-        writer.write(pano);
-        written++;
-        if (written % 30 == 0 || i == endFrame)
-            cout << "  " << (int)(100.0 * (i - startFrame + 1) / (endFrame - startFrame + 1))
-                 << "%  (frame " << i << ")\n";
-    }
-    cap.release();
-    writer.release();
-    cout << "video -> " << outPath << "  (" << written << " frames)\n";
+    string result = video ? stitchVideoFile(source, m, degrees, shiftX, startFrame, endFrame, outDir)
+                          : stitchImageFile(source, m, degrees, shiftX, outDir);
+    cout << (video ? "video -> " : "image -> ") << result << "\n";
     return 0;
 }

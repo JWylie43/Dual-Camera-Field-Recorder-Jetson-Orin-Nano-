@@ -211,23 +211,31 @@ reused for every frame.
 | `--degrees D` | `0` | Horizon roll correction |
 | `--seam X` | auto | Hard-seam column (default: overlap centre) |
 | `--shift-x N` | `0` | Nudge the right image N px horizontally (+ = right) |
-| `--tune` | off | Write an interactive `tune.html` instead of stitching (see below) |
+| `--tune` | off | Launch the interactive browser tuner (see below) |
+| `--port N` | `8090` | Port for the `--tune` web server |
 
 ### Interactive tuning (`--tune`)
 
 Rotation-only alignment is exact only at infinity; at finite distance a small
-horizontal **shift** can sharpen a chosen plane (e.g. a screen). To dial it in
-visually:
+horizontal **shift** can sharpen a chosen plane (e.g. a screen). `--tune` gives you
+a one-command visual tuner:
 
 ```bash
-./build/StitchPipeline --source <image-or-video> --tune --out tune_out
-# open tune_out/tune.html in a browser
+./build/StitchPipeline --source <image-or-video> --tune
 ```
 
-`tune.html` is self-contained (the warped halves are embedded). Click the arrows —
-or use ←/→ (shift) and `[` `]` (seam) — to nudge the right image and move the seam,
-with a live stitched preview and an **overlap-blend** toggle for checking alignment.
-It shows the exact `--shift-x N --seam N` to pass to a normal run.
+This warps the first frame, starts a tiny localhost web server, and **opens your
+browser** to a live tuner. There you:
+- click the **◀ ▶** arrows (or ←/→ for shift, `[` `]` for seam) to nudge the right
+  image and move the seam over a live stitched preview,
+- toggle **overlap blend** (50/50) to check alignment,
+- click **Stitch all frames** to run the full stitch on the whole image/video with
+  the current values — no need to re-run anything,
+- click **Quit** (or Ctrl+C the terminal) when done.
+
+For a video it previews/​tunes on the first frame (or `--start N`), then applies your
+chosen shift/seam to every frame. You can also skip the UI and pass the values
+directly: `--shift-x N --seam X`. Use `--port N` if 8090 is taken.
 
 > **Exposure/seam:** in high-contrast scenes the seam can show a brightness step (one
 > camera facing a bright window). Exposure compensation + seam feathering are future

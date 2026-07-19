@@ -11,3 +11,6 @@ include_directories(${OpenCV_INCLUDE_DIRS} ${PROJECT_SOURCE_DIR}/include)
 # Calibration-driven, feature-free pipeline (builds on OpenCV 4.x AND 5.x)
 add_executable(StitchPipeline stitch_pipeline.cpp)
 target_link_libraries(StitchPipeline ${OpenCV_LIBS})
+if(WIN32)
+  target_link_libraries(StitchPipeline ws2_32)   # sockets for the --tune web UI
+endif()
