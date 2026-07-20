@@ -78,10 +78,11 @@ struct StitchMaps
     int seam = 0;
 };
 
-// Right-image alignment (per-row horizontal shear + vertical shift).
+// Right-image alignment (per-row horizontal shear + vertical shift) + seam feather.
 struct Align
 {
     double shiftTop = 0, shiftBottom = 0, shiftY = 0;
+    int feather = 0;   // width (px) of the cross-fade band around the seam; 0 = hard
 };
 
 // Shared progress state for the --tune server (stitch runs on a worker thread).
@@ -234,8 +235,39 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
         warpAffine(warpR, right, T, Size(m.OW, m.OH));
     }
     UMat pano(m.OH, m.OW, warpL.type(), Scalar::all(0));
-    warpL(Rect(0, 0, m.seam, m.OH)).copyTo(pano(Rect(0, 0, m.seam, m.OH)));
-    right(Rect(m.seam, 0, m.OW - m.seam, m.OH)).copyTo(pano(Rect(m.seam, 0, m.OW - m.seam, m.OH)));
+    int seam = m.seam, fw = a.feather;
+    if (fw > 1)
+    {
+        // cross-fade band [seam-fw/2, seam+fw/2): alpha ramps 1 (left) -> 0 (right)
+        int half = fw / 2;
+        int x0 = max(0, seam - half), x1 = min(m.OW, seam + half), bw = x1 - x0;
+        if (x0 > 0) warpL(Rect(0, 0, x0, m.OH)).copyTo(pano(Rect(0, 0, x0, m.OH)));
+        if (x1 < m.OW) right(Rect(x1, 0, m.OW - x1, m.OH)).copyTo(pano(Rect(x1, 0, m.OW - x1, m.OH)));
+        if (bw > 0)
+        {
+            Mat ramp1(1, bw, CV_32F);
+            float *rp = ramp1.ptr<float>(0);
+            for (int x = 0; x < bw; x++) rp[x] = bw > 1 ? 1.0f - (float)x / (bw - 1) : 1.0f;
+            Mat rampRow, ramp3;
+            repeat(ramp1, m.OH, 1, rampRow);
+            merge(vector<Mat>{rampRow, rampRow, rampRow}, ramp3);
+            UMat af; ramp3.copyTo(af);
+            UMat lbf, rbf, omaf, out;
+            warpL(Rect(x0, 0, bw, m.OH)).convertTo(lbf, CV_32FC3);
+            right(Rect(x0, 0, bw, m.OH)).convertTo(rbf, CV_32FC3);
+            multiply(lbf, af, lbf);
+            subtract(Scalar(1, 1, 1), af, omaf);
+            multiply(rbf, omaf, rbf);
+            add(lbf, rbf, out);
+            out.convertTo(out, warpL.type());
+            out.copyTo(pano(Rect(x0, 0, bw, m.OH)));
+        }
+    }
+    else
+    {
+        warpL(Rect(0, 0, seam, m.OH)).copyTo(pano(Rect(0, 0, seam, m.OH)));
+        right(Rect(seam, 0, m.OW - seam, m.OH)).copyTo(pano(Rect(seam, 0, m.OW - seam, m.OH)));
+    }
     if (degrees != 0.0)
     {
         double ang = degrees * CV_PI / 180.0;
@@ -272,16 +304,17 @@ static string stitchImageFile(const string &source, StitchMaps &m, double degree
 }
 
 static string stitchVideoFile(const string &source, StitchMaps &m, double degrees,
-                              const Align &a, int startFrame, int endFrame, const string &outDir,
-                              std::atomic<int> *prog = nullptr)
+                              const Align &a, int startFrame, int endFrame, int totalFrames,
+                              const string &outDir, std::atomic<int> *prog = nullptr)
 {
     VideoCapture cap(source);
     if (!cap.isOpened()) return "ERROR: cannot open video";
-    int total = (int)cap.get(CAP_PROP_FRAME_COUNT);
     double fps = cap.get(CAP_PROP_FPS);
     if (fps <= 0) fps = 30.0;
-    int e = (endFrame < 0 || endFrame >= total) ? total - 1 : endFrame;
+    const int BIG = 1 << 30;
     int s = startFrame < 0 ? 0 : startFrame;
+    int e = endFrame >= 0 ? endFrame : (totalFrames > 0 ? totalFrames - 1 : BIG);
+    bool bounded = (e < BIG);
     string out = outDir + "/stitched_video.mp4";
     VideoWriter writer(out, VideoWriter::fourcc('m', 'p', '4', 'v'), fps, Size(m.OW, m.OH));
     if (!writer.isOpened()) return "ERROR: cannot open output video";
@@ -291,15 +324,19 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
     int written = 0;
     for (int i = s; i <= e; i++)
     {
-        if (!cap.read(frame) || frame.empty()) break;
+        if (!cap.read(frame) || frame.empty()) break;   // also stops at EOF
         frame.copyTo(uFrame);
         warpHalves(uFrame, m, wL, wR);
         composite(wL, wR, m, degrees, a).copyTo(pano);
         writer.write(pano);
-        int pct = (int)(100.0 * (i - s + 1) / (e - s + 1));
-        if (prog) prog->store(pct);
-        if (++written % 30 == 0 || i == e)
-            cout << "  " << pct << "%  (frame " << i << ")\n";
+        ++written;
+        if (bounded)
+        {
+            int pct = (int)(100.0 * (i - s + 1) / (e - s + 1));
+            if (prog) prog->store(pct);
+            if (written % 30 == 0 || i == e) cout << "  " << pct << "%  (frame " << i << ")\n";
+        }
+        else if (written % 30 == 0) cout << "  frame " << i << "\n";
     }
     cap.release();
     writer.release();
@@ -352,6 +389,7 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
   <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
   <div class="grp">Shift-y <button id="yl">&#9664;</button><input class="val" id="yv" type="number" value="0"><button id="yr">&#9654;</button></div>
   <div class="grp">Seam <button id="ml">&#9664;</button><input class="val" id="mv" type="number" value="0"><button id="mr">&#9654;</button></div>
+  <div class="grp">Feather <button id="wl">&#9664;</button><input class="val" id="fw" type="number" value="0"><button id="wr">&#9654;</button></div>
   <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
   <div class="grp">step <select id="step"><option>1</option><option>2</option><option>5</option><option>10</option></select></div>
@@ -374,8 +412,10 @@ const stepv=()=>parseInt(document.getElementById('step').value)||1;
 const st=t=>document.getElementById('status').textContent=t;
 // number inputs are the source of truth
 const tv=document.getElementById('tv'), bv=document.getElementById('bv'),
-      yv=document.getElementById('yv'), mv=document.getElementById('mv');
+      yv=document.getElementById('yv'), mv=document.getElementById('mv'), fw=document.getElementById('fw');
 mv.value=SEAM0;
+const off=document.createElement('canvas'); off.width=OW; off.height=OH;
+const octx=off.getContext('2d');
 let sTop=0, sBot=0, sY=0, seam=SEAM0, pending=0;
 const imgL=new Image(), imgR=new Image();
 function both(){ if(--pending<=0){ pending=0; render(); } }
@@ -384,14 +424,31 @@ function drawRight(){
   const k=(OH>1)?(sBot-sTop)/(OH-1):0;         // per-row shear slope
   ctx.save(); ctx.transform(1,0,k,1,sTop,sY); ctx.drawImage(imgR,0,0); ctx.restore();
 }
+function drawRightFeather(fwv){            // cross-fade the right image across a band
+  const half=fwv/2, x0=Math.max(0,seam-half), x1=Math.min(OW,seam+half);
+  const k=(OH>1)?(sBot-sTop)/(OH-1):0;
+  octx.setTransform(1,0,0,1,0,0); octx.globalCompositeOperation='source-over'; octx.clearRect(0,0,OW,OH);
+  octx.setTransform(1,0,k,1,sTop,sY); octx.drawImage(imgR,0,0);
+  octx.setTransform(1,0,0,1,0,0);
+  octx.globalCompositeOperation='destination-in';
+  octx.fillStyle='rgba(0,0,0,0)'; octx.fillRect(0,0,x0,OH);            // left: drop right
+  const g=octx.createLinearGradient(x0,0,x1,0);
+  g.addColorStop(0,'rgba(0,0,0,0)'); g.addColorStop(1,'rgba(0,0,0,1)');
+  octx.fillStyle=g; octx.fillRect(x0,0,Math.max(1,x1-x0),OH);          // band: ramp
+  octx.fillStyle='rgba(0,0,0,1)'; octx.fillRect(x1,0,OW-x1,OH);        // right: keep
+  octx.globalCompositeOperation='source-over';
+  ctx.drawImage(off,0,0);
+}
 function render(){
   sTop=+tv.value||0; sBot=+bv.value||0; sY=+yv.value||0; seam=clampSeam(+mv.value||0);
+  const fwv=Math.max(0,+fw.value||0);
   ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=1; ctx.clearRect(0,0,OW,OH);
   if(document.getElementById('blend').checked){
     ctx.globalAlpha=0.5; ctx.drawImage(imgL,0,0); drawRight(); ctx.globalAlpha=1;
   } else {
     ctx.drawImage(imgL,0,0);
-    ctx.save(); ctx.beginPath(); ctx.rect(seam,0,OW-seam,OH); ctx.clip(); drawRight(); ctx.restore();
+    if(fwv>1) drawRightFeather(fwv);
+    else { ctx.save(); ctx.beginPath(); ctx.rect(seam,0,OW-seam,OH); ctx.clip(); drawRight(); ctx.restore(); }
   }
   ctx.strokeStyle='#f33'; ctx.lineWidth=2;
   ctx.beginPath(); ctx.moveTo(seam,0); ctx.lineTo(seam,OH); ctx.stroke();
@@ -401,7 +458,9 @@ tl.onclick=()=>nudge(tv,-stepv()); tr.onclick=()=>nudge(tv,stepv());
 bl.onclick=()=>nudge(bv,-stepv()); br.onclick=()=>nudge(bv,stepv());
 yl.onclick=()=>nudge(yv,-stepv()); yr.onclick=()=>nudge(yv,stepv());
 ml.onclick=()=>nudge(mv,-stepv()); mr.onclick=()=>nudge(mv,stepv());
-[tv,bv,yv,mv].forEach(el=>el.oninput=render);
+wl.onclick=()=>{ fw.value=Math.max(0,(+fw.value||0)-stepv()); render(); };
+wr.onclick=()=>{ fw.value=Math.max(0,(+fw.value||0)+stepv()); render(); };
+[tv,bv,yv,mv,fw].forEach(el=>el.oninput=render);
 document.getElementById('blend').onchange=render;
 addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT') return;      // let typing in the boxes work normally
@@ -434,7 +493,7 @@ frange.onchange=()=>loadFrame(frange.value);
 fval.onchange=()=>loadFrame(fval.value);
 let polling=null;
 const pb=document.getElementById('pb'), pct=document.getElementById('pct');
-const params=()=>'shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty='+(+yv.value||0)+'&seam='+clampSeam(+mv.value||0);
+const params=()=>'shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty='+(+yv.value||0)+'&seam='+clampSeam(+mv.value||0)+'&feather='+Math.max(0,+fw.value||0);
 document.getElementById('stitch').onclick=async()=>{
   if(polling) return;
   document.getElementById('stitch').disabled=true;
@@ -555,6 +614,7 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
                 a.shiftTop = query.find("shifttop=") != string::npos ? stod(qparam(query, "shifttop")) : 0;
                 a.shiftBottom = query.find("shiftbottom=") != string::npos ? stod(qparam(query, "shiftbottom")) : 0;
                 a.shiftY = query.find("shifty=") != string::npos ? stod(qparam(query, "shifty")) : 0;
+                a.feather = query.find("feather=") != string::npos ? stoi(qparam(query, "feather")) : 0;
                 string ss = qparam(query, "seam");
                 StitchMaps mm = m;
                 if (!ss.empty()) mm.seam = stoi(ss);
@@ -562,9 +622,10 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
                 { lock_guard<mutex> lk(g_mu); g_result.clear(); }
                 cout << "[stitch] top=" << a.shiftTop << " bottom=" << a.shiftBottom
                      << " y=" << a.shiftY << " seam=" << mm.seam << " ...\n";
-                std::thread([mm, a, source, video, degrees, startFrame, endFrame, outDir]() mutable {
+                int tf = totalFrames;
+                std::thread([mm, a, source, video, degrees, startFrame, endFrame, tf, outDir]() mutable {
                     string res = video
-                        ? stitchVideoFile(source, mm, degrees, a, startFrame, endFrame, outDir, &g_percent)
+                        ? stitchVideoFile(source, mm, degrees, a, startFrame, endFrame, tf, outDir, &g_percent)
                         : stitchImageFile(source, mm, degrees, a, outDir);
                     { lock_guard<mutex> lk(g_mu); g_result = res; }
                     g_percent = 100; g_done = true; g_busy = false;
@@ -693,6 +754,7 @@ int main(int argc, char **argv)
     a.shiftTop = stod(argVal(argc, argv, "--shift-top", sx));
     a.shiftBottom = stod(argVal(argc, argv, "--shift-bottom", sx));
     a.shiftY = stod(argVal(argc, argv, "--shift-y", "0"));
+    a.feather = stoi(argVal(argc, argv, "--feather", "0"));
     int port = stoi(argVal(argc, argv, "--port", "8090"));
     bool tune = hasArg(argc, argv, "--tune");
     if (source.empty())
@@ -750,7 +812,7 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    string result = video ? stitchVideoFile(source, m, degrees, a, startFrame, endFrame, outDir)
+    string result = video ? stitchVideoFile(source, m, degrees, a, startFrame, endFrame, totalFrames, outDir)
                           : stitchImageFile(source, m, degrees, a, outDir);
     cout << (video ? "video -> " : "image -> ") << result << "\n";
     return 0;
