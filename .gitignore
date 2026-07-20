@@ -1,6 +1,8 @@
-# Recordings and logs (never commit captured video)
+# Recordings and logs (never commit captured video / rendered output)
 *.mkv
 *.avi
+*.mp4
+*.mov
 *.raw
 *.yuv
 *.tegrastats.log
@@ -23,6 +25,8 @@ charuco_board.png
 # ignore build output and generated renders
 stitching/build/
 stitching/*_out/
+stitching/output/
+stitching/pipeline_out/
 *.bin
 
 # 3D model: commit only the zip; ignore the loose CAD files (incl. the 53 MB STEP)
