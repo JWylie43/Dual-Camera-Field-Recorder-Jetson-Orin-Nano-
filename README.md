@@ -180,13 +180,54 @@ rotation `R`. Per-frame work runs on `cv::UMat`, so it uses the **GPU via OpenCL
 when available and falls back to CPU otherwise — same source on macOS and desktop,
 OpenCV 4.x or 5.x.
 
+## Prerequisites
+
+The stitcher is C++ and is built from source on your machine. You don't need to
+build OpenCV yourself — a prebuilt package is fine. You need four things: a C++
+compiler, CMake, OpenCV (4.x or 5.x), and FFmpeg (for `ffprobe`, used to count
+video frames). Install per platform:
+
+**macOS** (via [Homebrew](https://brew.sh)):
+```bash
+xcode-select --install          # C++ compiler (clang) — skip if already installed
+brew install cmake opencv ffmpeg
+```
+
+**Windows** (x64):
+1. **Visual Studio 2022** — install the *"Desktop development with C++"* workload
+   (this is the compiler). The free Community edition is fine.
+2. **CMake** — https://cmake.org/download (or `winget install Kitware.CMake`).
+3. **OpenCV** — download the Windows build from https://opencv.org/releases,
+   run the self-extractor, and extract to `C:\` so you get `C:\opencv`. Then set
+   the env var CMake looks for, and add the DLL folder to PATH (PowerShell, Admin):
+   ```powershell
+   [Environment]::SetEnvironmentVariable("OpenCV_DIR", "C:\opencv\build", "Machine")
+   [Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\opencv\build\x64\vc16\bin", "Machine")
+   ```
+   (If there's no `vc16` folder, use whatever `vcXX` exists under `C:\opencv\build\x64\`.)
+4. **FFmpeg** — https://ffmpeg.org/download.html (or `winget install Gyan.FFmpeg`);
+   make sure `ffprobe` is on your PATH.
+
+**Linux** (Debian/Ubuntu):
+```bash
+sudo apt-get install -y build-essential cmake libopencv-dev ffmpeg
+```
+
+To confirm everything is present: `cmake --version`, `ffprobe -version`, and (macOS/Linux)
+`pkg-config --modversion opencv4` or check that `C:\opencv\build\OpenCVConfig.cmake` exists.
+
 ## Build
 
 ```bash
-# macOS: brew install cmake opencv
 cd stitching
-cmake -S . -B build && cmake --build build
+cmake -S . -B build
+cmake --build build --config Release      # --config Release matters on Windows
 ```
+
+The binary lands at `build/StitchPipeline` (macOS/Linux) or
+`build\Release\StitchPipeline.exe` (Windows). On Windows the project's
+`CMakeLists.txt` already points at `C:/opencv/build`; override with
+`-D OpenCV_DIR="<path>"` if yours lives elsewhere.
 
 ## Run
 
@@ -362,6 +403,9 @@ xdg-mime default vlc.desktop video/x-matroska
 | 0 stereo views / no overlap | Board never fully visible to both cameras at once — get it centred and big in **both** preview halves; print it (screens fail). |
 | Baseline scale looks wrong | `--square-mm`/`--marker-mm` must match the **measured** printed board. |
 | Stitch seam ghosting on near objects | Parallax from the baseline — unavoidable rotation-only; minimal on distant scenes. |
+| CMake: "Could NOT find OpenCV" | OpenCV isn't installed or not found. Install it (see Prerequisites), or pass `-D OpenCV_DIR="<dir containing OpenCVConfig.cmake>"`. |
+| Windows: app exits with "opencv_world….dll not found" | The OpenCV `bin` folder isn't on PATH. Add `C:\opencv\build\x64\vc16\bin` to PATH (see Prerequisites) or copy the DLL next to the exe. |
+| Frame slider shows `/ ?` (unknown total) | `ffprobe` isn't on PATH — install FFmpeg. Stitching still works; only the frame count is unknown. |
 
 ---
 
