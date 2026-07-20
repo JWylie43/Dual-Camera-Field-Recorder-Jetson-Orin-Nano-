@@ -514,7 +514,7 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
   <div class="grp">Shift-y <button id="yl">&#9664;</button><input class="val" id="yv" type="number" value="0"><button id="yr">&#9654;</button></div>
   <div class="grp">Seam <button id="ml">&#9664;</button><input class="val" id="mv" type="number" value="0"><button id="mr">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="mb" checked> multi-band blend</label></div>
-  <div class="grp"><label><input type="checkbox" id="xc"> exposure/color match</label></div>
+  <div class="grp"><label><input type="checkbox" id="xc" checked> exposure/color match</label></div>
   <div class="grp"><label><input type="checkbox" id="ss" checked> seam avoidance (moving objects)</label></div>
   <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
@@ -862,7 +862,7 @@ int main(int argc, char **argv)
     a.shiftBottom = stod(argVal(argc, argv, "--shift-bottom", sx));
     a.shiftY = stod(argVal(argc, argv, "--shift-y", "0"));
     a.bands = stoi(argVal(argc, argv, "--bands", "6"));   // 0 = hard seam
-    a.exposure = hasArg(argc, argv, "--exposure");
+    a.exposure = !hasArg(argc, argv, "--no-exposure");     // on by default
     a.smartSeam = !hasArg(argc, argv, "--no-smart-seam");  // on by default
     int port = stoi(argVal(argc, argv, "--port", "8090"));
     bool tune = hasArg(argc, argv, "--tune");
@@ -871,7 +871,7 @@ int main(int argc, char **argv)
         cerr << "Usage: StitchPipeline --source <image-or-video> [--calib-dir ..] [--out ..]\n"
              << "        [--start N] [--end N] [--degrees D] [--tune] [--port N]\n"
              << "        [--shift-top N] [--shift-bottom N] [--shift-y N]  (--shift-x N sets top=bottom)\n"
-             << "        [--bands N (default 6, 0=hard seam)] [--exposure] [--no-smart-seam] [--seam X]\n";
+             << "        [--bands N (default 6, 0=hard seam)] [--no-exposure] [--no-smart-seam] [--seam X]\n";
         return 1;
     }
     fs::create_directories(outDir);
