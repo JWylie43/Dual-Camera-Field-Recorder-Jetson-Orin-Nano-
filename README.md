@@ -192,24 +192,26 @@ cmake -S . -B build && cmake --build build
 
 ### One-click flow (recommended)
 
-Run the binary with **no `--source`** and it opens native file dialogs itself:
+Run the binary with **no `--source`** and the browser tuner opens immediately:
 
 ```bash
-./build/StitchPipeline          # pops input picker → output picker → tuner
+./build/StitchPipeline          # opens the tuner; import + save happen in the page
 ```
 
-It pops a native dialog to **pick the input** file (video or image, anywhere on
-disk), a second dialog to **pick the output** destination + filename, and opens
-the tuner already loaded with that file. Align the far/near edges, then click
-**Stitch all frames** to render to your chosen output.
+In the page:
+1. Click **Import source…** — a native file dialog opens; pick a video or image
+   (anywhere on disk). The preview loads and the frame slider wires up.
+2. Align the **far (top)** and **near (bottom)** edges.
+3. Click **Stitch all frames** — a native **Save as** dialog pops up to choose the
+   output path + filename, then it renders the whole video there.
 
-The dialogs are the OS's own: macOS uses `osascript` (Finder), Windows uses a
-PowerShell `OpenFileDialog`/`SaveFileDialog`, Linux uses `zenity`. No wrapper
-script or extra dependency — it's all in the one executable per platform.
+The dialogs are the OS's own: macOS uses `osascript` (Finder), Windows a
+PowerShell `OpenFileDialog`/`SaveFileDialog`, Linux `zenity`. No wrapper script or
+extra dependency — it's all in the one executable per platform.
 
 On macOS you can also **double-click `stitching/stitch.command`** in Finder — it
-just builds the binary on first run and launches it. On Windows, double-click
-`build\StitchPipeline.exe` directly.
+builds the binary on first run and launches it. On Windows, double-click
+`build\StitchPipeline.exe`.
 
 ### Direct CLI
 

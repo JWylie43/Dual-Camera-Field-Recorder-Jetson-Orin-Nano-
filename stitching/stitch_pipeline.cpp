@@ -484,21 +484,29 @@ static string base64(const vector<uchar> &data)
     return out;
 }
 
-static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
-                        int total, int startIdx, bool video)
+// Defined later; needed by the tuner's on-demand source loader.
+static bool isVideoFile(const string &path);
+static int probeFrames(const string &source, double fps);
+
+// Escape a string for embedding in JSON (handles Windows backslashes + quotes).
+static string jsonEscape(const string &s)
 {
-    Mat mL, mR;
-    warpL.copyTo(mL); warpR.copyTo(mR);
-    vector<uchar> bL, bR; vector<int> q = {IMWRITE_JPEG_QUALITY, 85};
-    imencode(".jpg", mL, bL, q);
-    imencode(".jpg", mR, bR, q);
+    string o;
+    for (char c : s)
+    {
+        if (c == '\\' || c == '"') { o.push_back('\\'); o.push_back(c); }
+        else if (c == '\n') o += "\\n";
+        else o.push_back(c);
+    }
+    return o;
+}
+
+// The tuner page. Starts with no source loaded; the browser's "Import source"
+// button (and /state on load) fill in the preview dynamically.
+static string tunerHtml()
+{
     ostringstream h;
     h << "<!doctype html><html><head><meta charset='utf-8'><title>Stitch tuner</title>"
-      << "<script>const OW=" << m.OW << ",OH=" << m.OH << ",SEAM0=" << m.seam
-      << ",TOTAL=" << total << ",FRAME0=" << startIdx
-      << ",VIDEO=" << (video ? "true" : "false") << ";"
-      << "const IMGL='data:image/jpeg;base64," << base64(bL) << "';"
-      << "const IMGR='data:image/jpeg;base64," << base64(bR) << "';</script>"
       << R"HTML(<style>
  body{margin:0;font-family:system-ui,sans-serif;background:#111;color:#eee}
  #bar{padding:10px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#1b1b1b;position:sticky;top:0;z-index:2}
@@ -506,10 +514,14 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
  #stitch{background:#1f8a3b;font-weight:700} #quit{background:#8a3b1f} #finish{background:#555}
  .grp{display:flex;gap:6px;align-items:center;border:1px solid #333;padding:5px 9px;border-radius:8px;font-size:14px}
  .val{width:60px;text-align:center;font-variant-numeric:tabular-nums;font-size:15px;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:3px}
+ .path{width:230px;font-size:12px;background:#222;color:#9cf;border:1px solid #444;border-radius:5px;padding:3px}
+ #import{background:#6a4fb3;font-weight:700} button:disabled{opacity:.45;cursor:not-allowed}
  #wrap{overflow:auto} canvas{display:block;max-width:100%;background:#000}
  #status{padding:6px 10px;color:#9cf} .hint{color:#888;font-size:12px}
 </style></head><body>
 <div id="bar">
+  <div class="grp"><button id="import">Import source…</button><input class="path" id="srcpath" type="text" readonly placeholder="no file loaded"></div>
+  <div class="grp">Output <input class="path" id="outpath" type="text" readonly placeholder="chosen when you click Stitch"></div>
   <div class="grp">Shift far (top) <button id="tl">&#9664;</button><input class="val" id="tv" type="number" value="0"><button id="tr">&#9654;</button></div>
   <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
   <!-- Hidden for now (smart seam, multi-band blend, and exposure match are on by default):
@@ -521,11 +533,11 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
   -->
   <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
-  <button id="stitch">Stitch all frames</button>
+  <button id="stitch" disabled>Stitch all frames</button>
   <button id="quit">Quit</button>
   <span class="hint">&#8592;/&#8594; shift both</span>
 </div>
-<div id="status">Ready. Align the far (top) and near (bottom) edges, then Stitch.</div>
+<div id="status">Click "Import source…" to choose a video or image.</div>
 <div id="prog" style="padding:0 10px 10px;display:none">
   <progress id="pb" max="100" value="0" style="width:280px;height:16px;vertical-align:middle"></progress>
   <span id="pct" style="margin-left:8px">0%</span>
@@ -533,14 +545,15 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
 </div>
 <div id="wrap"><canvas id="c"></canvas></div>
 <script>
+// Dynamic state — filled in by /state (on load) or /import (button).
+let OW=0, OH=0, SEAM0=0, TOTAL=1, VIDEO=false, loaded=false;
 const cv=document.getElementById('c'), ctx=cv.getContext('2d');
-cv.width=OW; cv.height=OH;
 const clampSeam=v=>{ return Math.max(0,Math.min(OW,v)); };
-const stepv=()=>{ return 1; };   // step selector removed; arrows nudge by 1
+const stepv=()=>{ return 1; };   // arrows nudge by 1
 const st=t=>{ document.getElementById('status').textContent=t; };
-// number inputs are the source of truth
 const tv=document.getElementById('tv'), bv=document.getElementById('bv');
-let sTop=0, sBot=0, sY=0, seam=SEAM0, pending=0;   // sY/seam fixed (controls hidden)
+const stitchBtn=document.getElementById('stitch');
+let sTop=0, sBot=0, sY=0, seam=0, pending=0;   // sY/seam fixed (controls hidden)
 const imgL=new Image(), imgR=new Image();
 function both(){ if(--pending<=0){ pending=0; render(); } }
 imgL.onload=imgR.onload=both;
@@ -549,6 +562,7 @@ function drawRight(){
   ctx.save(); ctx.transform(1,0,k,1,sTop,sY); ctx.drawImage(imgR,0,0); ctx.restore();
 }
 function render(){
+  if(!loaded) return;
   sTop=+tv.value||0; sBot=+bv.value||0;   // sY and seam stay fixed (controls hidden)
   ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=1; ctx.clearRect(0,0,OW,OH);
   if(document.getElementById('blend').checked){
@@ -571,48 +585,83 @@ addEventListener('keydown',e=>{
   if(e.key==='ArrowLeft'){tv.value=(+tv.value||0)-d; bv.value=(+bv.value||0)-d; render(); e.preventDefault();}
   else if(e.key==='ArrowRight'){tv.value=(+tv.value||0)+d; bv.value=(+bv.value||0)+d; render(); e.preventDefault();}
 });
-pending=2; imgL.src=IMGL; imgR.src=IMGR;   // initial frame
 // frame scrubbing (video only)
 const frange=document.getElementById('frange'), fval=document.getElementById('fval');
-const known = TOTAL>1;
-const FMAX = known ? TOTAL-1 : 100000;
-frange.max=FMAX; frange.value=FRAME0; fval.value=FRAME0; fval.max=FMAX;
-document.getElementById('ftot').textContent = known ? ('/ '+TOTAL) : '/ ?';
-if(!VIDEO) document.getElementById('framegrp').style.display='none';
-const ftxt=n=>'Frame '+n+(known?(' / '+TOTAL):'');
+const ftxt=n=>{ return 'Frame '+n+(TOTAL>1?(' / '+TOTAL):''); };
 function loadFrame(n){
+  if(!loaded) return;
+  const FMAX = TOTAL>1 ? TOTAL-1 : 100000;
   n=Math.max(0,Math.min(FMAX,parseInt(n)||0)); frange.value=n; fval.value=n;
   st('Loading '+ftxt(n)+'…');
-  fetch('/frame?n='+n).then(r=>r.json()).then(d=>{
+  fetch('/frame?n='+n).then(r=>{return r.json();}).then(d=>{
     if(d.error){ st('frame error: '+d.error); return; }
     pending=2; imgL.src=d.left; imgR.src=d.right; st(ftxt(n));
-  }).catch(e=>st('frame load error: '+e));
+  }).catch(e=>{ st('frame load error: '+e); });
 }
-document.getElementById('fprev').onclick=()=>loadFrame((+frange.value||0)-1);
-document.getElementById('fnext').onclick=()=>loadFrame((+frange.value||0)+1);
-frange.onchange=()=>loadFrame(frange.value);
-fval.onchange=()=>loadFrame(fval.value);
+document.getElementById('fprev').onclick=()=>{ loadFrame((+frange.value||0)-1); };
+document.getElementById('fnext').onclick=()=>{ loadFrame((+frange.value||0)+1); };
+frange.onchange=()=>{ loadFrame(frange.value); };
+fval.onchange=()=>{ loadFrame(fval.value); };
+
+// Apply a loaded source (from /state or /import): size the canvas, wire the
+// frame slider, show the first frame, and enable stitching.
+function applyLoad(d){
+  loaded=true; OW=d.ow; OH=d.oh; SEAM0=d.seam; TOTAL=d.total; VIDEO=d.video; seam=SEAM0;
+  cv.width=OW; cv.height=OH;
+  document.getElementById('srcpath').value=d.source||'';
+  if(d.output) document.getElementById('outpath').value=d.output;
+  const known=TOTAL>1, FMAX=known?TOTAL-1:100000;
+  frange.max=FMAX; frange.value=0; fval.value=0; fval.max=FMAX;
+  document.getElementById('ftot').textContent = known ? ('/ '+TOTAL) : '/ ?';
+  document.getElementById('framegrp').style.display = VIDEO ? '' : 'none';
+  stitchBtn.disabled=false;
+  pending=2; imgL.src=d.left; imgR.src=d.right;
+  st('Loaded. Align the far (top) and near (bottom) edges, then Stitch.');
+}
+document.getElementById('import').onclick=async()=>{
+  st('Choose an input file…');
+  try{
+    const d=await (await fetch('/import')).json();
+    if(d.cancelled){ st('Import cancelled.'); return; }
+    if(d.error){ st('Import error: '+d.error); return; }
+    applyLoad(d);
+  }catch(e){ st('Import failed: '+e); }
+};
+// On page load, adopt a source that was preloaded via --source (if any).
+(async()=>{
+  try{ const d=await (await fetch('/state')).json(); if(d.loaded) applyLoad(d); }catch(e){}
+})();
+
 let polling=null;
 const pb=document.getElementById('pb'), pct=document.getElementById('pct');
 // hidden controls fixed to defaults: shift-y 0, smart seam on, 6-band blend, exposure match on
 const params=()=>{ return 'shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty=0&seam='+SEAM0+'&bands=6&exposure=1&smartseam=1'; };
-document.getElementById('stitch').onclick=async()=>{
-  if(polling) return;
-  document.getElementById('stitch').disabled=true;
+stitchBtn.onclick=async()=>{
+  if(polling || !loaded) return;
+  // pop the native "save as" dialog to choose the output path + filename
+  st('Choose where to save the output…');
+  let out='';
+  try{ out=(await (await fetch('/chooseoutput')).json()).path||''; }
+  catch(e){ st('Could not open save dialog: '+e); return; }
+  if(!out){ st('Save cancelled.'); return; }
+  document.getElementById('outpath').value=out;
+  stitchBtn.disabled=true;
   document.getElementById('prog').style.display='block';
   document.getElementById('finish').style.display='none';
   pb.value=0; pct.textContent='0%';
-  st('Stitching all frames ('+params()+') …');
+  st('Stitching all frames → '+out+' …');
   try{ const r=await fetch('/stitch?'+params());
-       if((await r.text())==='busy'){ st('Already stitching…'); return; } }
-  catch(e){ st('Error starting: '+e); document.getElementById('stitch').disabled=false; return; }
+       const t=await r.text();
+       if(t==='busy'){ st('Already stitching…'); return; }
+       if(t==='notloaded'){ st('Import a source first.'); stitchBtn.disabled=false; return; } }
+  catch(e){ st('Error starting: '+e); stitchBtn.disabled=false; return; }
   polling=setInterval(async()=>{
     try{
       const p=await (await fetch('/progress')).json();
       pb.value=p.percent; pct.textContent=p.percent+'%';
       if(p.done){
         clearInterval(polling); polling=null;
-        document.getElementById('stitch').disabled=false;
+        stitchBtn.disabled=false;
         pb.value=100; pct.textContent='100%';
         st('✅ Done — saved to '+p.result);
         document.getElementById('finish').style.display='inline-block';
@@ -695,15 +744,66 @@ static void openBrowser(const string &url)
 #endif
 }
 
-static void runTuneServer(const string &source, bool video, StitchMaps &m,
-                          const UMat &warpL, const UMat &warpR, double degrees,
-                          int startFrame, int endFrame, const string &outDir,
-                          const string &outFile, int totalFrames, int port)
+static void runTuneServer(const Mat &KL, const vector<double> &DL,
+                          const Mat &KR, const vector<double> &DR, const Mat &R,
+                          double degrees, int startFrame, int endFrame,
+                          const string &outDir, const string &initSource,
+                          const string &initOutFile, int port)
 {
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
-    string html = tunerHtml(warpL, warpR, m, totalFrames, startFrame, video);
+    string html = tunerHtml();
+
+    // Mutable server state: a source can be loaded (or replaced) at any time
+    // via the browser's Import button, so none of this is fixed up front.
+    string source = initSource, outFile = initOutFile;
+    bool video = false, loaded = false;
+    int totalFrames = 1;
+    StitchMaps m;
+    string curLeft, curRight;            // first-frame preview (data: URIs)
+    VideoCapture frameCap;               // persistent for /frame scrubbing
+    int frameCapPos = -1;
+
+    // Open a file: build the stitch maps and the first-frame preview. Returns
+    // "" on success or an error message.
+    auto loadSource = [&](const string &path) -> string {
+        bool isVid = isVideoFile(path);
+        Mat frame; int tf = 1;
+        if (!isVid) { frame = imread(path); }
+        else
+        {
+            VideoCapture cap(path);
+            if (!cap.isOpened()) return "cannot open video";
+            tf = (int)cap.get(CAP_PROP_FRAME_COUNT);
+            if (tf < 1 || tf > 100000000) { double fps = cap.get(CAP_PROP_FPS); tf = probeFrames(path, fps > 0 ? fps : 30.0); }
+            cap.read(frame); cap.release();
+        }
+        if (frame.empty()) return "cannot read source";
+        StitchMaps mm = buildStitchMaps(KL, DL, KR, DR, R, frame.cols / 2, frame.rows, -1);
+        UMat uF, wL, wR; frame.copyTo(uF); warpHalves(uF, mm, wL, wR);
+        Mat mL, mR; wL.copyTo(mL); wR.copyTo(mR);
+        vector<uchar> bL, bR; vector<int> q = {IMWRITE_JPEG_QUALITY, 85};
+        imencode(".jpg", mL, bL, q); imencode(".jpg", mR, bR, q);
+        m = mm; video = isVid; totalFrames = tf; source = path; loaded = true;
+        curLeft = "data:image/jpeg;base64," + base64(bL);
+        curRight = "data:image/jpeg;base64," + base64(bR);
+        frameCap.release(); frameCapPos = -1;
+        return "";
+    };
+
+    auto stateJson = [&]() -> string {
+        if (!loaded) return "{\"loaded\":false}";
+        ostringstream j;
+        j << "{\"loaded\":true,\"ow\":" << m.OW << ",\"oh\":" << m.OH << ",\"seam\":" << m.seam
+          << ",\"total\":" << totalFrames << ",\"video\":" << (video ? "true" : "false")
+          << ",\"source\":\"" << jsonEscape(source) << "\",\"output\":\"" << jsonEscape(outFile) << "\""
+          << ",\"left\":\"" << curLeft << "\",\"right\":\"" << curRight << "\"}";
+        return j.str();
+    };
+
+    // Preload a source passed on the command line (`--source x --tune`).
+    if (!source.empty()) { string err = loadSource(source); if (!err.empty()) cerr << "preload: " << err << "\n"; }
 
     socket_t srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv == INVALID_SOCKET) { cerr << "socket() failed\n"; return; }
@@ -723,9 +823,6 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
     string url = "http://127.0.0.1:" + to_string(bound) + "/";
     cout << "\nTuner running at " << url << "  (opening browser; Ctrl+C or Quit to stop)\n";
     openBrowser(url);
-
-    VideoCapture frameCap;   // persistent for /frame scrubbing (forward = fast grab)
-    int frameCapPos = -1;    // index of the last frame retrieved into frameCap
 
     bool running = true;
     while (running)
@@ -753,9 +850,30 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
             ctype = "text/html; charset=utf-8";
             body = html;
         }
+        else if (path == "/state")
+        {
+            ctype = "application/json";
+            body = stateJson();
+        }
+        else if (path == "/import")
+        {
+            ctype = "application/json";
+            string p = pickInputFile();
+            if (p.empty()) body = "{\"cancelled\":true}";
+            else { string err = loadSource(p); body = err.empty() ? stateJson() : ("{\"error\":\"" + jsonEscape(err) + "\"}"); }
+        }
+        else if (path == "/chooseoutput")
+        {
+            ctype = "application/json";
+            string def = video ? "stitched.mp4" : "stitched.jpg";
+            string p = pickSaveFile(def);
+            if (!p.empty()) outFile = p;
+            body = "{\"path\":\"" + jsonEscape(p) + "\"}";
+        }
         else if (path == "/stitch")
         {
-            if (g_busy) { body = "busy"; }
+            if (!loaded) { body = "notloaded"; }
+            else if (g_busy) { body = "busy"; }
             else
             {
                 Align a;
@@ -771,12 +889,13 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
                 g_busy = true; g_done = false; g_percent = 0;
                 { lock_guard<mutex> lk(g_mu); g_result.clear(); }
                 cout << "[stitch] top=" << a.shiftTop << " bottom=" << a.shiftBottom
-                     << " y=" << a.shiftY << " seam=" << mm.seam << " ...\n";
+                     << " y=" << a.shiftY << " seam=" << mm.seam << " -> " << outFile << " ...\n";
                 int tf = totalFrames;
-                std::thread([mm, a, source, video, degrees, startFrame, endFrame, tf, outDir, outFile]() mutable {
-                    string res = video
-                        ? stitchVideoFile(source, mm, degrees, a, startFrame, endFrame, tf, outDir, outFile, &g_percent)
-                        : stitchImageFile(source, mm, degrees, a, outDir, outFile);
+                string src = source, of = outFile; bool vid = video;
+                std::thread([mm, a, src, vid, degrees, startFrame, endFrame, tf, outDir, of]() mutable {
+                    string res = vid
+                        ? stitchVideoFile(src, mm, degrees, a, startFrame, endFrame, tf, outDir, of, &g_percent)
+                        : stitchImageFile(src, mm, degrees, a, outDir, of);
                     { lock_guard<mutex> lk(g_mu); g_result = res; }
                     g_percent = 100; g_done = true; g_busy = false;
                     cout << "[stitch] done -> " << res << "\n";
@@ -787,29 +906,33 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
         else if (path == "/frame")
         {
             ctype = "application/json";
-            int n = 0; string ns = qparam(query, "n");
-            if (!ns.empty()) n = stoi(ns);
-            if (n < 0) n = 0;
-            Mat frame;
-            // sequential positioning (seeking is unreliable). Grab forward from the
-            // current position; only re-open when scrubbing backward.
-            if (!frameCap.isOpened() || n < frameCapPos)
-            { frameCap.release(); frameCap.open(source); frameCapPos = -1; }
-            while (frameCapPos < n) { if (!frameCap.grab()) break; frameCapPos++; }
-            if (frameCapPos == n) frameCap.retrieve(frame);
-            if (frame.empty()) { body = "{\"error\":\"cannot read frame\"}"; }
+            if (!loaded) { body = "{\"error\":\"no source loaded\"}"; }
             else
             {
-                UMat uF, wL, wR; frame.copyTo(uF);
-                warpHalves(uF, m, wL, wR);
-                Mat mL, mR; wL.copyTo(mL); wR.copyTo(mR);
-                vector<uchar> bL, bR; vector<int> q = {IMWRITE_JPEG_QUALITY, 85};
-                imencode(".jpg", mL, bL, q);
-                imencode(".jpg", mR, bR, q);
-                ostringstream j;
-                j << "{\"left\":\"data:image/jpeg;base64," << base64(bL)
-                  << "\",\"right\":\"data:image/jpeg;base64," << base64(bR) << "\"}";
-                body = j.str();
+                int n = 0; string ns = qparam(query, "n");
+                if (!ns.empty()) n = stoi(ns);
+                if (n < 0) n = 0;
+                Mat frame;
+                // sequential positioning (seeking is unreliable). Grab forward from the
+                // current position; only re-open when scrubbing backward.
+                if (!frameCap.isOpened() || n < frameCapPos)
+                { frameCap.release(); frameCap.open(source); frameCapPos = -1; }
+                while (frameCapPos < n) { if (!frameCap.grab()) break; frameCapPos++; }
+                if (frameCapPos == n) frameCap.retrieve(frame);
+                if (frame.empty()) { body = "{\"error\":\"cannot read frame\"}"; }
+                else
+                {
+                    UMat uF, wL, wR; frame.copyTo(uF);
+                    warpHalves(uF, m, wL, wR);
+                    Mat mL, mR; wL.copyTo(mL); wR.copyTo(mR);
+                    vector<uchar> bL, bR; vector<int> q = {IMWRITE_JPEG_QUALITY, 85};
+                    imencode(".jpg", mL, bL, q);
+                    imencode(".jpg", mR, bR, q);
+                    ostringstream j;
+                    j << "{\"left\":\"data:image/jpeg;base64," << base64(bL)
+                      << "\",\"right\":\"data:image/jpeg;base64," << base64(bR) << "\"}";
+                    body = j.str();
+                }
             }
         }
         else if (path == "/progress")
@@ -820,7 +943,7 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
             j << "{\"busy\":" << (g_busy ? "true" : "false")
               << ",\"done\":" << (g_done ? "true" : "false")
               << ",\"percent\":" << g_percent.load()
-              << ",\"result\":\"" << res << "\"}";
+              << ",\"result\":\"" << jsonEscape(res) << "\"}";
             body = j.str();
         }
         else if (path == "/quit")
@@ -910,29 +1033,8 @@ int main(int argc, char **argv)
     a.smartSeam = !hasArg(argc, argv, "--no-smart-seam");  // on by default
     int port = stoi(argVal(argc, argv, "--port", "8090"));
     bool tune = hasArg(argc, argv, "--tune");
-    // No --source: open native file pickers and launch the tuner (the one-click flow).
-    if (source.empty())
-    {
-        source = pickInputFile();
-        if (source.empty())
-        {
-            cerr << "Usage: StitchPipeline --source <image-or-video> [--calib-dir ..] [--out ..] [--out-file <path>]\n"
-                 << "        [--start N] [--end N] [--degrees D] [--tune] [--port N]\n"
-                 << "        [--shift-top N] [--shift-bottom N] [--shift-y N]  (--shift-x N sets top=bottom)\n"
-                 << "        [--bands N (default 6, 0=hard seam)] [--no-exposure] [--no-smart-seam] [--seam X]\n"
-                 << "  (run with no --source to pick files via native dialogs)\n";
-            return 1;
-        }
-        if (outFile.empty())
-        {
-            string def = isVideoFile(source) ? "stitched.mp4" : "stitched.jpg";
-            outFile = pickSaveFile(def);
-            if (outFile.empty()) { cerr << "No output selected — cancelled.\n"; return 0; }
-        }
-        tune = true;   // interactive pick always opens the tuner
-        cout << "Input:  " << source << "\nOutput: " << outFile << "\n";
-    }
-    // If an explicit output file was given, make sure its parent directory exists.
+
+    // Ensure the output destination exists (batch, or a preset --out-file).
     if (!outFile.empty()) { fs::path p(outFile); if (p.has_parent_path()) fs::create_directories(p.parent_path()); }
     else fs::create_directories(outDir);
 
@@ -945,8 +1047,17 @@ int main(int argc, char **argv)
     loadIntrinsics(calibDir + "/right_intrinsics.json", KR, DR);
     R = loadRotation(calibDir + "/stereo_extrinsics.json");
 
-    bool video = isVideoFile(source);
+    // Interactive tuner — the default when no --source is given, and whenever
+    // --tune is passed. The browser's Import button loads the source on demand,
+    // so `source` may be empty here (empty page until the user imports).
+    if (source.empty() || tune)
+    {
+        runTuneServer(KL, DL, KR, DR, R, degrees, startFrame, endFrame, outDir, source, outFile, port);
+        return 0;
+    }
 
+    // Headless batch stitch of a source given on the command line.
+    bool video = isVideoFile(source);
     Mat frame;
     int totalFrames = 1;
     if (!video) frame = imread(source);
@@ -971,16 +1082,6 @@ int main(int argc, char **argv)
     if (frame.empty()) { cerr << "Cannot read source: " << source << endl; return 1; }
 
     StitchMaps m = buildStitchMaps(KL, DL, KR, DR, R, frame.cols / 2, frame.rows, seamArg);
-
-    if (tune)
-    {
-        UMat uFrame, warpL, warpR;
-        frame.copyTo(uFrame);
-        warpHalves(uFrame, m, warpL, warpR);
-        runTuneServer(source, video, m, warpL, warpR, degrees, startFrame, endFrame, outDir,
-                      outFile, totalFrames, port);
-        return 0;
-    }
 
     string result = video ? stitchVideoFile(source, m, degrees, a, startFrame, endFrame, totalFrames, outDir, outFile)
                           : stitchImageFile(source, m, degrees, a, outDir, outFile);

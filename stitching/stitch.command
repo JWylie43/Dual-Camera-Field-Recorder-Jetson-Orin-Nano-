@@ -2,10 +2,12 @@
 #
 # stitch.command — double-click convenience launcher for the panorama tuner.
 #
-# The StitchPipeline binary is self-contained: run with no --source it opens
-# native file dialogs (input + output) and launches the browser tuner itself.
-# This script just builds it on first run and then runs it, so you can launch
-# the whole flow by double-clicking in Finder.
+# Run with no arguments, StitchPipeline opens the browser tuner immediately.
+# Inside the page: click "Import source…" (a native file dialog opens) to load a
+# video/image, align the far/near edges, then click "Stitch all frames" — which
+# pops a native "save as" dialog to choose the output path + filename.
+# This script just builds the binary on first run and then runs it, so you can
+# launch the whole flow by double-clicking in Finder.
 #
 # On Windows, double-click build\StitchPipeline.exe directly (it does the same).
 set -e
