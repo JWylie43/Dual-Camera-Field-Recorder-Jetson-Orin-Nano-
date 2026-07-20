@@ -710,10 +710,13 @@ static string runCapture(const string &cmd)
 static string pickInputFile()
 {
 #ifdef _WIN32
+    // A TopMost owner form forces the dialog to the foreground (otherwise it
+    // opens behind the browser and you have to Alt+Tab to find it).
     return runCapture("powershell -NoProfile -Command \"Add-Type -AssemblyName System.Windows.Forms;"
+                      "$o=New-Object System.Windows.Forms.Form -Property @{TopMost=$true};"
                       "$d=New-Object System.Windows.Forms.OpenFileDialog;"
                       "$d.Title='Select the input video or image';"
-                      "if($d.ShowDialog() -eq 'OK'){$d.FileName}\" 2>NUL");
+                      "if($d.ShowDialog($o) -eq 'OK'){$d.FileName}\" 2>NUL");
 #elif __APPLE__
     return runCapture("osascript -e 'POSIX path of (choose file with prompt "
                       "\"Select the input video or image\")' 2>/dev/null");
@@ -727,9 +730,10 @@ static string pickSaveFile(const string &defName)
 {
 #ifdef _WIN32
     return runCapture("powershell -NoProfile -Command \"Add-Type -AssemblyName System.Windows.Forms;"
+                      "$o=New-Object System.Windows.Forms.Form -Property @{TopMost=$true};"
                       "$d=New-Object System.Windows.Forms.SaveFileDialog;"
                       "$d.Title='Save the stitched output as'; $d.FileName='" + defName + "';"
-                      "if($d.ShowDialog() -eq 'OK'){$d.FileName}\" 2>NUL");
+                      "if($d.ShowDialog($o) -eq 'OK'){$d.FileName}\" 2>NUL");
 #elif __APPLE__
     return runCapture("osascript -e 'POSIX path of (choose file name with prompt "
                       "\"Save the stitched output as\" default name \"" + defName + "\")' 2>/dev/null");
