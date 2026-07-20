@@ -430,12 +430,12 @@ function drawRightFeather(fwv){            // cross-fade the right image across 
   octx.setTransform(1,0,0,1,0,0); octx.globalCompositeOperation='source-over'; octx.clearRect(0,0,OW,OH);
   octx.setTransform(1,0,k,1,sTop,sY); octx.drawImage(imgR,0,0);
   octx.setTransform(1,0,0,1,0,0);
+  // single full-width alpha mask: gradient clamps to 0 left of x0 and 1 right of x1,
+  // so one fillRect gives (drop-left | ramp-band | keep-right) in one destination-in pass.
   octx.globalCompositeOperation='destination-in';
-  octx.fillStyle='rgba(0,0,0,0)'; octx.fillRect(0,0,x0,OH);            // left: drop right
   const g=octx.createLinearGradient(x0,0,x1,0);
   g.addColorStop(0,'rgba(0,0,0,0)'); g.addColorStop(1,'rgba(0,0,0,1)');
-  octx.fillStyle=g; octx.fillRect(x0,0,Math.max(1,x1-x0),OH);          // band: ramp
-  octx.fillStyle='rgba(0,0,0,1)'; octx.fillRect(x1,0,OW-x1,OH);        // right: keep
+  octx.fillStyle=g; octx.fillRect(0,0,OW,OH);
   octx.globalCompositeOperation='source-over';
   ctx.drawImage(off,0,0);
 }
