@@ -76,6 +76,7 @@ struct StitchMaps
     UMat mapLx, mapLy, mapRx, mapRy;
     int OW = 0, OH = 0;
     int seam = 0;
+    int ox0 = 0, ox1 = 0;   // overlap column range [ox0, ox1) where both cameras are valid
 };
 
 // Right-image alignment (per-row horizontal shear + vertical shift) + seam blend.
@@ -206,6 +207,8 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
     }
     m.seam = seamArg >= 0 ? seamArg
              : (overlapCols.empty() ? m.OW / 2 : overlapCols[overlapCols.size() / 2]);
+    m.ox0 = overlapCols.empty() ? 0 : overlapCols.front();
+    m.ox1 = overlapCols.empty() ? m.OW : overlapCols.back() + 1;
 
     mapLx.copyTo(m.mapLx); mapLy.copyTo(m.mapLy);
     mapRx.copyTo(m.mapRx); mapRy.copyTo(m.mapRy);
@@ -236,20 +239,35 @@ static UMat straightMask(int seam, int OW, int OH)
     UMat u; m.copyTo(u); return u;
 }
 
-// Dynamic seam: find a min-difference vertical path through the overlap so the cut
-// weaves AROUND moving objects (players) instead of slicing through them.
-static UMat computeSeamMask(const UMat &warpL, const UMat &right, int seam, int OW, int OH)
+// Dynamic seam: min-cost vertical path through the KNOWN overlap [ox0,ox1) so the cut
+// weaves AROUND moving objects. Cost = image difference + a center bias (stay near the
+// overlap centre) + a temporal term (stick to the previous frame's seam) so wind/noise
+// doesn't make the seam jitter frame-to-frame - it only moves when a player forces it.
+static UMat computeSeamMask(const UMat &warpL, const UMat &right, int ox0, int ox1,
+                            int OW, int OH, vector<int> &prevSeam)
 {
-    int W = min(300, OW / 6);
-    int x0 = max(0, seam - W), x1 = min(OW, seam + W), bw = x1 - x0;
-    if (bw < 4) return straightMask(seam, OW, OH);
-    Mat Lf, Rf; warpL.copyTo(Lf); right.copyTo(Rf);
-    Mat gL, gR;
-    cvtColor(Lf(Rect(x0, 0, bw, OH)), gL, COLOR_BGR2GRAY);
-    cvtColor(Rf(Rect(x0, 0, bw, OH)), gR, COLOR_BGR2GRAY);
+    int x0 = max(0, ox0), x1 = min(OW, ox1), bw = x1 - x0;
+    if (bw < 4) { prevSeam.assign(OH, (x0 + x1) / 2); return straightMask((x0 + x1) / 2, OW, OH); }
+    const double center = (x0 + x1) / 2.0;
+    const float CB = 0.08f;   // center bias
+    const float TW = 0.8f;    // temporal stickiness
+    bool temporal = ((int)prevSeam.size() == OH);
+
+    UMat lband = warpL(Rect(x0, 0, bw, OH)), rband = right(Rect(x0, 0, bw, OH));
+    Mat L, R; lband.copyTo(L); rband.copyTo(R);       // download only the overlap band
+    Mat gL, gR; cvtColor(L, gL, COLOR_BGR2GRAY); cvtColor(R, gR, COLOR_BGR2GRAY);
     Mat cost; absdiff(gL, gR, cost); cost.convertTo(cost, CV_32F);
-    Mat bad = (gL < 5) | (gR < 5);
-    cost.setTo(1e6f, bad);                             // keep the seam inside the valid overlap
+    Mat bad = (gL < 5) | (gR < 5); cost.setTo(1e6f, bad);   // keep seam inside valid overlap
+    for (int y = 0; y < OH; y++)
+    {
+        float *cp = cost.ptr<float>(y);
+        for (int x = 0; x < bw; x++)
+        {
+            float gx = (float)(x0 + x);
+            cp[x] += CB * fabsf(gx - (float)center);
+            if (temporal) cp[x] += TW * fabsf(gx - (float)prevSeam[y]);
+        }
+    }
     Mat M = cost.clone(), back(OH, bw, CV_32S);
     for (int y = 1; y < OH; y++)
     {
@@ -266,10 +284,12 @@ static UMat computeSeamMask(const UMat &warpL, const UMat &right, int seam, int 
     }
     int cur = 0;
     { const float *last = M.ptr<float>(OH - 1); for (int x = 1; x < bw; x++) if (last[x] < last[cur]) cur = x; }
+    prevSeam.assign(OH, 0);
     Mat mask = Mat::zeros(OH, OW, CV_32F);
     for (int y = OH - 1; y >= 0; y--)
     {
         int px = x0 + cur;
+        prevSeam[y] = px;
         if (px > 0) mask(Rect(0, y, px, 1)).setTo(1.0f);
         if (y > 0) cur = back.ptr<int>(y)[cur];
     }
@@ -340,7 +360,7 @@ static void exposureMatch(const UMat &warpL, UMat &right, int seam, int OW, int 
 }
 
 static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
-                      double degrees, const Align &a)
+                      double degrees, const Align &a, vector<int> *prevSeam = nullptr)
 {
     UMat right = warpR;
     if (a.shiftTop != 0.0 || a.shiftBottom != 0.0 || a.shiftY != 0.0)
@@ -351,8 +371,15 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
         warpAffine(warpR, right, T, Size(m.OW, m.OH));
     }
     if (a.exposure) exposureMatch(warpL, right, m.seam, m.OW, m.OH);
-    UMat mask = a.smartSeam ? computeSeamMask(warpL, right, m.seam, m.OW, m.OH)
-                            : straightMask(m.seam, m.OW, m.OH);
+    UMat mask;
+    if (a.smartSeam)
+    {
+        vector<int> local;
+        vector<int> &ps = prevSeam ? *prevSeam : local;   // temporal only within a video loop
+        mask = computeSeamMask(warpL, right, m.ox0, m.ox1, m.OW, m.OH, ps);
+    }
+    else
+        mask = straightMask(m.seam, m.OW, m.OH);
     UMat pano;
     if (a.bands > 0)
     {
@@ -417,13 +444,14 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
     seekFrame(cap, s);
     Mat frame, pano;
     UMat uFrame, wL, wR;
+    vector<int> prevSeam;   // carried across frames for a temporally stable smart seam
     int written = 0;
     for (int i = s; i <= e; i++)
     {
         if (!cap.read(frame) || frame.empty()) break;   // also stops at EOF
         frame.copyTo(uFrame);
         warpHalves(uFrame, m, wL, wR);
-        composite(wL, wR, m, degrees, a).copyTo(pano);
+        composite(wL, wR, m, degrees, a, &prevSeam).copyTo(pano);
         writer.write(pano);
         ++written;
         if (bounded)

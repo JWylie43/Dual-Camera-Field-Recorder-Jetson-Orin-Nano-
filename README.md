@@ -209,14 +209,14 @@ reused for every frame.
 | `--out DIR` | `pipeline_out` | Output folder |
 | `--start N` / `--end N` | `0` / `-1` | Video frame range (`-1` = end) |
 | `--degrees D` | `0` | Horizon roll correction |
-| `--seam X` | auto | Hard-seam column (default: overlap centre) |
+| `--seam X` | auto | Straight-seam column (default: overlap centre). Ignored when `--smart-seam` is on |
 | `--shift-top N` | `0` | Horizontal shift of the right image's **top** rows (aligns the **far** edge) |
 | `--shift-bottom N` | `0` | Horizontal shift of the **bottom** rows (aligns the **near** edge) |
 | `--shift-y N` | `0` | Vertical shift of the right image |
 | `--shift-x N` | `0` | Convenience: sets both top and bottom to N (plain horizontal shift) |
 | `--bands N` | `6` | Multi-band (Laplacian) blend levels — smooths the seam *without* blurring detail; `0` = hard seam |
 | `--exposure` | off | Match the right image's brightness/color to the left (per-channel gain measured in the overlap) — for when one camera faces brighter light |
-| `--smart-seam` | off | Route the seam through the min-difference path so it weaves *around* moving objects — reduces player ghosting/duplication at the seam |
+| `--smart-seam` | off | Route the seam through the min-difference path so it weaves *around* moving objects — reduces player ghosting/duplication at the seam. Auto-searches the known overlap region (no `--seam` needed), biased toward the overlap centre, and is temporally stabilised so it stays put frame-to-frame (won't jitter with tripod sway) unless a moving object makes a detour clearly cheaper |
 | `--tune` | off | Launch the interactive browser tuner (see below) |
 | `--port N` | `8090` | Port for the `--tune` web server |
 
