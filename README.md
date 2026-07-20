@@ -250,9 +250,14 @@ The dialogs are the OS's own: macOS uses `osascript` (Finder), Windows a
 PowerShell `OpenFileDialog`/`SaveFileDialog`, Linux `zenity`. No wrapper script or
 extra dependency — it's all in the one executable per platform.
 
-On macOS you can also **double-click `stitching/stitch.command`** in Finder — it
-builds the binary on first run and launches it. On Windows, double-click
-`build\StitchPipeline.exe`.
+**Double-click launchers** (build-on-first-run, then launch):
+- **macOS:** `stitching/stitch.command` (Finder)
+- **Windows:** `stitching/stitch.bat`
+
+The program finds the `calibration/` folder **relative to its own executable**
+(searching upward), so it works no matter what directory it's launched from —
+double-clicking the built `StitchPipeline` / `StitchPipeline.exe` directly works
+too. Use `--calib-dir <path>` to point elsewhere.
 
 ### Direct CLI
 

@@ -49,6 +49,7 @@
 #ifdef _WIN32
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #include <windows.h>          // GetModuleFileNameA (locate our own exe)
   using socket_t = SOCKET;
   #define CLOSESOCK closesocket
 #else
@@ -59,6 +60,10 @@
   using socket_t = int;
   #define CLOSESOCK close
   #define INVALID_SOCKET (-1)
+#endif
+
+#ifdef __APPLE__
+  #include <mach-o/dyld.h>      // _NSGetExecutablePath (locate our own exe)
 #endif
 
 #ifdef _WIN32
@@ -1013,10 +1018,59 @@ static int probeFrames(const string &source, double fps)
     try { return (int)llround(stod(dur) * fps); } catch (...) { return 0; }
 }
 
+// Full path to the running executable (used to locate calibration/ regardless
+// of the current working directory, so double-clicking the binary works).
+static string exePath()
+{
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, buf, MAX_PATH);
+    return n > 0 ? string(buf, n) : string();
+#elif __APPLE__
+    char buf[4096]; uint32_t size = sizeof(buf);
+    return _NSGetExecutablePath(buf, &size) == 0 ? string(buf) : string();
+#else
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) { buf[n] = '\0'; return string(buf); }
+    return string();
+#endif
+}
+
+static bool hasCalib(const fs::path &dir)
+{
+    std::error_code ec;
+    return fs::exists(dir / "left_intrinsics.json", ec);
+}
+
+// Resolve the calibration directory. Priority:
+//   1. the requested path if it already has the JSONs (explicit --calib-dir,
+//      or the default when run from the stitching/ folder);
+//   2. a calibration/ folder found by walking UP from the executable's location
+//      (depth-independent: handles Mac's build/ and Windows' build/Release/);
+//   3. the same upward search from the current working directory;
+//   4. the requested path unchanged (caller then reports the missing files).
+static string resolveCalibDir(const string &requested)
+{
+    if (hasCalib(requested)) return requested;
+    std::error_code ec;
+    for (fs::path d = fs::path(exePath()).parent_path(); !d.empty(); d = d.parent_path())
+    {
+        if (hasCalib(d / "calibration")) return (d / "calibration").string();
+        if (d == d.root_path()) break;
+    }
+    for (fs::path d = fs::current_path(ec); !d.empty(); d = d.parent_path())
+    {
+        if (hasCalib(d / "calibration")) return (d / "calibration").string();
+        if (d == d.root_path()) break;
+    }
+    return requested;
+}
+
 int main(int argc, char **argv)
 {
     string source = argVal(argc, argv, "--source", argVal(argc, argv, "--image", ""));
-    string calibDir = argVal(argc, argv, "--calib-dir", "../calibration");
+    string calibDir = resolveCalibDir(argVal(argc, argv, "--calib-dir", "../calibration"));
     string outDir = argVal(argc, argv, "--out", "pipeline_out");
     string outFile = argVal(argc, argv, "--out-file", "");   // full path incl. filename (overrides --out)
     double degrees = stod(argVal(argc, argv, "--degrees", "0"));
@@ -1041,6 +1095,7 @@ int main(int argc, char **argv)
     ocl::setUseOpenCL(true);
     cout << "OpenCL available: " << ocl::haveOpenCL() << ", using GPU: " << ocl::useOpenCL() << "\n";
 
+    cout << "Calibration: " << calibDir << "\n";
     Mat KL, KR, R;
     vector<double> DL, DR;
     loadIntrinsics(calibDir + "/left_intrinsics.json", KL, DL);
