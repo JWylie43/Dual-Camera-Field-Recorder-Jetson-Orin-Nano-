@@ -412,7 +412,7 @@ static bool seekFrame(VideoCapture &cap, int n)
 }
 
 static string stitchImageFile(const string &source, StitchMaps &m, double degrees,
-                              const Align &a, const string &outDir)
+                              const Align &a, const string &outDir, const string &outFile = "")
 {
     Mat img = imread(source);
     if (img.empty()) return "ERROR: cannot read image";
@@ -421,14 +421,15 @@ static string stitchImageFile(const string &source, StitchMaps &m, double degree
     warpHalves(uImg, m, wL, wR);
     UMat uPano = composite(wL, wR, m, degrees, a);
     Mat pano; uPano.copyTo(pano);
-    string out = outDir + "/pano.jpg";
+    string out = !outFile.empty() ? outFile : (outDir + "/pano.jpg");
     imwrite(out, pano);
     return out;
 }
 
 static string stitchVideoFile(const string &source, StitchMaps &m, double degrees,
                               const Align &a, int startFrame, int endFrame, int totalFrames,
-                              const string &outDir, std::atomic<int> *prog = nullptr)
+                              const string &outDir, const string &outFile = "",
+                              std::atomic<int> *prog = nullptr)
 {
     VideoCapture cap(source);
     if (!cap.isOpened()) return "ERROR: cannot open video";
@@ -438,7 +439,7 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
     int s = startFrame < 0 ? 0 : startFrame;
     int e = endFrame >= 0 ? endFrame : (totalFrames > 0 ? totalFrames - 1 : BIG);
     bool bounded = (e < BIG);
-    string out = outDir + "/stitched_video.mp4";
+    string out = !outFile.empty() ? outFile : (outDir + "/stitched_video.mp4");
     VideoWriter writer(out, VideoWriter::fourcc('m', 'p', '4', 'v'), fps, Size(m.OW, m.OH));
     if (!writer.isOpened()) return "ERROR: cannot open output video";
     seekFrame(cap, s);
@@ -651,7 +652,7 @@ static void openBrowser(const string &url)
 static void runTuneServer(const string &source, bool video, StitchMaps &m,
                           const UMat &warpL, const UMat &warpR, double degrees,
                           int startFrame, int endFrame, const string &outDir,
-                          int totalFrames, int port)
+                          const string &outFile, int totalFrames, int port)
 {
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -726,10 +727,10 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
                 cout << "[stitch] top=" << a.shiftTop << " bottom=" << a.shiftBottom
                      << " y=" << a.shiftY << " seam=" << mm.seam << " ...\n";
                 int tf = totalFrames;
-                std::thread([mm, a, source, video, degrees, startFrame, endFrame, tf, outDir]() mutable {
+                std::thread([mm, a, source, video, degrees, startFrame, endFrame, tf, outDir, outFile]() mutable {
                     string res = video
-                        ? stitchVideoFile(source, mm, degrees, a, startFrame, endFrame, tf, outDir, &g_percent)
-                        : stitchImageFile(source, mm, degrees, a, outDir);
+                        ? stitchVideoFile(source, mm, degrees, a, startFrame, endFrame, tf, outDir, outFile, &g_percent)
+                        : stitchImageFile(source, mm, degrees, a, outDir, outFile);
                     { lock_guard<mutex> lk(g_mu); g_result = res; }
                     g_percent = 100; g_done = true; g_busy = false;
                     cout << "[stitch] done -> " << res << "\n";
@@ -848,6 +849,7 @@ int main(int argc, char **argv)
     string source = argVal(argc, argv, "--source", argVal(argc, argv, "--image", ""));
     string calibDir = argVal(argc, argv, "--calib-dir", "../calibration");
     string outDir = argVal(argc, argv, "--out", "pipeline_out");
+    string outFile = argVal(argc, argv, "--out-file", "");   // full path incl. filename (overrides --out)
     double degrees = stod(argVal(argc, argv, "--degrees", "0"));
     int seamArg = stoi(argVal(argc, argv, "--seam", "-1"));
     int startFrame = stoi(argVal(argc, argv, "--start", "0"));
@@ -864,13 +866,15 @@ int main(int argc, char **argv)
     bool tune = hasArg(argc, argv, "--tune");
     if (source.empty())
     {
-        cerr << "Usage: StitchPipeline --source <image-or-video> [--calib-dir ..] [--out ..]\n"
+        cerr << "Usage: StitchPipeline --source <image-or-video> [--calib-dir ..] [--out ..] [--out-file <path>]\n"
              << "        [--start N] [--end N] [--degrees D] [--tune] [--port N]\n"
              << "        [--shift-top N] [--shift-bottom N] [--shift-y N]  (--shift-x N sets top=bottom)\n"
              << "        [--bands N (default 6, 0=hard seam)] [--no-exposure] [--no-smart-seam] [--seam X]\n";
         return 1;
     }
-    fs::create_directories(outDir);
+    // If an explicit output file was given, make sure its parent directory exists.
+    if (!outFile.empty()) { fs::path p(outFile); if (p.has_parent_path()) fs::create_directories(p.parent_path()); }
+    else fs::create_directories(outDir);
 
     ocl::setUseOpenCL(true);
     cout << "OpenCL available: " << ocl::haveOpenCL() << ", using GPU: " << ocl::useOpenCL() << "\n";
@@ -914,12 +918,12 @@ int main(int argc, char **argv)
         frame.copyTo(uFrame);
         warpHalves(uFrame, m, warpL, warpR);
         runTuneServer(source, video, m, warpL, warpR, degrees, startFrame, endFrame, outDir,
-                      totalFrames, port);
+                      outFile, totalFrames, port);
         return 0;
     }
 
-    string result = video ? stitchVideoFile(source, m, degrees, a, startFrame, endFrame, totalFrames, outDir)
-                          : stitchImageFile(source, m, degrees, a, outDir);
+    string result = video ? stitchVideoFile(source, m, degrees, a, startFrame, endFrame, totalFrames, outDir, outFile)
+                          : stitchImageFile(source, m, degrees, a, outDir, outFile);
     cout << (video ? "video -> " : "image -> ") << result << "\n";
     return 0;
 }

@@ -190,6 +190,23 @@ cmake -S . -B build && cmake --build build
 
 ## Run
 
+### One-click launcher (recommended)
+
+Double-click **`stitching/stitch.command`** (macOS Finder), or run it from a terminal:
+
+```bash
+cd stitching && ./stitch.command
+```
+
+It builds the binary on first run, then pops a native dialog to **pick the input**
+file (video or image, anywhere on disk), a second dialog to **pick the output**
+destination + filename, and opens the tuner already loaded with that file. Align
+the far/near edges, then click **Stitch all frames** to render to your chosen output.
+(Linux uses `zenity` for the dialogs; on Windows, call the binary directly with
+`--source`/`--out-file`/`--tune`.)
+
+### Direct CLI
+
 ```bash
 # single image → pipeline_out/pano.jpg (+ overlap_5050.jpg)
 ./build/StitchPipeline --source ../calibration/images/calib_114.jpg
@@ -206,7 +223,8 @@ reused for every frame.
 |---|---|---|
 | `--source PATH` | (required) | Combined LEFT\|RIGHT image or video (alias `--image`) |
 | `--calib-dir DIR` | `../calibration` | Folder with the intrinsics/extrinsics JSON |
-| `--out DIR` | `pipeline_out` | Output folder |
+| `--out DIR` | `pipeline_out` | Output folder (file named `stitched_video.mp4` / `pano.jpg`) |
+| `--out-file PATH` | — | Full output path incl. filename; overrides `--out`. Parent dirs are created. Used by the launcher's output picker |
 | `--start N` / `--end N` | `0` / `-1` | Video frame range (`-1` = end) |
 | `--degrees D` | `0` | Horizon roll correction |
 | `--seam X` | auto | Straight-seam column (default: overlap centre). Only used when smart seam is off (`--no-smart-seam` + `--bands 0`) |
