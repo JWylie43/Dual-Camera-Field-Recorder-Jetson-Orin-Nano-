@@ -82,6 +82,11 @@ struct StitchMaps
     int OW = 0, OH = 0;
     int seam = 0;
     int ox0 = 0, ox1 = 0;   // overlap column range [ox0, ox1) where both cameras are valid
+    // Crop support: when a crop is applied the maps/OW/OH/seam/overlap are the cropped
+    // region, but the per-row shear is defined over the FULL height, so we keep the
+    // original height and the crop's top offset to reproduce it exactly.
+    int fullOH = 0;         // original (uncropped) canvas height; 0 = same as OH
+    int cropX = 0, cropY = 0;
 };
 
 // Right-image alignment (per-row horizontal shear + vertical shift) + seam blend.
@@ -217,11 +222,37 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
 
     mapLx.copyTo(m.mapLx); mapLy.copyTo(m.mapLy);
     mapRx.copyTo(m.mapRx); mapRy.copyTo(m.mapRy);
+    m.fullOH = m.OH;   // reference height for the shear (unchanged by cropping)
 
     cout << "panorama " << m.OW << "x" << m.OH
          << ", right yaw " << yawR * 180.0 / CV_PI << " deg, hard seam @ " << m.seam
          << (overlapCols.empty() ? "  [!! no overlap]" : "") << "\n";
     return m;
+}
+
+// Return a cropped view of the maps: ROI the remap tables and shift the seam/overlap
+// into crop-local coordinates. Everything downstream (warp, exposure, seam, blend,
+// output) then runs in the smaller cropped space, so rendering scales with the crop
+// area. The full height + crop origin are kept so the per-row shear is reproduced
+// exactly (see composite()). Crop rect is in full-canvas coordinates.
+static StitchMaps cropMaps(const StitchMaps &m, int cx, int cy, int cw, int ch)
+{
+    cx = max(0, min(cx, m.OW - 1));
+    cy = max(0, min(cy, m.OH - 1));
+    cw = max(1, min(cw, m.OW - cx));
+    ch = max(1, min(ch, m.OH - cy));
+    Rect r(cx, cy, cw, ch);
+    StitchMaps c = m;
+    c.mapLx = m.mapLx(r).clone(); c.mapLy = m.mapLy(r).clone();
+    c.mapRx = m.mapRx(r).clone(); c.mapRy = m.mapRy(r).clone();
+    c.OW = cw; c.OH = ch;
+    c.seam = max(0, min(m.seam - cx, cw));
+    c.ox0  = max(0, min(m.ox0 - cx, cw));
+    c.ox1  = max(0, min(m.ox1 - cx, cw));
+    c.fullOH = (m.fullOH > 0 ? m.fullOH : m.OH);
+    c.cropX = m.cropX + cx;
+    c.cropY = m.cropY + cy;
+    return c;
 }
 
 static void warpHalves(const UMat &frame, const StitchMaps &m, UMat &warpL, UMat &warpR)
@@ -370,9 +401,14 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
     UMat right = warpR;
     if (a.shiftTop != 0.0 || a.shiftBottom != 0.0 || a.shiftY != 0.0)
     {
-        // per-row horizontal shear (top->bottom) + vertical shift, as one affine.
-        double k = (m.OH > 1) ? (a.shiftBottom - a.shiftTop) / (m.OH - 1) : 0.0;
-        Mat T = (Mat_<double>(2, 3) << 1, k, a.shiftTop, 0, 1, a.shiftY);
+        // Per-row horizontal shear (top->bottom) + vertical shift, as one affine.
+        // The shear slope is defined over the FULL canvas height, and when cropped the
+        // top of the output is row `cropY` of the full frame - so the shift at the crop's
+        // top row is shiftTop + k*cropY. This keeps the shear identical whether cropped.
+        int foh = m.fullOH > 0 ? m.fullOH : m.OH;
+        double k = (foh > 1) ? (a.shiftBottom - a.shiftTop) / (foh - 1) : 0.0;
+        double shiftTopEff = a.shiftTop + k * m.cropY;
+        Mat T = (Mat_<double>(2, 3) << 1, k, shiftTopEff, 0, 1, a.shiftY);
         warpAffine(warpR, right, T, Size(m.OW, m.OH));
     }
     if (a.exposure) exposureMatch(warpL, right, m.seam, m.OW, m.OH);
@@ -538,6 +574,7 @@ static string tunerHtml()
   -->
   <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
+  <div class="grp"><label><input type="checkbox" id="crop"> crop to box</label> <span class="hint" id="cropdim"></span></div>
   <button id="stitch" disabled>Stitch all frames</button>
   <button id="quit">Quit</button>
   <span class="hint">&#8592;/&#8594; shift both</span>
@@ -559,6 +596,10 @@ const st=t=>{ document.getElementById('status').textContent=t; };
 const tv=document.getElementById('tv'), bv=document.getElementById('bv');
 const stitchBtn=document.getElementById('stitch');
 let sTop=0, sBot=0, sY=0, seam=0, pending=0;   // sY/seam fixed (controls hidden)
+const clmp=(v,lo,hi)=>{ return Math.max(lo,Math.min(hi,v)); };
+// Crop box (in OW/OH panorama coords). cropOn toggles it; drag body to move,
+// drag the top-left / bottom-right handles to resize.
+let cropOn=false, cropX=0, cropY=0, cropW=0, cropH=0, dragMode=null, dragStart=null, cropStart=null;
 const imgL=new Image(), imgR=new Image();
 function both(){ if(--pending<=0){ pending=0; render(); } }
 imgL.onload=imgR.onload=both;
@@ -578,12 +619,59 @@ function render(){
   }
   ctx.strokeStyle='#f33'; ctx.lineWidth=2;
   ctx.beginPath(); ctx.moveTo(seam,0); ctx.lineTo(seam,OH); ctx.stroke();
+  if(cropOn) drawCrop();
+}
+function drawCrop(){
+  if(cropW<=0){ cropX=Math.round(OW*0.05); cropY=Math.round(OH*0.05); cropW=Math.round(OW*0.9); cropH=Math.round(OH*0.9); }
+  cropX=clmp(cropX,0,OW-1); cropY=clmp(cropY,0,OH-1);
+  cropW=clmp(cropW,1,OW-cropX); cropH=clmp(cropH,1,OH-cropY);
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,0,0.55)';                       // dim everything outside the box
+  ctx.fillRect(0,0,OW,cropY);
+  ctx.fillRect(0,cropY+cropH,OW,OH-(cropY+cropH));
+  ctx.fillRect(0,cropY,cropX,cropH);
+  ctx.fillRect(cropX+cropW,cropY,OW-(cropX+cropW),cropH);
+  ctx.strokeStyle='#ff0'; ctx.lineWidth=2; ctx.strokeRect(cropX,cropY,cropW,cropH);
+  const hs=Math.max(10,OW*0.01); ctx.fillStyle='#ff0';
+  ctx.fillRect(cropX-hs/2,cropY-hs/2,hs,hs);              // top-left handle
+  ctx.fillRect(cropX+cropW-hs/2,cropY+cropH-hs/2,hs,hs);  // bottom-right handle
+  ctx.restore();
+  document.getElementById('cropdim').textContent=Math.round(cropW)+'x'+Math.round(cropH);
 }
 const nudge=(el,d)=>{ el.value=(+el.value||0)+d; render(); };
 tl.onclick=()=>{ nudge(tv,-stepv()); }; tr.onclick=()=>{ nudge(tv,stepv()); };
 bl.onclick=()=>{ nudge(bv,-stepv()); }; br.onclick=()=>{ nudge(bv,stepv()); };
 [tv,bv].forEach(el=>{ el.oninput=render; });
 document.getElementById('blend').onchange=render;
+// Crop box: drag body to move, drag the yellow corner handles to resize.
+const toCanvas=(e)=>{ return { x: e.offsetX * OW / cv.clientWidth, y: e.offsetY * OH / cv.clientHeight }; };
+cv.onmousedown=(e)=>{
+  if(!cropOn||!loaded) return;
+  const p=toCanvas(e), hs=Math.max(14, OW*0.016);
+  const nBR=Math.abs(p.x-(cropX+cropW))<hs && Math.abs(p.y-(cropY+cropH))<hs;
+  const nTL=Math.abs(p.x-cropX)<hs && Math.abs(p.y-cropY)<hs;
+  if(nBR) dragMode='br'; else if(nTL) dragMode='tl';
+  else if(p.x>cropX && p.x<cropX+cropW && p.y>cropY && p.y<cropY+cropH) dragMode='move';
+  else dragMode=null;
+  if(dragMode){ dragStart=p; cropStart={x:cropX,y:cropY,w:cropW,h:cropH}; e.preventDefault(); }
+};
+cv.onmousemove=(e)=>{
+  if(!dragMode) return;
+  const p=toCanvas(e), dx=p.x-dragStart.x, dy=p.y-dragStart.y;
+  if(dragMode==='move'){ cropX=clmp(cropStart.x+dx,0,OW-cropW); cropY=clmp(cropStart.y+dy,0,OH-cropH); }
+  else if(dragMode==='br'){ cropW=clmp(cropStart.w+dx,20,OW-cropX); cropH=clmp(cropStart.h+dy,20,OH-cropY); }
+  else if(dragMode==='tl'){
+    const nx=clmp(cropStart.x+dx,0,cropStart.x+cropStart.w-20), ny=clmp(cropStart.y+dy,0,cropStart.y+cropStart.h-20);
+    cropW=cropStart.w+(cropStart.x-nx); cropH=cropStart.h+(cropStart.y-ny); cropX=nx; cropY=ny;
+  }
+  render();
+};
+addEventListener('mouseup',()=>{ dragMode=null; });
+document.getElementById('crop').onchange=(e)=>{
+  cropOn=e.target.checked;
+  if(!cropOn) document.getElementById('cropdim').textContent='';
+  render();
+};
 addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT') return;      // let typing in the boxes work normally
   const d=stepv();
@@ -612,6 +700,7 @@ fval.onchange=()=>{ loadFrame(fval.value); };
 // frame slider, show the first frame, and enable stitching.
 function applyLoad(d){
   loaded=true; OW=d.ow; OH=d.oh; SEAM0=d.seam; TOTAL=d.total; VIDEO=d.video; seam=SEAM0;
+  cropW=0;   // re-initialise the crop box to the new frame size on next draw
   cv.width=OW; cv.height=OH;
   document.getElementById('srcpath').value=d.source||'';
   if(d.output) document.getElementById('outpath').value=d.output;
@@ -640,7 +729,11 @@ document.getElementById('import').onclick=async()=>{
 let polling=null;
 const pb=document.getElementById('pb'), pct=document.getElementById('pct');
 // hidden controls fixed to defaults: shift-y 0, smart seam on, 6-band blend, exposure match on
-const params=()=>{ return 'shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty=0&seam='+SEAM0+'&bands=6&exposure=1&smartseam=1'; };
+const params=()=>{
+  let p='shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty=0&seam='+SEAM0+'&bands=6&exposure=1&smartseam=1';
+  if(cropOn && cropW>0) p+='&cropx='+Math.round(cropX)+'&cropy='+Math.round(cropY)+'&cropw='+Math.round(cropW)+'&croph='+Math.round(cropH);
+  return p;
+};
 stitchBtn.onclick=async()=>{
   if(polling || !loaded) return;
   // pop the native "save as" dialog to choose the output path + filename
@@ -895,6 +988,16 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                 string ss = qparam(query, "seam");
                 StitchMaps mm = m;
                 if (!ss.empty()) mm.seam = stoi(ss);
+                // Optional crop (full-canvas coords): restrict all work to this region.
+                int cw = query.find("cropw=") != string::npos ? stoi(qparam(query, "cropw")) : 0;
+                int chh = query.find("croph=") != string::npos ? stoi(qparam(query, "croph")) : 0;
+                if (cw > 0 && chh > 0)
+                {
+                    int cx = query.find("cropx=") != string::npos ? stoi(qparam(query, "cropx")) : 0;
+                    int cy = query.find("cropy=") != string::npos ? stoi(qparam(query, "cropy")) : 0;
+                    mm = cropMaps(mm, cx, cy, cw, chh);
+                    cout << "[stitch] crop " << cw << "x" << chh << " @ (" << cx << "," << cy << ")\n";
+                }
                 g_busy = true; g_done = false; g_percent = 0;
                 { lock_guard<mutex> lk(g_mu); g_result.clear(); }
                 cout << "[stitch] top=" << a.shiftTop << " bottom=" << a.shiftBottom
@@ -1141,6 +1244,18 @@ int main(int argc, char **argv)
     if (frame.empty()) { cerr << "Cannot read source: " << source << endl; return 1; }
 
     StitchMaps m = buildStitchMaps(KL, DL, KR, DR, R, frame.cols / 2, frame.rows, seamArg);
+
+    // Optional --crop "x,y,w,h" (full-canvas coords): restrict work to that region.
+    string cropArg = argVal(argc, argv, "--crop", "");
+    if (!cropArg.empty())
+    {
+        int cx = 0, cy = 0, cw = 0, ch = 0;
+        if (sscanf(cropArg.c_str(), "%d,%d,%d,%d", &cx, &cy, &cw, &ch) == 4 && cw > 0 && ch > 0)
+        {
+            m = cropMaps(m, cx, cy, cw, ch);
+            cout << "crop " << cw << "x" << ch << " @ (" << cx << "," << cy << ")\n";
+        }
+    }
 
     string result = video ? stitchVideoFile(source, m, degrees, a, startFrame, endFrame, totalFrames, outDir, outFile)
                           : stitchImageFile(source, m, degrees, a, outDir, outFile);

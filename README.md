@@ -243,7 +243,11 @@ In the page:
 1. Click **Import source…** — a native file dialog opens; pick a video or image
    (anywhere on disk). The preview loads and the frame slider wires up.
 2. Align the **far (top)** and **near (bottom)** edges.
-3. Click **Stitch all frames** — a native **Save as** dialog pops up to choose the
+3. *(Optional)* tick **crop to box** and drag the yellow box (move by its body,
+   resize from the top-left / bottom-right handles) to keep only the region you
+   want — trims the black undistortion borders and unneeded scenery. The render
+   only processes that region, so it's faster and the output is smaller.
+4. Click **Stitch all frames** — a native **Save as** dialog pops up to choose the
    output path + filename, then it renders the whole video there.
 
 The dialogs are the OS's own: macOS uses `osascript` (Finder), Windows a
@@ -279,6 +283,7 @@ reused for every frame.
 | `--calib-dir DIR` | `../calibration` | Folder with the intrinsics/extrinsics JSON |
 | `--out DIR` | `pipeline_out` | Output folder (file named `stitched_video.mp4` / `pano.jpg`) |
 | `--out-file PATH` | — | Full output path incl. filename; overrides `--out`. Parent dirs are created. Used by the launcher's output picker |
+| `--crop x,y,w,h` | — | Restrict stitching to this rectangle (in panorama pixels) — trims black borders/scenery and speeds up rendering (warp + blend + encode only process the crop). The tuner's "crop to box" sets this visually. Seam + exposure still use the full overlap, which is always inside the crop |
 | `--start N` / `--end N` | `0` / `-1` | Video frame range (`-1` = end) |
 | `--degrees D` | `0` | Horizon roll correction |
 | `--seam X` | auto | Straight-seam column (default: overlap centre). Only used when smart seam is off (`--no-smart-seam` + `--bands 0`) |
