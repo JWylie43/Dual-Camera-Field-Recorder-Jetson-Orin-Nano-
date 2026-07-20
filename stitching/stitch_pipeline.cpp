@@ -511,17 +511,18 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
 <div id="bar">
   <div class="grp">Shift far (top) <button id="tl">&#9664;</button><input class="val" id="tv" type="number" value="0"><button id="tr">&#9654;</button></div>
   <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
+  <!-- Hidden for now (smart seam, multi-band blend, and exposure match are on by default):
   <div class="grp">Shift-y <button id="yl">&#9664;</button><input class="val" id="yv" type="number" value="0"><button id="yr">&#9654;</button></div>
   <div class="grp">Seam <button id="ml">&#9664;</button><input class="val" id="mv" type="number" value="0"><button id="mr">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="mb" checked> multi-band blend</label></div>
   <div class="grp"><label><input type="checkbox" id="xc" checked> exposure/color match</label></div>
   <div class="grp"><label><input type="checkbox" id="ss" checked> seam avoidance (moving objects)</label></div>
+  -->
   <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
-  <div class="grp">step <select id="step"><option>1</option><option>2</option><option>5</option><option>10</option></select></div>
   <button id="stitch">Stitch all frames</button>
   <button id="quit">Quit</button>
-  <span class="hint">&#8592;/&#8594; shift both &nbsp; [ / ] seam</span>
+  <span class="hint">&#8592;/&#8594; shift both</span>
 </div>
 <div id="status">Ready. Align the far (top) and near (bottom) edges, then Stitch.</div>
 <div id="prog" style="padding:0 10px 10px;display:none">
@@ -533,14 +534,12 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
 <script>
 const cv=document.getElementById('c'), ctx=cv.getContext('2d');
 cv.width=OW; cv.height=OH;
-const clampSeam=v=>Math.max(0,Math.min(OW,v));
-const stepv=()=>parseInt(document.getElementById('step').value)||1;
-const st=t=>document.getElementById('status').textContent=t;
+const clampSeam=v=>{ return Math.max(0,Math.min(OW,v)); };
+const stepv=()=>{ return 1; };   // step selector removed; arrows nudge by 1
+const st=t=>{ document.getElementById('status').textContent=t; };
 // number inputs are the source of truth
-const tv=document.getElementById('tv'), bv=document.getElementById('bv'),
-      yv=document.getElementById('yv'), mv=document.getElementById('mv');
-mv.value=SEAM0;
-let sTop=0, sBot=0, sY=0, seam=SEAM0, pending=0;
+const tv=document.getElementById('tv'), bv=document.getElementById('bv');
+let sTop=0, sBot=0, sY=0, seam=SEAM0, pending=0;   // sY/seam fixed (controls hidden)
 const imgL=new Image(), imgR=new Image();
 function both(){ if(--pending<=0){ pending=0; render(); } }
 imgL.onload=imgR.onload=both;
@@ -549,7 +548,7 @@ function drawRight(){
   ctx.save(); ctx.transform(1,0,k,1,sTop,sY); ctx.drawImage(imgR,0,0); ctx.restore();
 }
 function render(){
-  sTop=+tv.value||0; sBot=+bv.value||0; sY=+yv.value||0; seam=clampSeam(+mv.value||0);
+  sTop=+tv.value||0; sBot=+bv.value||0;   // sY and seam stay fixed (controls hidden)
   ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=1; ctx.clearRect(0,0,OW,OH);
   if(document.getElementById('blend').checked){
     ctx.globalAlpha=0.5; ctx.drawImage(imgL,0,0); drawRight(); ctx.globalAlpha=1;
@@ -561,19 +560,15 @@ function render(){
   ctx.beginPath(); ctx.moveTo(seam,0); ctx.lineTo(seam,OH); ctx.stroke();
 }
 const nudge=(el,d)=>{ el.value=(+el.value||0)+d; render(); };
-tl.onclick=()=>nudge(tv,-stepv()); tr.onclick=()=>nudge(tv,stepv());
-bl.onclick=()=>nudge(bv,-stepv()); br.onclick=()=>nudge(bv,stepv());
-yl.onclick=()=>nudge(yv,-stepv()); yr.onclick=()=>nudge(yv,stepv());
-ml.onclick=()=>nudge(mv,-stepv()); mr.onclick=()=>nudge(mv,stepv());
-[tv,bv,yv,mv].forEach(el=>el.oninput=render);
+tl.onclick=()=>{ nudge(tv,-stepv()); }; tr.onclick=()=>{ nudge(tv,stepv()); };
+bl.onclick=()=>{ nudge(bv,-stepv()); }; br.onclick=()=>{ nudge(bv,stepv()); };
+[tv,bv].forEach(el=>{ el.oninput=render; });
 document.getElementById('blend').onchange=render;
 addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT') return;      // let typing in the boxes work normally
   const d=stepv();
   if(e.key==='ArrowLeft'){tv.value=(+tv.value||0)-d; bv.value=(+bv.value||0)-d; render(); e.preventDefault();}
   else if(e.key==='ArrowRight'){tv.value=(+tv.value||0)+d; bv.value=(+bv.value||0)+d; render(); e.preventDefault();}
-  else if(e.key==='['){mv.value=clampSeam((+mv.value||0)-d); render();}
-  else if(e.key===']'){mv.value=clampSeam((+mv.value||0)+d); render();}
 });
 pending=2; imgL.src=IMGL; imgR.src=IMGR;   // initial frame
 // frame scrubbing (video only)
@@ -598,7 +593,8 @@ frange.onchange=()=>loadFrame(frange.value);
 fval.onchange=()=>loadFrame(fval.value);
 let polling=null;
 const pb=document.getElementById('pb'), pct=document.getElementById('pct');
-const params=()=>'shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty='+(+yv.value||0)+'&seam='+clampSeam(+mv.value||0)+'&bands='+(document.getElementById('mb').checked?6:0)+'&exposure='+(document.getElementById('xc').checked?1:0)+'&smartseam='+(document.getElementById('ss').checked?1:0);
+// hidden controls fixed to defaults: shift-y 0, smart seam on, 6-band blend, exposure match on
+const params=()=>{ return 'shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty=0&seam='+SEAM0+'&bands=6&exposure=1&smartseam=1'; };
 document.getElementById('stitch').onclick=async()=>{
   if(polling) return;
   document.getElementById('stitch').disabled=true;
