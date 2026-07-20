@@ -638,6 +638,52 @@ static string qparam(const string &query, const string &key)
     return query.substr(s, e == string::npos ? string::npos : e - s);
 }
 
+// Run a command and capture its stdout (trimmed). Used to drive the OS's
+// native file dialogs so the binary is self-contained (no wrapper script).
+static string runCapture(const string &cmd)
+{
+    string out;
+    FILE *p = popen(cmd.c_str(), "r");
+    if (!p) return "";
+    char buf[4096]; size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), p)) > 0) out.append(buf, n);
+    pclose(p);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    return out;
+}
+
+// Native "open file" dialog. Returns the chosen path, or "" if cancelled/unavailable.
+static string pickInputFile()
+{
+#ifdef _WIN32
+    return runCapture("powershell -NoProfile -Command \"Add-Type -AssemblyName System.Windows.Forms;"
+                      "$d=New-Object System.Windows.Forms.OpenFileDialog;"
+                      "$d.Title='Select the input video or image';"
+                      "if($d.ShowDialog() -eq 'OK'){$d.FileName}\" 2>NUL");
+#elif __APPLE__
+    return runCapture("osascript -e 'POSIX path of (choose file with prompt "
+                      "\"Select the input video or image\")' 2>/dev/null");
+#else
+    return runCapture("zenity --file-selection --title=\"Select the input video or image\" 2>/dev/null");
+#endif
+}
+
+// Native "save file" dialog. Returns the chosen path, or "" if cancelled/unavailable.
+static string pickSaveFile(const string &defName)
+{
+#ifdef _WIN32
+    return runCapture("powershell -NoProfile -Command \"Add-Type -AssemblyName System.Windows.Forms;"
+                      "$d=New-Object System.Windows.Forms.SaveFileDialog;"
+                      "$d.Title='Save the stitched output as'; $d.FileName='" + defName + "';"
+                      "if($d.ShowDialog() -eq 'OK'){$d.FileName}\" 2>NUL");
+#elif __APPLE__
+    return runCapture("osascript -e 'POSIX path of (choose file name with prompt "
+                      "\"Save the stitched output as\" default name \"" + defName + "\")' 2>/dev/null");
+#else
+    return runCapture("zenity --file-selection --save --confirm-overwrite --filename=\"" + defName + "\" 2>/dev/null");
+#endif
+}
+
 static void openBrowser(const string &url)
 {
 #ifdef _WIN32
@@ -864,13 +910,27 @@ int main(int argc, char **argv)
     a.smartSeam = !hasArg(argc, argv, "--no-smart-seam");  // on by default
     int port = stoi(argVal(argc, argv, "--port", "8090"));
     bool tune = hasArg(argc, argv, "--tune");
+    // No --source: open native file pickers and launch the tuner (the one-click flow).
     if (source.empty())
     {
-        cerr << "Usage: StitchPipeline --source <image-or-video> [--calib-dir ..] [--out ..] [--out-file <path>]\n"
-             << "        [--start N] [--end N] [--degrees D] [--tune] [--port N]\n"
-             << "        [--shift-top N] [--shift-bottom N] [--shift-y N]  (--shift-x N sets top=bottom)\n"
-             << "        [--bands N (default 6, 0=hard seam)] [--no-exposure] [--no-smart-seam] [--seam X]\n";
-        return 1;
+        source = pickInputFile();
+        if (source.empty())
+        {
+            cerr << "Usage: StitchPipeline --source <image-or-video> [--calib-dir ..] [--out ..] [--out-file <path>]\n"
+                 << "        [--start N] [--end N] [--degrees D] [--tune] [--port N]\n"
+                 << "        [--shift-top N] [--shift-bottom N] [--shift-y N]  (--shift-x N sets top=bottom)\n"
+                 << "        [--bands N (default 6, 0=hard seam)] [--no-exposure] [--no-smart-seam] [--seam X]\n"
+                 << "  (run with no --source to pick files via native dialogs)\n";
+            return 1;
+        }
+        if (outFile.empty())
+        {
+            string def = isVideoFile(source) ? "stitched.mp4" : "stitched.jpg";
+            outFile = pickSaveFile(def);
+            if (outFile.empty()) { cerr << "No output selected — cancelled.\n"; return 0; }
+        }
+        tune = true;   // interactive pick always opens the tuner
+        cout << "Input:  " << source << "\nOutput: " << outFile << "\n";
     }
     // If an explicit output file was given, make sure its parent directory exists.
     if (!outFile.empty()) { fs::path p(outFile); if (p.has_parent_path()) fs::create_directories(p.parent_path()); }
