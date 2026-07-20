@@ -84,6 +84,7 @@ struct Align
     double shiftTop = 0, shiftBottom = 0, shiftY = 0;
     int bands = 0;       // multi-band (Laplacian) blend levels; 0 = hard seam
     bool exposure = false; // match right image brightness/color to left (per channel)
+    bool smartSeam = false; // route the seam around moving objects (min-difference path)
 };
 
 // Shared progress state for the --tune server (stitch runs on a worker thread).
@@ -227,18 +228,61 @@ static void warpHalves(const UMat &frame, const StitchMaps &m, UMat &warpL, UMat
 // Multi-band (Laplacian pyramid) blend of A (left) and B (right) across a sharp seam
 // mask. Low frequencies blend over a wide band (smooth tone) and high frequencies over
 // a narrow band (edges stay sharp) - no ghosting/blur, unlike a linear feather.
-static UMat multiBandBlend(const UMat &A8, const UMat &B8, int seam, int bands, int OW, int OH)
+static UMat straightMask(int seam, int OW, int OH)
+{
+    Mat m = Mat::zeros(OH, OW, CV_32F);
+    int s = max(0, min(seam, OW));
+    if (s > 0) m(Rect(0, 0, s, OH)).setTo(1.0f);       // 1 = keep left, 0 = keep right
+    UMat u; m.copyTo(u); return u;
+}
+
+// Dynamic seam: find a min-difference vertical path through the overlap so the cut
+// weaves AROUND moving objects (players) instead of slicing through them.
+static UMat computeSeamMask(const UMat &warpL, const UMat &right, int seam, int OW, int OH)
+{
+    int W = min(300, OW / 6);
+    int x0 = max(0, seam - W), x1 = min(OW, seam + W), bw = x1 - x0;
+    if (bw < 4) return straightMask(seam, OW, OH);
+    Mat Lf, Rf; warpL.copyTo(Lf); right.copyTo(Rf);
+    Mat gL, gR;
+    cvtColor(Lf(Rect(x0, 0, bw, OH)), gL, COLOR_BGR2GRAY);
+    cvtColor(Rf(Rect(x0, 0, bw, OH)), gR, COLOR_BGR2GRAY);
+    Mat cost; absdiff(gL, gR, cost); cost.convertTo(cost, CV_32F);
+    Mat bad = (gL < 5) | (gR < 5);
+    cost.setTo(1e6f, bad);                             // keep the seam inside the valid overlap
+    Mat M = cost.clone(), back(OH, bw, CV_32S);
+    for (int y = 1; y < OH; y++)
+    {
+        const float *mp = M.ptr<float>(y - 1);
+        float *mc = M.ptr<float>(y);
+        int *bk = back.ptr<int>(y);
+        for (int x = 0; x < bw; x++)
+        {
+            float best = mp[x]; int bx = x;
+            if (x > 0 && mp[x - 1] < best) { best = mp[x - 1]; bx = x - 1; }
+            if (x < bw - 1 && mp[x + 1] < best) { best = mp[x + 1]; bx = x + 1; }
+            mc[x] += best; bk[x] = bx;
+        }
+    }
+    int cur = 0;
+    { const float *last = M.ptr<float>(OH - 1); for (int x = 1; x < bw; x++) if (last[x] < last[cur]) cur = x; }
+    Mat mask = Mat::zeros(OH, OW, CV_32F);
+    for (int y = OH - 1; y >= 0; y--)
+    {
+        int px = x0 + cur;
+        if (px > 0) mask(Rect(0, y, px, 1)).setTo(1.0f);
+        if (y > 0) cur = back.ptr<int>(y)[cur];
+    }
+    UMat u; mask.copyTo(u); return u;
+}
+
+static UMat multiBandBlend(const UMat &A8, const UMat &B8, const UMat &maskF, int bands)
 {
     bands = max(2, min(bands, 8));
     UMat A, B;
     A8.convertTo(A, CV_32FC3);
     B8.convertTo(B, CV_32FC3);
-    Mat maskM = Mat::zeros(OH, OW, CV_32F);
-    int s = max(0, min(seam, OW));
-    if (s > 0) maskM(Rect(0, 0, s, OH)).setTo(1.0f);   // 1 = keep left, 0 = keep right
-    UMat mask; maskM.copyTo(mask);
-
-    vector<UMat> gA{A}, gB{B}, gM{mask};
+    vector<UMat> gA{A}, gB{B}, gM{maskF};
     for (int i = 1; i < bands; i++)
     {
         UMat da, db, dm;
@@ -307,17 +351,18 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
         warpAffine(warpR, right, T, Size(m.OW, m.OH));
     }
     if (a.exposure) exposureMatch(warpL, right, m.seam, m.OW, m.OH);
-    int seam = m.seam;
+    UMat mask = a.smartSeam ? computeSeamMask(warpL, right, m.seam, m.OW, m.OH)
+                            : straightMask(m.seam, m.OW, m.OH);
     UMat pano;
     if (a.bands > 0)
     {
-        pano = multiBandBlend(warpL, right, seam, a.bands, m.OW, m.OH);
+        pano = multiBandBlend(warpL, right, mask, a.bands);
     }
     else
     {
-        pano = UMat(m.OH, m.OW, warpL.type(), Scalar::all(0));
-        warpL(Rect(0, 0, seam, m.OH)).copyTo(pano(Rect(0, 0, seam, m.OH)));
-        right(Rect(seam, 0, m.OW - seam, m.OH)).copyTo(pano(Rect(seam, 0, m.OW - seam, m.OH)));
+        UMat mask8; mask.convertTo(mask8, CV_8U, 255.0);
+        pano = right.clone();
+        warpL.copyTo(pano, mask8);          // left where mask, right elsewhere
     }
     if (degrees != 0.0)
     {
@@ -442,6 +487,7 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
   <div class="grp">Seam <button id="ml">&#9664;</button><input class="val" id="mv" type="number" value="0"><button id="mr">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="mb" checked> multi-band blend</label></div>
   <div class="grp"><label><input type="checkbox" id="xc"> exposure/color match</label></div>
+  <div class="grp"><label><input type="checkbox" id="ss"> seam avoidance (moving objects)</label></div>
   <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
   <div class="grp">step <select id="step"><option>1</option><option>2</option><option>5</option><option>10</option></select></div>
@@ -524,7 +570,7 @@ frange.onchange=()=>loadFrame(frange.value);
 fval.onchange=()=>loadFrame(fval.value);
 let polling=null;
 const pb=document.getElementById('pb'), pct=document.getElementById('pct');
-const params=()=>'shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty='+(+yv.value||0)+'&seam='+clampSeam(+mv.value||0)+'&bands='+(document.getElementById('mb').checked?6:0)+'&exposure='+(document.getElementById('xc').checked?1:0);
+const params=()=>'shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty='+(+yv.value||0)+'&seam='+clampSeam(+mv.value||0)+'&bands='+(document.getElementById('mb').checked?6:0)+'&exposure='+(document.getElementById('xc').checked?1:0)+'&smartseam='+(document.getElementById('ss').checked?1:0);
 document.getElementById('stitch').onclick=async()=>{
   if(polling) return;
   document.getElementById('stitch').disabled=true;
@@ -647,6 +693,7 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
                 a.shiftY = query.find("shifty=") != string::npos ? stod(qparam(query, "shifty")) : 0;
                 a.bands = query.find("bands=") != string::npos ? stoi(qparam(query, "bands")) : 0;
                 a.exposure = qparam(query, "exposure") == "1";
+                a.smartSeam = qparam(query, "smartseam") == "1";
                 string ss = qparam(query, "seam");
                 StitchMaps mm = m;
                 if (!ss.empty()) mm.seam = stoi(ss);
@@ -788,6 +835,7 @@ int main(int argc, char **argv)
     a.shiftY = stod(argVal(argc, argv, "--shift-y", "0"));
     a.bands = stoi(argVal(argc, argv, "--bands", "6"));   // 0 = hard seam
     a.exposure = hasArg(argc, argv, "--exposure");
+    a.smartSeam = hasArg(argc, argv, "--smart-seam");
     int port = stoi(argVal(argc, argv, "--port", "8090"));
     bool tune = hasArg(argc, argv, "--tune");
     if (source.empty())

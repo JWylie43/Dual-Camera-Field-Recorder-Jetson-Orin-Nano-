@@ -216,6 +216,7 @@ reused for every frame.
 | `--shift-x N` | `0` | Convenience: sets both top and bottom to N (plain horizontal shift) |
 | `--bands N` | `6` | Multi-band (Laplacian) blend levels — smooths the seam *without* blurring detail; `0` = hard seam |
 | `--exposure` | off | Match the right image's brightness/color to the left (per-channel gain measured in the overlap) — for when one camera faces brighter light |
+| `--smart-seam` | off | Route the seam through the min-difference path so it weaves *around* moving objects — reduces player ghosting/duplication at the seam |
 | `--tune` | off | Launch the interactive browser tuner (see below) |
 | `--port N` | `8090` | Port for the `--tune` web server |
 
@@ -242,8 +243,9 @@ browser** to a live tuner. There you:
   field so the whole thing lines up under a straight vertical seam. Leave
   **multi-band blend** on to smooth the join in the output (it keeps detail sharp,
   unlike a linear feather), and enable **exposure/color match** if one camera faces
-  brighter light; the preview shows the raw seam so you can align precisely, and both
-  blend and exposure are applied to the stitched output,
+  brighter light, and turn on **seam avoidance** if players ghost/duplicate at the
+  seam (it routes the cut around moving objects); the preview shows the raw seam so
+  you can align precisely, and blend/exposure/seam-avoidance apply to the output,
 - **for a video**, use the **Frame** slider, its ◀ ▶, or the frame box to jump to
   any frame and align on it — the current frame and total (`N / 1591`) are shown.
   The total comes from `ffprobe` packet-counting (fast, exact for MJPEG even when the
