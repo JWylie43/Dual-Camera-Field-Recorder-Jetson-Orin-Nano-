@@ -214,7 +214,7 @@ reused for every frame.
 | `--shift-bottom N` | `0` | Horizontal shift of the **bottom** rows (aligns the **near** edge) |
 | `--shift-y N` | `0` | Vertical shift of the right image |
 | `--shift-x N` | `0` | Convenience: sets both top and bottom to N (plain horizontal shift) |
-| `--feather N` | `0` | Cross-fade the seam over an N-px band (0 = hard seam) — hides the join/brightness step |
+| `--bands N` | `6` | Multi-band (Laplacian) blend levels — smooths the seam *without* blurring detail; `0` = hard seam |
 | `--tune` | off | Launch the interactive browser tuner (see below) |
 | `--port N` | `8090` | Port for the `--tune` web server |
 
@@ -235,11 +235,12 @@ a one-command visual tuner:
 
 This warps the first frame, starts a tiny localhost web server, and **opens your
 browser** to a live tuner. There you:
-- adjust **Shift far (top)**, **Shift near (bottom)**, **Shift-y**, **Seam**, and
-  **Feather** with the **◀ ▶** arrows or by typing (←/→ shifts both top & bottom
-  together; `[` `]` moves the seam) over a live stitched preview — align the far and
-  near edges of the field so the whole thing lines up under a straight vertical seam,
-  then raise **Feather** to cross-fade the join,
+- adjust **Shift far (top)**, **Shift near (bottom)**, **Shift-y**, and **Seam** with
+  the **◀ ▶** arrows or by typing (←/→ shifts both top & bottom together; `[` `]`
+  moves the seam) over a live stitched preview — align the far and near edges of the
+  field so the whole thing lines up under a straight vertical seam. Leave
+  **multi-band blend** on to smooth the join in the output (it keeps detail sharp,
+  unlike a linear feather); the preview shows the raw seam so you can align precisely,
 - **for a video**, use the **Frame** slider, its ◀ ▶, or the frame box to jump to
   any frame and align on it — the current frame and total (`N / 1591`) are shown.
   The total comes from `ffprobe` packet-counting (fast, exact for MJPEG even when the
