@@ -82,7 +82,8 @@ struct StitchMaps
 struct Align
 {
     double shiftTop = 0, shiftBottom = 0, shiftY = 0;
-    int bands = 0;   // multi-band (Laplacian) blend levels; 0 = hard seam
+    int bands = 0;       // multi-band (Laplacian) blend levels; 0 = hard seam
+    bool exposure = false; // match right image brightness/color to left (per channel)
 };
 
 // Shared progress state for the --tune server (stitch runs on a worker thread).
@@ -267,6 +268,33 @@ static UMat multiBandBlend(const UMat &A8, const UMat &B8, int seam, int bands, 
     return out;
 }
 
+// Per-channel gain so the right image's brightness/color matches the left. Gains are
+// measured from the overlap band around the seam, then applied to the WHOLE right image.
+static void exposureMatch(const UMat &warpL, UMat &right, int seam, int OW, int OH)
+{
+    int W = min(200, OW / 8);
+    int x0 = max(0, seam - W), x1 = min(OW, seam + W);
+    if (x1 - x0 < 2) return;
+    Rect band(x0, 0, x1 - x0, OH);
+    UMat gl, gr, mL8, mR8, mask;
+    cvtColor(warpL(band), gl, COLOR_BGR2GRAY);
+    cvtColor(right(band), gr, COLOR_BGR2GRAY);
+    threshold(gl, mL8, 5, 255, THRESH_BINARY);
+    threshold(gr, mR8, 5, 255, THRESH_BINARY);
+    bitwise_and(mL8, mR8, mask);               // valid in BOTH (skip black wedges)
+    if (countNonZero(mask) < 100) return;
+    Scalar meanL = mean(warpL(band), mask);
+    Scalar meanR = mean(right(band), mask);
+    vector<UMat> ch; split(right, ch);
+    for (int c = 0; c < 3; c++)
+    {
+        double g = meanR[c] > 1e-3 ? meanL[c] / meanR[c] : 1.0;
+        g = max(0.3, min(3.0, g));             // clamp to avoid extreme corrections
+        ch[c].convertTo(ch[c], CV_8U, g);      // saturating per-channel scale
+    }
+    merge(ch, right);
+}
+
 static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
                       double degrees, const Align &a)
 {
@@ -278,6 +306,7 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
         Mat T = (Mat_<double>(2, 3) << 1, k, a.shiftTop, 0, 1, a.shiftY);
         warpAffine(warpR, right, T, Size(m.OW, m.OH));
     }
+    if (a.exposure) exposureMatch(warpL, right, m.seam, m.OW, m.OH);
     int seam = m.seam;
     UMat pano;
     if (a.bands > 0)
@@ -411,7 +440,8 @@ static string tunerHtml(const UMat &warpL, const UMat &warpR, const StitchMaps &
   <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
   <div class="grp">Shift-y <button id="yl">&#9664;</button><input class="val" id="yv" type="number" value="0"><button id="yr">&#9654;</button></div>
   <div class="grp">Seam <button id="ml">&#9664;</button><input class="val" id="mv" type="number" value="0"><button id="mr">&#9654;</button></div>
-  <div class="grp"><label><input type="checkbox" id="mb" checked> multi-band blend (output)</label></div>
+  <div class="grp"><label><input type="checkbox" id="mb" checked> multi-band blend</label></div>
+  <div class="grp"><label><input type="checkbox" id="xc"> exposure/color match</label></div>
   <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
   <div class="grp">step <select id="step"><option>1</option><option>2</option><option>5</option><option>10</option></select></div>
@@ -494,7 +524,7 @@ frange.onchange=()=>loadFrame(frange.value);
 fval.onchange=()=>loadFrame(fval.value);
 let polling=null;
 const pb=document.getElementById('pb'), pct=document.getElementById('pct');
-const params=()=>'shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty='+(+yv.value||0)+'&seam='+clampSeam(+mv.value||0)+'&bands='+(document.getElementById('mb').checked?6:0);
+const params=()=>'shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty='+(+yv.value||0)+'&seam='+clampSeam(+mv.value||0)+'&bands='+(document.getElementById('mb').checked?6:0)+'&exposure='+(document.getElementById('xc').checked?1:0);
 document.getElementById('stitch').onclick=async()=>{
   if(polling) return;
   document.getElementById('stitch').disabled=true;
@@ -616,6 +646,7 @@ static void runTuneServer(const string &source, bool video, StitchMaps &m,
                 a.shiftBottom = query.find("shiftbottom=") != string::npos ? stod(qparam(query, "shiftbottom")) : 0;
                 a.shiftY = query.find("shifty=") != string::npos ? stod(qparam(query, "shifty")) : 0;
                 a.bands = query.find("bands=") != string::npos ? stoi(qparam(query, "bands")) : 0;
+                a.exposure = qparam(query, "exposure") == "1";
                 string ss = qparam(query, "seam");
                 StitchMaps mm = m;
                 if (!ss.empty()) mm.seam = stoi(ss);
@@ -756,6 +787,7 @@ int main(int argc, char **argv)
     a.shiftBottom = stod(argVal(argc, argv, "--shift-bottom", sx));
     a.shiftY = stod(argVal(argc, argv, "--shift-y", "0"));
     a.bands = stoi(argVal(argc, argv, "--bands", "6"));   // 0 = hard seam
+    a.exposure = hasArg(argc, argv, "--exposure");
     int port = stoi(argVal(argc, argv, "--port", "8090"));
     bool tune = hasArg(argc, argv, "--tune");
     if (source.empty())
