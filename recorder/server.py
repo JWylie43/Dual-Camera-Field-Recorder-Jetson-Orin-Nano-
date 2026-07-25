@@ -56,7 +56,8 @@ CALIB_DIR = os.path.join(OUTPUT_DIR, "calib")  # calibration snapshots land here
 app = Flask(__name__)
 
 _lock = threading.Lock()
-_state = {"proc": None, "started": None, "preview": None, "suspended": False}
+_state = {"proc": None, "started": None, "preview": None, "suspended": False,
+          "rec_preview": True}   # whether the active recording built a preview tee
 
 
 def _is_running():
@@ -185,9 +186,13 @@ def index():
 def status():
     running = _is_running()
     elapsed = int(time.time() - _state["started"]) if running and _state["started"] else 0
+    # A preview is available when idle (on demand) or when the active recording
+    # was started with its preview tee. False -> recording without live preview.
+    preview = _state.get("rec_preview", True) if running else True
     return jsonify(running=running,
                    file=_newest_recording() if running else None,
                    elapsed=elapsed,
+                   preview=preview,
                    server_root=(getattr(os, "geteuid", lambda: 1)() == 0))
 
 
@@ -243,10 +248,12 @@ def start():
             return jsonify(ok=False, error="busy"), 409
         _state["suspended"] = True               # keep preview off during the swap
     data = request.get_json(silent=True) or {}
+    want_preview = bool(data.get("preview", True))   # live preview tee during recording
     _sync_preview()                              # free the camera + preview port
     time.sleep(SETTLE)
-    cmd = ["python3", RECORD_SCRIPT, "--output-dir", OUTPUT_DIR,
-           "--preview-port", str(PREVIEW_TCP)]
+    cmd = ["python3", RECORD_SCRIPT, "--output-dir", OUTPUT_DIR]
+    if want_preview:                             # omit -> record with no preview tee
+        cmd += ["--preview-port", str(PREVIEW_TCP)]
     if data.get("log_thermals"):
         cmd.append("--log-thermals")
     if data.get("quality"):
@@ -254,7 +261,8 @@ def start():
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with _lock:
-        _state.update(proc=proc, started=time.time(), suspended=False)
+        _state.update(proc=proc, started=time.time(), suspended=False,
+                      rec_preview=want_preview)
     return jsonify(ok=True)
 
 
@@ -376,6 +384,8 @@ PAGE = """<!doctype html>
    <div id="detail" class="muted"></div>
  </div>
  <div class="card">
+   <label><input type="checkbox" id="pvrec" checked> Live preview while recording</label>
+   <div class="muted">Off &rarr; camera is dedicated to recording (no preview until you stop).</div>
    <label><input type="checkbox" id="logth"> Log thermals to file</label>
    <label>Quality <input type="number" id="quality" value="85" min="1" max="100"></label>
    <div id="rootnote" class="muted"></div>
@@ -403,14 +413,21 @@ const tclass = c => c>=80?'hot':c>=65?'warn':'ok';
 
 // Preview show/hide. When off, drop the stream (src='') so the browser closes the
 // connection -> no Wi-Fi traffic, no phone battery, and (when idle) the server
-// releases the camera and stops the preview pipeline entirely.
-function reconnectPreview(){ if($('showpv').checked) $('preview').src = '/preview.mjpg?' + Date.now(); }
-$('preview').onerror = () => { if($('showpv').checked) setTimeout(reconnectPreview, 1200); };
-$('showpv').onchange = () => {
-  if($('showpv').checked){ $('preview').style.display='block'; $('pvnote').textContent=''; reconnectPreview(); }
-  else { $('preview').style.display='none'; $('preview').src='';
-         $('pvnote').textContent='Hidden — preview stopped and camera released while idle (recording is unaffected).'; }
-};
+// releases the camera and stops the preview pipeline entirely. previewAvailable is
+// false while a recording started with "Live preview while recording" unchecked --
+// there's no stream to fetch then, so we don't try.
+let previewAvailable = true;
+function previewWanted(){ return $('showpv').checked && previewAvailable; }
+function reconnectPreview(){ if(previewWanted()) $('preview').src = '/preview.mjpg?' + Date.now(); }
+function applyPreviewState(){
+  if(previewWanted()){ $('preview').style.display='block'; }
+  else { $('preview').style.display='none'; $('preview').src=''; }
+  $('pvnote').textContent =
+    !previewAvailable ? 'Preview off for this recording (started with live preview disabled).' :
+    !$('showpv').checked ? 'Hidden — preview stopped and camera released while idle (recording is unaffected).' : '';
+}
+$('preview').onerror = () => { if(previewWanted()) setTimeout(reconnectPreview, 1200); };
+$('showpv').onchange = () => { applyPreviewState(); if(previewWanted()) reconnectPreview(); };
 
 let wasRunning = null;
 async function refreshStatus(){
@@ -424,13 +441,19 @@ async function refreshStatus(){
     $('snap').disabled  = s.running;
     $('rootnote').textContent = (!s.server_root && $('logth').checked)
       ? 'Note: logging to file needs the server run under sudo.' : '';
+    // track whether a preview stream exists right now (idle, or recording-with-tee)
+    const prevAvail = previewAvailable;
+    previewAvailable = (s.preview !== false);
+    if(prevAvail !== previewAvailable) applyPreviewState();
     // camera handed over on a state change -> nudge the preview to reconnect
-    if(wasRunning !== null && wasRunning !== s.running) setTimeout(reconnectPreview, 1500);
+    if((wasRunning !== null && wasRunning !== s.running) || (prevAvail !== previewAvailable))
+      setTimeout(reconnectPreview, 1500);
     wasRunning = s.running;
   }catch(e){ $('statetext').textContent = 'server unreachable'; }
 }
 $('start').onclick = async () => { $('start').disabled=true;
-  await post('/start',{log_thermals:$('logth').checked, quality:+$('quality').value});
+  await post('/start',{log_thermals:$('logth').checked, quality:+$('quality').value,
+                       preview:$('pvrec').checked});
   refreshStatus(); };
 $('stop').onclick  = async () => { $('stop').disabled=true; await post('/stop'); refreshStatus(); };
 $('snap').onclick  = async () => {
