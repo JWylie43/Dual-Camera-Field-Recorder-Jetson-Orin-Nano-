@@ -8,13 +8,19 @@ readout, calibration snapshots, and an optional thermal-log toggle. Drives recor
   START -> stop idle preview, launch `record.py --preview-port <P> ...`
   STOP  -> SIGINT the recorder (clean EOS), then restart idle preview
 
-PREVIEW (works idle AND while recording):
-  The camera can only be opened by one process. So when idle, THIS server runs a
-  lightweight preview pipeline (camera -> downscale -> JPEG -> tcpserversink on
-  PREVIEW_TCP). When recording, record.py's own `tee` serves the preview on the
-  SAME port. Either way the browser reads /preview.mjpg, which relays the TCP
-  MJPEG stream as multipart/x-mixed-replace into an <img> tag. The source behind
-  the port swaps transparently; the page just reconnects across the brief gap.
+PREVIEW (on-demand when idle; always-on while recording):
+  The camera can only be opened by one process, and the preview pipeline draws
+  power (camera + downscale + JPEG engine) even with nobody watching. So when
+  idle we run it ON DEMAND: the browser's /preview.mjpg connection is the signal.
+  We reference-count those connections (_viewers) and only run the lightweight
+  idle pipeline (camera -> downscale -> JPEG -> tcpserversink on PREVIEW_TCP)
+  while at least one viewer is connected. Close the tab or untick "Show preview"
+  and the last connection drops -> the camera is released and idles.
+  When recording, record.py's own `tee` serves the preview on the SAME port, so
+  we leave the idle pipeline off and never touch the camera. Either way the
+  browser reads /preview.mjpg, which relays the TCP MJPEG stream as
+  multipart/x-mixed-replace into an <img> tag. The source behind the port swaps
+  transparently; the page just reconnects across the brief gap.
 
 Live thermals are read from /sys/class/thermal (no root). The "log thermals"
 toggle passes --log-thermals to record.py (tegrastats, needs root) -> run this
@@ -50,7 +56,7 @@ CALIB_DIR = os.path.join(OUTPUT_DIR, "calib")  # calibration snapshots land here
 app = Flask(__name__)
 
 _lock = threading.Lock()
-_state = {"proc": None, "started": None, "preview": None}
+_state = {"proc": None, "started": None, "preview": None, "suspended": False}
 
 
 def _is_running():
@@ -98,6 +104,40 @@ def _stop_idle_preview():
         except subprocess.TimeoutExpired:
             p.kill()
     _state["preview"] = None
+
+
+# ---- on-demand preview lifecycle -----------------------------------------
+# _viewers counts live /preview.mjpg connections. The idle preview should run
+# iff someone is watching AND we're neither recording nor mid-transition
+# (record.py owns the camera then). _sync_preview reconciles the pipeline to
+# that desired state; _pv_lock serializes it so a start and stop can't race.
+_viewers = 0
+_pv_lock = threading.Lock()
+
+
+def _preview_wanted():
+    """True iff the idle pipeline should be running right now. Call under _lock."""
+    return _viewers > 0 and not _is_running() and not _state.get("suspended")
+
+
+def _sync_preview():
+    """Bring the idle preview pipeline in line with current demand."""
+    with _pv_lock:
+        with _lock:
+            want = _preview_wanted()
+        if want:
+            _start_idle_preview()
+        else:
+            _stop_idle_preview()
+
+
+def _viewer_delta(d):
+    """Adjust the live-viewer count, then reconcile the pipeline. Never hold
+    _lock across this (it takes _pv_lock -> _lock internally)."""
+    global _viewers
+    with _lock:
+        _viewers = max(0, _viewers + d)
+    _sync_preview()
 
 
 # ---- thermals via sysfs (no root needed) ---------------------------------
@@ -163,21 +203,33 @@ def thermals():
 
 @app.route("/preview.mjpg")
 def preview():
-    """Relay the gst tcpserversink MJPEG stream to the browser as multipart."""
+    """Relay the gst tcpserversink MJPEG stream to the browser as multipart.
+
+    Opening this connection is what turns the idle preview ON (via _viewer_delta);
+    closing it (tab closed, 'Show preview' unticked) turns it back OFF once no
+    other viewer remains. On the first viewer the pipeline is still spinning up,
+    so we retry the local connect for a few seconds before giving up."""
     def gen():
+        _viewer_delta(+1)                        # demand up -> maybe start pipeline
         s = None
         try:
-            s = socket.create_connection(("127.0.0.1", PREVIEW_TCP), timeout=3)
+            deadline = time.monotonic() + 5.0    # producer may be starting up
+            while s is None:
+                try:
+                    s = socket.create_connection(("127.0.0.1", PREVIEW_TCP), timeout=3)
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        return                   # gave up; browser will retry
+                    time.sleep(0.3)
             while True:
                 chunk = s.recv(8192)
                 if not chunk:
                     break
                 yield chunk
-        except OSError:
-            return                               # no producer yet; browser will retry
         finally:
             if s is not None:
                 s.close()
+            _viewer_delta(-1)                    # demand down -> maybe stop pipeline
     return Response(gen(),
                     mimetype=f"multipart/x-mixed-replace; boundary={PREVIEW_BOUNDARY}")
 
@@ -187,19 +239,23 @@ def start():
     with _lock:
         if _is_running():
             return jsonify(ok=False, error="already recording"), 409
-        data = request.get_json(silent=True) or {}
-        _stop_idle_preview()                     # free the camera + preview port
-        time.sleep(SETTLE)
-        cmd = ["python3", RECORD_SCRIPT, "--output-dir", OUTPUT_DIR,
-               "--preview-port", str(PREVIEW_TCP)]
-        if data.get("log_thermals"):
-            cmd.append("--log-thermals")
-        if data.get("quality"):
-            cmd += ["--quality", str(int(data["quality"]))]
-        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _state.update(proc=proc, started=time.time())
-        return jsonify(ok=True)
+        if _state.get("suspended"):
+            return jsonify(ok=False, error="busy"), 409
+        _state["suspended"] = True               # keep preview off during the swap
+    data = request.get_json(silent=True) or {}
+    _sync_preview()                              # free the camera + preview port
+    time.sleep(SETTLE)
+    cmd = ["python3", RECORD_SCRIPT, "--output-dir", OUTPUT_DIR,
+           "--preview-port", str(PREVIEW_TCP)]
+    if data.get("log_thermals"):
+        cmd.append("--log-thermals")
+    if data.get("quality"):
+        cmd += ["--quality", str(int(data["quality"]))]
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with _lock:
+        _state.update(proc=proc, started=time.time(), suspended=False)
+    return jsonify(ok=True)
 
 
 @app.route("/stop", methods=["POST"])
@@ -208,16 +264,17 @@ def stop():
         if not _is_running():
             return jsonify(ok=False, error="not recording"), 409
         proc = _state["proc"]
-        proc.send_signal(signal.SIGINT)          # clean EOS -> finalized MKV
-        try:
-            proc.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
-        f = _newest_recording()
+    proc.send_signal(signal.SIGINT)              # clean EOS -> finalized MKV
+    try:
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+    f = _newest_recording()
+    with _lock:
         _state.update(proc=None, started=None)
-        time.sleep(SETTLE)
-        _start_idle_preview()                    # resume idle preview
-        return jsonify(ok=True, file=f)
+    time.sleep(SETTLE)
+    _sync_preview()                              # resume idle preview iff someone's watching
+    return jsonify(ok=True, file=f)
 
 
 def _snapshot_cmd(pattern):
@@ -240,8 +297,12 @@ def snapshot():
     with _lock:
         if _is_running():
             return jsonify(ok=False, error="stop recording first"), 409
+        if _state.get("suspended"):
+            return jsonify(ok=False, error="busy"), 409
+        _state["suspended"] = True               # hold the camera for the still
+    try:
         os.makedirs(CALIB_DIR, exist_ok=True)
-        _stop_idle_preview()
+        _sync_preview()                          # release the camera
         time.sleep(SETTLE)
         tmp = os.path.join(CALIB_DIR, "_tmp_%03d.jpg")
         try:
@@ -262,11 +323,14 @@ def snapshot():
                     os.remove(t)
                 except OSError:
                     pass
-        _start_idle_preview()
-        if not saved:
-            return jsonify(ok=False, error="capture failed (no frame)"), 500
-        count = len(glob.glob(os.path.join(CALIB_DIR, "calib_*.jpg")))
-        return jsonify(ok=True, file=os.path.basename(saved), count=count)
+    finally:
+        with _lock:
+            _state["suspended"] = False
+        _sync_preview()                          # restore preview iff someone's watching
+    if not saved:
+        return jsonify(ok=False, error="capture failed (no frame)"), 500
+    count = len(glob.glob(os.path.join(CALIB_DIR, "calib_*.jpg")))
+    return jsonify(ok=True, file=os.path.basename(saved), count=count)
 
 
 PAGE = """<!doctype html>
@@ -338,13 +402,14 @@ const fmt = s => Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
 const tclass = c => c>=80?'hot':c>=65?'warn':'ok';
 
 // Preview show/hide. When off, drop the stream (src='') so the browser closes the
-// connection -> no Wi-Fi traffic, no phone battery, server stops relaying.
+// connection -> no Wi-Fi traffic, no phone battery, and (when idle) the server
+// releases the camera and stops the preview pipeline entirely.
 function reconnectPreview(){ if($('showpv').checked) $('preview').src = '/preview.mjpg?' + Date.now(); }
 $('preview').onerror = () => { if($('showpv').checked) setTimeout(reconnectPreview, 1200); };
 $('showpv').onchange = () => {
   if($('showpv').checked){ $('preview').style.display='block'; $('pvnote').textContent=''; reconnectPreview(); }
   else { $('preview').style.display='none'; $('preview').src='';
-         $('pvnote').textContent='Hidden — no stream to this device (camera still records normally).'; }
+         $('pvnote').textContent='Hidden — preview stopped and camera released while idle (recording is unaffected).'; }
 };
 
 let wasRunning = null;
@@ -400,8 +465,8 @@ refreshStatus();
 
 if __name__ == "__main__":
     print(f"Camera rig control panel on http://0.0.0.0:{PORT}  (find IP: hostname -I)")
-    _start_idle_preview()                        # live preview as soon as we boot
+    # No preview on boot: the camera stays idle until a browser opens /preview.mjpg.
     try:
         app.run(host="0.0.0.0", port=PORT, threaded=True)
     finally:
-        _stop_idle_preview()
+        _stop_idle_preview()                     # tidy up any on-demand pipeline
