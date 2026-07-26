@@ -21,6 +21,16 @@
 // to a live tuner where you adjust those values and click "Stitch all frames" to run
 // the full stitch (progress bar + done). One command; UI opens itself.
 //
+// Parallel video stitch (default ON):
+//   --jobs N   split the frame range across N child processes, then ffmpeg-concat
+//              the parts into the one --out-file. Defaults to 4. Each child keeps its
+//              own smart-seam continuity within its chunk (the seam only resets at the
+//              N-1 chunk joins). Separate processes (not threads) so each gets its own
+//              OpenCL context and the GPU scheduler overlaps them - the way to actually
+//              fill the GPU. Tune N to your GPU's saturation knee (watch GPU% + VRAM).
+//   --no-jobs  (or --jobs 1) run everything in this one process - no parallelism.
+//   Requires ffmpeg on PATH for the concat. Images and --tune always run single-process.
+//
 // GPU: per-frame work runs on cv::UMat (OpenCL when available, CPU fallback).
 // Uses core/imgproc/imgcodecs/videoio; builds on OpenCV 4.x and 5.x.
 //
@@ -1174,6 +1184,107 @@ static string resolveCalibDir(const string &requested)
     return requested;
 }
 
+// Run a shell command, blocking until it exits. On Windows a command that begins
+// with a quoted path needs the WHOLE string wrapped again or cmd.exe mis-parses it.
+static int runShell(string cmd)
+{
+#ifdef _WIN32
+    cmd = "\"" + cmd + "\"";
+#endif
+    return std::system(cmd.c_str());
+}
+
+// Parallel stitch: split [startFrame..endFrame] across `jobs` child processes (each
+// this same exe with --jobs 1 over its sub-range -> its own temp part), run them
+// concurrently, then ffmpeg-concat the parts (in order) into `outFile`. Child
+// processes rather than threads so each has its own OpenCL context and the GPU
+// scheduler can overlap them. Returns 0 on success. The smart seam resets at each
+// chunk boundary (fresh prevSeam per child) - the only cost of the split.
+static int runParallelJobs(const string &source, const string &calibDir,
+                           double degrees, int seamArg, const Align &a,
+                           const string &cropArg, int startFrame, int endFrame,
+                           const string &outFile, int jobs)
+{
+    auto q = [](const string &s) { return "\"" + s + "\""; };   // quote for the shell
+
+    string exe = exePath();
+    if (exe.empty()) { cerr << "jobs: cannot locate own executable.\n"; return -1; }
+
+    int total = endFrame - startFrame + 1;
+    if (jobs > total) jobs = total;                 // never more jobs than frames
+    int per = (total + jobs - 1) / jobs;            // ceil, so chunks tile the range
+
+    fs::path op(outFile);
+    string stem = op.stem().string();
+    string ext = op.extension().empty() ? ".mp4" : op.extension().string();
+    fs::path dir = op.parent_path();
+
+    vector<string> parts, logs, cmds;
+    vector<int> rangeS, rangeE;
+    for (int i = 0; i < jobs; i++)
+    {
+        int s = startFrame + i * per;
+        if (s > endFrame) break;
+        int e = std::min(s + per - 1, endFrame);
+        string part = (dir / (stem + ".part" + to_string(i) + ext)).string();
+        string log = (dir / (stem + ".part" + to_string(i) + ".log")).string();
+        parts.push_back(part);
+        logs.push_back(log);
+        rangeS.push_back(s);
+        rangeE.push_back(e);
+        cmds.push_back(
+            q(exe) + " --source " + q(source) + " --calib-dir " + q(calibDir)
+            + " --degrees " + to_string(degrees) + " --seam " + to_string(seamArg)
+            + " --shift-top " + to_string(a.shiftTop) + " --shift-bottom " + to_string(a.shiftBottom)
+            + " --shift-y " + to_string(a.shiftY) + " --bands " + to_string(a.bands)
+            + (a.exposure ? "" : " --no-exposure") + (a.smartSeam ? "" : " --no-smart-seam")
+            + (cropArg.empty() ? "" : " --crop " + q(cropArg))
+            + " --jobs 1 --start " + to_string(s) + " --end " + to_string(e)
+            + " --out-file " + q(part) + " > " + q(log) + " 2>&1");
+    }
+
+    int n = (int)cmds.size();
+    cout << "jobs: splitting frames " << startFrame << ".." << endFrame
+         << " across " << n << " parallel process(es)\n";
+    for (int i = 0; i < n; i++)
+        cout << "  part " << i << ": frames " << rangeS[i] << ".." << rangeE[i]
+             << "   (progress -> " << logs[i] << ")\n";
+    cout << "Working... (tail a .log to watch a part)\n";
+
+    vector<std::thread> ts;
+    vector<int> rc(n, -1);
+    for (int i = 0; i < n; i++)
+        ts.emplace_back([&cmds, &rc, i]() { rc[i] = runShell(cmds[i]); });
+    for (auto &t : ts) t.join();
+
+    bool ok = true;
+    for (int i = 0; i < n; i++)
+    {
+        std::error_code ec;
+        if (rc[i] != 0 || !fs::exists(parts[i], ec))
+        { cerr << "jobs: part " << i << " failed (exit " << rc[i] << "); see " << logs[i] << "\n"; ok = false; }
+    }
+    if (!ok) { cerr << "jobs: a part failed - not concatenating; parts left on disk.\n"; return 1; }
+
+    // Lossless join of the parts (all identical codec/size/fps) via ffmpeg concat.
+    fs::path listPath = dir / (stem + ".concat.txt");
+    {
+        ofstream lf(listPath.string());
+        for (const auto &p : parts)
+        { string fp = p; std::replace(fp.begin(), fp.end(), '\\', '/'); lf << "file '" << fp << "'\n"; }
+    }
+    cout << "jobs: concatenating " << n << " parts -> " << outFile << "\n";
+    int crc = runShell("ffmpeg -y -f concat -safe 0 -i " + q(listPath.string()) + " -c copy " + q(outFile));
+    if (crc != 0) { cerr << "jobs: ffmpeg concat failed (exit " << crc << "). Is ffmpeg on PATH? Parts kept.\n"; return 1; }
+
+    std::error_code ec;
+    for (const auto &p : parts) fs::remove(p, ec);
+    for (const auto &l : logs) fs::remove(l, ec);
+    fs::remove(listPath, ec);
+    cout << "jobs: done -> " << outFile << "\n";
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     string source = argVal(argc, argv, "--source", argVal(argc, argv, "--image", ""));
@@ -1194,6 +1305,9 @@ int main(int argc, char **argv)
     a.smartSeam = !hasArg(argc, argv, "--no-smart-seam");  // on by default
     int port = stoi(argVal(argc, argv, "--port", "8090"));
     bool tune = hasArg(argc, argv, "--tune");
+    int jobs = stoi(argVal(argc, argv, "--jobs", "4"));    // parallel child processes (video); default 4
+    if (hasArg(argc, argv, "--no-jobs")) jobs = 1;         // force everything into this one process
+    string cropArg = argVal(argc, argv, "--crop", "");     // read early; child processes need it too
 
     // Ensure the output destination exists (batch, or a preset --out-file).
     if (!outFile.empty()) { fs::path p(outFile); if (p.has_parent_path()) fs::create_directories(p.parent_path()); }
@@ -1243,10 +1357,21 @@ int main(int argc, char **argv)
     }
     if (frame.empty()) { cerr << "Cannot read source: " << source << endl; return 1; }
 
+    // Parallel path: split the video across `jobs` child processes, then concat into
+    // the single --out-file. Video only; images and the tuner always run single-process.
+    if (video && jobs > 1)
+    {
+        string finalOut = !outFile.empty() ? outFile : (outDir + "/stitched_video.mp4");
+        int endResolved = endFrame >= 0 ? endFrame : (totalFrames > 0 ? totalFrames - 1 : -1);
+        if (endResolved >= startFrame)
+            return runParallelJobs(source, calibDir, degrees, seamArg, a, cropArg,
+                                   startFrame, endResolved, finalOut, jobs);
+        cerr << "jobs: couldn't determine frame count; running single-process.\n";
+    }
+
     StitchMaps m = buildStitchMaps(KL, DL, KR, DR, R, frame.cols / 2, frame.rows, seamArg);
 
     // Optional --crop "x,y,w,h" (full-canvas coords): restrict work to that region.
-    string cropArg = argVal(argc, argv, "--crop", "");
     if (!cropArg.empty())
     {
         int cx = 0, cy = 0, cw = 0, ch = 0;
