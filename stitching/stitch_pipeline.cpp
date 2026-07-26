@@ -1225,7 +1225,7 @@ static int runParallelJobs(const string &source, const string &calibDir,
     {
         int s = startFrame + i * per;
         if (s > endFrame) break;
-        int e = std::min(s + per - 1, endFrame);
+        int e = min(s + per - 1, endFrame);
         string part = (dir / (stem + ".part" + to_string(i) + ext)).string();
         string log = (dir / (stem + ".part" + to_string(i) + ".log")).string();
         parts.push_back(part);
