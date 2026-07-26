@@ -54,6 +54,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <chrono>
 #include "json.hpp"
 
 #ifdef _WIN32
@@ -114,6 +115,9 @@ static std::atomic<bool> g_busy{false};
 static std::atomic<bool> g_done{false};
 static std::mutex g_mu;
 static string g_result;
+// Per-process progress for a parallel (--jobs) render, surfaced to the tuner UI.
+static std::mutex g_partMu;
+static vector<int> g_partPct, g_partDone, g_partTotal;
 
 static void loadIntrinsics(const string &path, Mat &K, vector<double> &D)
 {
@@ -480,7 +484,7 @@ static string stitchImageFile(const string &source, StitchMaps &m, double degree
 static string stitchVideoFile(const string &source, StitchMaps &m, double degrees,
                               const Align &a, int startFrame, int endFrame, int totalFrames,
                               const string &outDir, const string &outFile = "",
-                              std::atomic<int> *prog = nullptr)
+                              std::atomic<int> *prog = nullptr, const string &progFile = "")
 {
     VideoCapture cap(source);
     if (!cap.isOpened()) return "ERROR: cannot open video";
@@ -510,7 +514,13 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
         {
             int pct = (int)(100.0 * (i - s + 1) / (e - s + 1));
             if (prog) prog->store(pct);
-            if (written % 30 == 0 || i == e) cout << "  " << pct << "%  (frame " << i << ")\n";
+            if (written % 30 == 0 || i == e)
+            {
+                cout << "  " << pct << "%  (frame " << i << ")\n";
+                // Dedicated per-process progress file the parent monitor reads: "pct done total".
+                if (!progFile.empty())
+                { ofstream pf(progFile, std::ios::trunc); if (pf) pf << pct << " " << (i - s + 1) << " " << (e - s + 1) << "\n"; }
+            }
         }
         else if (written % 30 == 0) cout << "  frame " << i << "\n";
     }
@@ -595,6 +605,7 @@ static string tunerHtml()
   <span id="pct" style="margin-left:8px">0%</span>
   <button id="finish" style="display:none;margin-left:12px">Finish &amp; stop</button>
 </div>
+<div id="parts" style="padding:0 10px 10px;display:none;font-size:.9em;line-height:1.7"></div>
 <div id="wrap"><canvas id="c"></canvas></div>
 <script>
 // Dynamic state — filled in by /state (on load) or /import (button).
@@ -757,6 +768,7 @@ stitchBtn.onclick=async()=>{
   document.getElementById('prog').style.display='block';
   document.getElementById('finish').style.display='none';
   pb.value=0; pct.textContent='0%';
+  document.getElementById('parts').style.display='none';
   st('Stitching all frames → '+out+' …');
   try{ const r=await fetch('/stitch?'+params());
        const t=await r.text();
@@ -767,6 +779,12 @@ stitchBtn.onclick=async()=>{
     try{
       const p=await (await fetch('/progress')).json();
       pb.value=p.percent; pct.textContent=p.percent+'%';
+      const pe=document.getElementById('parts');
+      if(p.parts && p.parts.length){
+        pe.style.display='block';
+        pe.innerHTML=p.parts.map((x,i)=>'process '+i+': '+x.done+'/'+x.total+' ('+x.pct+'%) '
+          +'<progress max="100" value="'+x.pct+'" style="width:160px;vertical-align:middle"></progress>').join('<br>');
+      }
       if(p.done){
         clearInterval(polling); polling=null;
         stitchBtn.disabled=false;
@@ -856,11 +874,25 @@ static void openBrowser(const string &url)
 #endif
 }
 
+// Read a child's "pct done total" progress file (best-effort; false if not ready).
+static bool readProg(const string &path, int &pct, int &done, int &total)
+{
+    ifstream f(path);
+    return (bool)(f >> pct >> done >> total);
+}
+
+// Forward decl: the tuner routes video renders through the parallel path too.
+static int runParallelJobs(const string &source, const string &calibDir,
+                           double degrees, int seamArg, const Align &a,
+                           const string &cropArg, int startFrame, int endFrame,
+                           const string &outFile, int jobs, std::atomic<int> *prog = nullptr);
+
 static void runTuneServer(const Mat &KL, const vector<double> &DL,
                           const Mat &KR, const vector<double> &DR, const Mat &R,
                           double degrees, int startFrame, int endFrame,
                           const string &outDir, const string &initSource,
-                          const string &initOutFile, int port)
+                          const string &initOutFile, int port,
+                          const string &calibDir, int jobs)
 {
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -1001,23 +1033,40 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                 // Optional crop (full-canvas coords): restrict all work to this region.
                 int cw = query.find("cropw=") != string::npos ? stoi(qparam(query, "cropw")) : 0;
                 int chh = query.find("croph=") != string::npos ? stoi(qparam(query, "croph")) : 0;
+                int cx = query.find("cropx=") != string::npos ? stoi(qparam(query, "cropx")) : 0;
+                int cy = query.find("cropy=") != string::npos ? stoi(qparam(query, "cropy")) : 0;
+                // Crop rect as a --crop string (parallel children re-apply it themselves).
+                string cropStr = (cw > 0 && chh > 0)
+                    ? (to_string(cx) + "," + to_string(cy) + "," + to_string(cw) + "," + to_string(chh)) : "";
                 if (cw > 0 && chh > 0)
                 {
-                    int cx = query.find("cropx=") != string::npos ? stoi(qparam(query, "cropx")) : 0;
-                    int cy = query.find("cropy=") != string::npos ? stoi(qparam(query, "cropy")) : 0;
                     mm = cropMaps(mm, cx, cy, cw, chh);
                     cout << "[stitch] crop " << cw << "x" << chh << " @ (" << cx << "," << cy << ")\n";
                 }
                 g_busy = true; g_done = false; g_percent = 0;
                 { lock_guard<mutex> lk(g_mu); g_result.clear(); }
+                { lock_guard<mutex> lk(g_partMu); g_partPct.clear(); g_partDone.clear(); g_partTotal.clear(); }
                 cout << "[stitch] top=" << a.shiftTop << " bottom=" << a.shiftBottom
                      << " y=" << a.shiftY << " seam=" << mm.seam << " -> " << outFile << " ...\n";
                 int tf = totalFrames;
                 string src = source, of = outFile; bool vid = video;
-                std::thread([mm, a, src, vid, degrees, startFrame, endFrame, tf, outDir, of]() mutable {
-                    string res = vid
-                        ? stitchVideoFile(src, mm, degrees, a, startFrame, endFrame, tf, outDir, of, &g_percent)
-                        : stitchImageFile(src, mm, degrees, a, outDir, of);
+                int seamVal = ss.empty() ? -1 : stoi(ss);
+                int endRes = endFrame >= 0 ? endFrame : (tf > 0 ? tf - 1 : -1);
+                string calib = calibDir;
+                std::thread([mm, a, src, vid, degrees, startFrame, endFrame, endRes, tf,
+                             outDir, of, seamVal, cropStr, calib, jobs]() mutable {
+                    string res;
+                    if (vid && jobs > 1 && endRes >= startFrame)   // parallel video render
+                    {
+                        string fo = of.empty() ? (outDir + "/stitched_video.mp4") : of;
+                        int rc = runParallelJobs(src, calib, degrees, seamVal, a, cropStr,
+                                                 startFrame, endRes, fo, jobs, &g_percent);
+                        res = rc == 0 ? fo : string("ERROR: parallel stitch failed (see console)");
+                    }
+                    else                                           // single-process (image, or --no-jobs)
+                        res = vid
+                            ? stitchVideoFile(src, mm, degrees, a, startFrame, endFrame, tf, outDir, of, &g_percent)
+                            : stitchImageFile(src, mm, degrees, a, outDir, of);
                     { lock_guard<mutex> lk(g_mu); g_result = res; }
                     g_percent = 100; g_done = true; g_busy = false;
                     cout << "[stitch] done -> " << res << "\n";
@@ -1065,7 +1114,14 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
             j << "{\"busy\":" << (g_busy ? "true" : "false")
               << ",\"done\":" << (g_done ? "true" : "false")
               << ",\"percent\":" << g_percent.load()
-              << ",\"result\":\"" << jsonEscape(res) << "\"}";
+              << ",\"result\":\"" << jsonEscape(res) << "\",\"parts\":[";
+            {
+                lock_guard<mutex> lk(g_partMu);
+                for (size_t i = 0; i < g_partPct.size(); i++)
+                    j << (i ? "," : "") << "{\"pct\":" << g_partPct[i]
+                      << ",\"done\":" << g_partDone[i] << ",\"total\":" << g_partTotal[i] << "}";
+            }
+            j << "]}";
             body = j.str();
         }
         else if (path == "/quit")
@@ -1203,7 +1259,7 @@ static int runShell(string cmd)
 static int runParallelJobs(const string &source, const string &calibDir,
                            double degrees, int seamArg, const Align &a,
                            const string &cropArg, int startFrame, int endFrame,
-                           const string &outFile, int jobs)
+                           const string &outFile, int jobs, std::atomic<int> *prog)
 {
     auto q = [](const string &s) { return "\"" + s + "\""; };   // quote for the shell
 
@@ -1219,7 +1275,7 @@ static int runParallelJobs(const string &source, const string &calibDir,
     string ext = op.extension().empty() ? ".mp4" : op.extension().string();
     fs::path dir = op.parent_path();
 
-    vector<string> parts, logs, cmds;
+    vector<string> parts, logs, progs, cmds;
     vector<int> rangeS, rangeE;
     for (int i = 0; i < jobs; i++)
     {
@@ -1228,8 +1284,10 @@ static int runParallelJobs(const string &source, const string &calibDir,
         int e = min(s + per - 1, endFrame);
         string part = (dir / (stem + ".part" + to_string(i) + ext)).string();
         string log = (dir / (stem + ".part" + to_string(i) + ".log")).string();
+        string prg = (dir / (stem + ".part" + to_string(i) + ".prog")).string();
         parts.push_back(part);
         logs.push_back(log);
+        progs.push_back(prg);
         rangeS.push_back(s);
         rangeE.push_back(e);
         cmds.push_back(
@@ -1240,6 +1298,7 @@ static int runParallelJobs(const string &source, const string &calibDir,
             + (a.exposure ? "" : " --no-exposure") + (a.smartSeam ? "" : " --no-smart-seam")
             + (cropArg.empty() ? "" : " --crop " + q(cropArg))
             + " --jobs 1 --start " + to_string(s) + " --end " + to_string(e)
+            + " --progress-file " + q(prg)
             + " --out-file " + q(part) + " > " + q(log) + " 2>&1");
     }
 
@@ -1249,13 +1308,45 @@ static int runParallelJobs(const string &source, const string &calibDir,
     for (int i = 0; i < n; i++)
         cout << "  part " << i << ": frames " << rangeS[i] << ".." << rangeE[i]
              << "   (progress -> " << logs[i] << ")\n";
-    cout << "Working... (tail a .log to watch a part)\n";
+    cout << "Working... (per-process progress below; also in each .log)\n";
+
+    { lock_guard<mutex> lk(g_partMu); g_partPct.assign(n, 0); g_partDone.assign(n, 0); g_partTotal.assign(n, 0); }
+
+    // Monitor: poll each child's .prog file, update shared per-part state (for the tuner
+    // UI + the overall prog bar), and print a live per-process line to the console.
+    std::atomic<bool> running{true};
+    std::thread mon([&]() {
+        while (running.load())
+        {
+            int sum = 0;
+            {
+                lock_guard<mutex> lk(g_partMu);
+                for (int i = 0; i < n; i++)
+                {
+                    int p = 0, d = 0, t = 0;
+                    if (readProg(progs[i], p, d, t)) { g_partPct[i] = p; g_partDone[i] = d; g_partTotal[i] = t; }
+                    sum += g_partPct[i];
+                }
+            }
+            if (prog) prog->store(n ? sum / n : 0);
+            {
+                ostringstream ln; ln << "\rjobs:";
+                lock_guard<mutex> lk(g_partMu);
+                for (int i = 0; i < n; i++) ln << "  p" << i << " " << g_partPct[i] << "%";
+                cout << ln.str() << std::flush;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    });
 
     vector<std::thread> ts;
     vector<int> rc(n, -1);
     for (int i = 0; i < n; i++)
         ts.emplace_back([&cmds, &rc, i]() { rc[i] = runShell(cmds[i]); });
     for (auto &t : ts) t.join();
+    running = false; mon.join();
+    { lock_guard<mutex> lk(g_partMu); for (int i = 0; i < n; i++) g_partPct[i] = 100; }
+    cout << "\n";
 
     bool ok = true;
     for (int i = 0; i < n; i++)
@@ -1280,6 +1371,7 @@ static int runParallelJobs(const string &source, const string &calibDir,
     std::error_code ec;
     for (const auto &p : parts) fs::remove(p, ec);
     for (const auto &l : logs) fs::remove(l, ec);
+    for (const auto &pg : progs) fs::remove(pg, ec);
     fs::remove(listPath, ec);
     cout << "jobs: done -> " << outFile << "\n";
     return 0;
@@ -1308,6 +1400,7 @@ int main(int argc, char **argv)
     int jobs = stoi(argVal(argc, argv, "--jobs", "4"));    // parallel child processes (video); default 4
     if (hasArg(argc, argv, "--no-jobs")) jobs = 1;         // force everything into this one process
     string cropArg = argVal(argc, argv, "--crop", "");     // read early; child processes need it too
+    string progFile = argVal(argc, argv, "--progress-file", "");  // a child writes its progress here (parallel)
 
     // Ensure the output destination exists (batch, or a preset --out-file).
     if (!outFile.empty()) { fs::path p(outFile); if (p.has_parent_path()) fs::create_directories(p.parent_path()); }
@@ -1328,7 +1421,7 @@ int main(int argc, char **argv)
     // so `source` may be empty here (empty page until the user imports).
     if (source.empty() || tune)
     {
-        runTuneServer(KL, DL, KR, DR, R, degrees, startFrame, endFrame, outDir, source, outFile, port);
+        runTuneServer(KL, DL, KR, DR, R, degrees, startFrame, endFrame, outDir, source, outFile, port, calibDir, jobs);
         return 0;
     }
 
@@ -1382,7 +1475,7 @@ int main(int argc, char **argv)
         }
     }
 
-    string result = video ? stitchVideoFile(source, m, degrees, a, startFrame, endFrame, totalFrames, outDir, outFile)
+    string result = video ? stitchVideoFile(source, m, degrees, a, startFrame, endFrame, totalFrames, outDir, outFile, nullptr, progFile)
                           : stitchImageFile(source, m, degrees, a, outDir, outFile);
     cout << (video ? "video -> " : "image -> ") << result << "\n";
     return 0;
