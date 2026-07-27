@@ -118,6 +118,9 @@ static string g_result;
 // Per-process progress for a parallel (--jobs) render, surfaced to the tuner UI.
 static std::mutex g_partMu;
 static vector<int> g_partPct, g_partDone, g_partTotal;
+// The exact equivalent CLI command for the last/active stitch (shown in the tuner UI
+// and console) so you can reproduce a tuned render manually.
+static string g_cmd;
 
 static void loadIntrinsics(const string &path, Mat &K, vector<double> &D)
 {
@@ -457,11 +460,21 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
     return pano;
 }
 
-// POS_FRAMES seeking is unreliable on un-indexed MJPEG-MKV, so step sequentially:
-// grab n frames (0..n-1) so the NEXT read() returns frame n.
+// Seek to frame n. Tries an indexed jump first (instant, on a properly-indexed file
+// like a remuxed MKV) and only falls back to sequential grab for un-indexed files.
+// This is what makes --jobs actually parallel: each child jumps straight to its chunk
+// instead of grab-skipping from frame 0. Un-indexed input -> slow grab (remux to fix).
 static bool seekFrame(VideoCapture &cap, int n)
 {
-    for (int i = 0; i < n; i++)
+    if (n <= 0) return true;
+    cap.set(CAP_PROP_POS_FRAMES, (double)n);          // attempt indexed seek
+    int pos = (int)cap.get(CAP_PROP_POS_FRAMES);
+    if (pos == n) { cout << "  seek: indexed jump to frame " << n << " (fast)\n"; return true; }
+    if (pos < 0 || pos > n) { cap.set(CAP_PROP_POS_FRAMES, 0.0); pos = 0; }  // bogus -> restart
+    if (pos == 0)
+        cout << "  seek: no index - grab-skipping " << n
+             << " frames (SLOW; remux the file to add an index for fast parallel seeks)\n";
+    for (int i = pos; i < n; i++)                     // grab the remainder (or all, from 0)
         if (!cap.grab()) return false;
     return true;
 }
@@ -606,6 +619,10 @@ static string tunerHtml()
   <button id="finish" style="display:none;margin-left:12px">Finish &amp; stop</button>
 </div>
 <div id="parts" style="padding:0 10px 10px;display:none;font-size:.9em;line-height:1.7"></div>
+<div id="cmdwrap" style="display:none;padding:0 10px 10px">
+  <div style="font-size:.8em;color:#9cf;margin-bottom:4px">Equivalent CLI command (click to select, then copy):</div>
+  <textarea id="cmdbox" readonly onclick="this.select()" style="width:100%;height:64px;font-family:monospace;font-size:.78em;background:#111;color:#dfe;border:1px solid #444;border-radius:6px;padding:6px;box-sizing:border-box"></textarea>
+</div>
 <div id="wrap"><canvas id="c"></canvas></div>
 <script>
 // Dynamic state — filled in by /state (on load) or /import (button).
@@ -779,6 +796,8 @@ stitchBtn.onclick=async()=>{
     try{
       const p=await (await fetch('/progress')).json();
       pb.value=p.percent; pct.textContent=p.percent+'%';
+      if(p.cmd){ document.getElementById('cmdwrap').style.display='block';
+                 document.getElementById('cmdbox').value=p.cmd; }
       const pe=document.getElementById('parts');
       if(p.parts && p.parts.length){
         pe.style.display='block';
@@ -879,6 +898,34 @@ static bool readProg(const string &path, int &pct, int &done, int &total)
 {
     ifstream f(path);
     return (bool)(f >> pct >> done >> total);
+}
+
+static string exePath();   // forward decl (defined below, near main)
+
+// Build the exact, copy-pasteable CLI command that reproduces a stitch with these
+// settings. Shown in the tuner UI + console so a tuned render (shifts, crop, etc.)
+// can be re-run by hand. Only emits non-default flags to keep it readable.
+static string buildCliCommand(const string &source, const string &calibDir,
+                              double degrees, int seamArg, const Align &a,
+                              const string &cropArg, int startFrame, int endFrame,
+                              int jobs, const string &outFile)
+{
+    auto q = [](const string &s) { return "\"" + s + "\""; };
+    string exe = exePath(); if (exe.empty()) exe = "StitchPipeline";
+    string c = q(exe) + " --source " + q(source);
+    if (!calibDir.empty())    c += " --calib-dir " + q(calibDir);
+    if (degrees != 0.0)       c += " --degrees " + to_string(degrees);
+    if (seamArg >= 0)         c += " --seam " + to_string(seamArg);
+    c += " --shift-top " + to_string(a.shiftTop) + " --shift-bottom " + to_string(a.shiftBottom);
+    if (a.shiftY != 0.0)      c += " --shift-y " + to_string(a.shiftY);
+    c += " --bands " + to_string(a.bands);
+    if (!a.exposure)          c += " --no-exposure";
+    if (!a.smartSeam)         c += " --no-smart-seam";
+    if (!cropArg.empty())     c += " --crop " + q(cropArg);
+    if (startFrame > 0)       c += " --start " + to_string(startFrame);
+    if (endFrame >= 0)        c += " --end " + to_string(endFrame);
+    c += " --jobs " + to_string(jobs) + " --out-file " + q(outFile);
+    return c;
 }
 
 // Forward decl: the tuner routes video renders through the parallel path too.
@@ -1053,6 +1100,14 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                 int seamVal = ss.empty() ? -1 : stoi(ss);
                 int endRes = endFrame >= 0 ? endFrame : (tf > 0 ? tf - 1 : -1);
                 string calib = calibDir;
+                // Build + record the exact equivalent CLI command (shown in UI + console).
+                {
+                    string fo = of.empty() ? (outDir + "/stitched_video.mp4") : of;
+                    string cmd = buildCliCommand(src, calib, degrees, seamVal, a, cropStr,
+                                                 startFrame, (vid ? endRes : -1), (vid ? jobs : 1), fo);
+                    { lock_guard<mutex> lk(g_mu); g_cmd = cmd; }
+                    cout << "[stitch] equivalent CLI command:\n  " << cmd << "\n";
+                }
                 std::thread([mm, a, src, vid, degrees, startFrame, endFrame, endRes, tf,
                              outDir, of, seamVal, cropStr, calib, jobs]() mutable {
                     string res;
@@ -1109,11 +1164,12 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
         else if (path == "/progress")
         {
             ctype = "application/json";
-            string res; { lock_guard<mutex> lk(g_mu); res = g_result; }
+            string res, cmd; { lock_guard<mutex> lk(g_mu); res = g_result; cmd = g_cmd; }
             ostringstream j;
             j << "{\"busy\":" << (g_busy ? "true" : "false")
               << ",\"done\":" << (g_done ? "true" : "false")
               << ",\"percent\":" << g_percent.load()
+              << ",\"cmd\":\"" << jsonEscape(cmd) << "\""
               << ",\"result\":\"" << jsonEscape(res) << "\",\"parts\":[";
             {
                 lock_guard<mutex> lk(g_partMu);
@@ -1305,9 +1361,16 @@ static int runParallelJobs(const string &source, const string &calibDir,
     int n = (int)cmds.size();
     cout << "jobs: splitting frames " << startFrame << ".." << endFrame
          << " across " << n << " parallel process(es)\n";
+    // Top-level equivalent command (what you'd run by hand to reproduce this):
+    cout << "jobs: equivalent single command:\n  "
+         << buildCliCommand(source, calibDir, degrees, seamArg, a, cropArg,
+                            startFrame, endFrame, jobs, outFile) << "\n";
     for (int i = 0; i < n; i++)
+    {
         cout << "  part " << i << ": frames " << rangeS[i] << ".." << rangeE[i]
              << "   (progress -> " << logs[i] << ")\n";
+        cout << "    cmd: " << cmds[i] << "\n";   // the exact child command spawned
+    }
     cout << "Working... (per-process progress below; also in each .log)\n";
 
     { lock_guard<mutex> lk(g_partMu); g_partPct.assign(n, 0); g_partDone.assign(n, 0); g_partTotal.assign(n, 0); }
