@@ -142,7 +142,7 @@ df -h /mnt/video
 Instead of the manual mount + rsync above, you can have the Orin **auto‑mount the SSD and copy everything the moment you plug it in**. Files live in [`field-offload/`](field-offload/): a udev rule fires on the labeled drive → a systemd service → a script that mounts, `rsync`s all of `/mnt/video`, and unmounts.
 
 - **Copy only** — it never deletes from the Orin (the golden rule holds; delete stays manual after you verify).
-- **Only your drive triggers it** — it matches the SSD's exFAT **label**, so a random USB stick does nothing.
+- **Only *this* drive triggers it** — it matches the SSD's filesystem **UUID** (`5E64-018F`), unique to this drive. (Not the label: this SanDisk's label `Extreme SSD` is the factory default shared by every Extreme.) A random USB stick — even another SanDisk Extreme — does nothing.
 - **Incremental** — re‑plugging only copies new takes.
 
 **Install (once, on the Orin):**
@@ -151,13 +151,7 @@ Instead of the manual mount + rsync above, you can have the Orin **auto‑mount 
 sudo ~/orin-recorder/field-offload/install.sh
 ```
 
-**Label your SSD to match the rule** (default label `ORINDUMP`; drive must be unmounted):
-
-```bash
-sudo exfatlabel /dev/sda1 ORINDUMP
-```
-
-(Check the current label with `lsblk -f`. To use a different label, edit it in both `orin-offload.sh` and `99-orin-offload.rules`, or re‑run `install.sh` after editing.)
+No labeling needed — it's keyed to the UUID. Confirm the UUID still matches with `lsblk -f`. If you ever **reformat or replace** the SSD, its UUID changes: update it in both `orin-offload.sh` and `99-orin-offload.rules`, then re‑run `install.sh`.
 
 **Use it:** just plug the SSD in. Watch progress and see when it's safe to unplug:
 

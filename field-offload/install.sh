@@ -24,8 +24,9 @@ install -m 0644 "$HERE/99-orin-offload.rules" /etc/udev/rules.d/99-orin-offload.
 udevadm control --reload
 
 echo
-echo "Done. Make sure your SSD's exFAT label matches the one in the rule/script"
-echo "(default: ORINDUMP). Check with:  lsblk -f"
-echo "Set it (drive unmounted) with:    sudo exfatlabel /dev/sda1 ORINDUMP"
+echo "Matched by this drive's filesystem UUID (5E64-018F) - unique to it."
+echo "Confirm it still matches:  lsblk -f   (the UUID column for your SSD)."
+echo "If you ever reformat/replace the SSD, update the UUID in BOTH"
+echo "orin-offload.sh and 99-orin-offload.rules, then re-run this installer."
 echo
 echo "Then just plug the SSD in. Watch it:  tail -f /var/log/orin-offload.log"

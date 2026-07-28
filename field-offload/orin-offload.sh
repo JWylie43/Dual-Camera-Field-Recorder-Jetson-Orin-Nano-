@@ -17,7 +17,10 @@
 set -uo pipefail
 
 # ---- config -------------------------------------------------------------
-LABEL="ORINDUMP"            # your SSD's exFAT label (see field-offload/README)
+# Match by filesystem UUID = unique to THIS physical drive (the label
+# "Extreme SSD" is the SanDisk factory default, shared by every Extreme, so it
+# is NOT unique). Find it with `lsblk -f`. Changes only if you reformat.
+UUID="5E64-018F"            # this SSD's exFAT UUID
 SRC="/mnt/video"            # where recordings live
 MNT="/mnt/usb"              # mountpoint (same one the manual workflow uses)
 DEST_SUBDIR="orin-video"    # folder created on the SSD
@@ -25,17 +28,17 @@ LOG="/var/log/orin-offload.log"
 # -------------------------------------------------------------------------
 
 exec >>"$LOG" 2>&1
-echo "==== $(date '+%F %T')  offload triggered (label=$LABEL) ===="
+echo "==== $(date '+%F %T')  offload triggered (uuid=$UUID) ===="
 
-DEV="/dev/disk/by-label/${LABEL}"
+DEV="/dev/disk/by-uuid/${UUID}"
 
-# The by-label symlink can lag the plug event by a moment - wait briefly.
+# The by-uuid symlink can lag the plug event by a moment - wait briefly.
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     [ -e "$DEV" ] && break
     sleep 0.5
 done
 if [ ! -e "$DEV" ]; then
-    echo "no device with label '${LABEL}' appeared; nothing to do."
+    echo "no device with UUID '${UUID}' appeared; nothing to do."
     exit 0
 fi
 
