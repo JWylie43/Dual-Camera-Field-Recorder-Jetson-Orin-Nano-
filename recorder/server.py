@@ -9,10 +9,13 @@ Thermals are always logged to a file alongside each recording (run under sudo).
   START -> stop idle preview, launch `record.py --preview-port <P> --log-thermals ...`
   STOP  -> SIGINT the recorder (clean EOS), then restart idle preview
 
-Manage Files (/files) - only when idle (greyed out while recording): list the
-recordings on /mnt/video, mount/unmount the external SSD, transfer selected
-files to it (background rsync with progress + byte-size verification), and
-delete originals. The /snapshot route is retained (no button) for calibration.
+Manage Files (/files) - reached from a button that greys out while recording. A
+file explorer for BOTH drives (tabs: Orin /mnt/video and the external SSD): browse
+folders, breadcrumb navigation, and a recursive search box. Mount/unmount the SSD,
+transfer selected files to it (background rsync with progress + byte-size
+verification, subfolder layout preserved), and delete files on either drive.
+Transfer/delete are refused while recording; all paths are confined to their
+drive root (no traversal). The /snapshot route is retained (no button).
 
 PREVIEW (on-demand when idle; always-on while recording):
   The camera can only be opened by one process, and the preview pipeline draws
@@ -398,43 +401,44 @@ def _ssd_info():
     return info
 
 
-def _ssd_size(name):
-    p = os.path.join(USB_MNT, USB_SUBDIR, name)
+# Browsable locations: the Orin recordings drive and the external SSD.
+LOCS = {"video": OUTPUT_DIR, "ssd": USB_MNT}
+
+
+def _safe_join(root, rel):
+    """Absolute path for <root>/<rel>, or None if it escapes <root> (traversal)."""
+    rel = (rel or "").strip("/")
+    p = os.path.realpath(os.path.join(root, rel))
+    root_r = os.path.realpath(root)
+    return p if (p == root_r or p.startswith(root_r + os.sep)) else None
+
+
+def _entry(loc, abspath, rel):
+    """One browse entry (file or folder). For the 'video' location, files also
+    carry SSD mirror status: present at /mnt/usb/orin-video/<rel> with matching
+    byte size (that's the verification)."""
+    is_dir = os.path.isdir(abspath)
+    e = {"name": os.path.basename(abspath), "path": rel, "is_dir": is_dir,
+         "size": None, "size_h": "", "on_ssd": None, "match": None}
+    if is_dir:
+        return e
     try:
-        return os.path.getsize(p)
+        e["size"] = os.path.getsize(abspath)
+        e["size_h"] = _human(e["size"])
     except OSError:
-        return None
-
-
-def _list_files():
-    """Every file in /mnt/video, with size and (if mounted) its SSD copy status."""
-    mounted = _ssd_mounted()
-    out = []
-    for path in sorted(glob.glob(os.path.join(OUTPUT_DIR, "*"))):
-        if not os.path.isfile(path):
-            continue
-        name = os.path.basename(path)
-        size = os.path.getsize(path)
-        m = re.match(r"(game_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})", name)
-        entry = {"name": name, "size": size, "size_h": _human(size),
-                 "stem": m.group(1) if m else name}
-        if mounted:
-            ssz = _ssd_size(name)
-            entry["on_ssd"] = ssz is not None
-            entry["match"] = (ssz == size)
+        pass
+    if loc == "video" and _ssd_mounted():
+        dp = os.path.join(USB_MNT, USB_SUBDIR, rel)
+        if os.path.exists(dp):
+            e["on_ssd"] = True
+            try:
+                e["match"] = (os.path.getsize(dp) == e["size"])
+            except OSError:
+                e["match"] = False
         else:
-            entry["on_ssd"] = None
-            entry["match"] = None
-        out.append(entry)
-    return out
-
-
-def _safe_local(name):
-    """Absolute path in OUTPUT_DIR for a basename, or None if it escapes the dir."""
-    if not name or "/" in name or name in (".", ".."):
-        return None
-    p = os.path.realpath(os.path.join(OUTPUT_DIR, name))
-    return p if os.path.dirname(p) == os.path.realpath(OUTPUT_DIR) else None
+            e["on_ssd"] = False
+            e["match"] = False
+    return e
 
 
 def _run_ok(cmd, timeout=None):
@@ -450,10 +454,56 @@ def files_page():
     return FILES_PAGE
 
 
-@app.route("/api/files")
-def api_files():
-    return jsonify(recording=_is_running(), output_dir=OUTPUT_DIR,
-                   ssd=_ssd_info(), files=_list_files())
+@app.route("/api/browse")
+def api_browse():
+    """List a folder within a location, or (with ?q=) recursively search it.
+
+      loc  = video | ssd
+      path = folder relative to that location's root (default: root)
+      q    = optional filter; when set, walks the tree and returns matching files
+    """
+    loc = request.args.get("loc", "video")
+    rel = request.args.get("path", "")
+    q = (request.args.get("q") or "").strip()
+    resp = {"loc": loc, "path": "", "parent": None, "entries": [], "search": bool(q),
+            "truncated": False, "recording": _is_running(), "ssd": _ssd_info(), "error": None}
+    root = LOCS.get(loc)
+    if root is None:
+        resp["error"] = "unknown location"
+        return jsonify(resp)
+    if loc == "ssd" and not _ssd_mounted():
+        resp["error"] = "SSD not mounted."
+        return jsonify(resp)
+    base = _safe_join(root, rel)
+    if base is None or not os.path.isdir(base):
+        resp["error"] = "folder not found"
+        return jsonify(resp)
+    root_r = os.path.realpath(root)
+    cur = "" if base == root_r else os.path.relpath(base, root_r)
+    resp["path"] = cur
+    resp["parent"] = None if cur == "" else os.path.dirname(cur)
+    try:
+        if q:
+            n = 0
+            for dp, dirs, files in os.walk(base):
+                dirs.sort()
+                for fn in sorted(files):
+                    if q.lower() in fn.lower():
+                        fp = os.path.join(dp, fn)
+                        resp["entries"].append(_entry(loc, fp, os.path.relpath(fp, root_r)))
+                        n += 1
+                        if n >= 1000:
+                            resp["truncated"] = True
+                            return jsonify(resp)
+        else:
+            items = [_entry(loc, os.path.join(base, name),
+                            os.path.join(cur, name) if cur else name)
+                     for name in os.listdir(base)]
+            items.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+            resp["entries"] = items
+    except OSError as ex:                            # noqa: BLE001
+        resp["error"] = repr(ex)
+    return jsonify(resp)
 
 
 @app.route("/api/mount", methods=["POST"])
@@ -484,8 +534,11 @@ def api_unmount():
     return jsonify(ok=False, error=f"unmount failed (drive in use?): {out or 'unknown'}")
 
 
-def _transfer_worker(srcs, dest):
-    cmd = ["rsync", "-a", "--info=progress2", "--"] + srcs + [dest + "/"]
+def _transfer_worker(rels, dest):
+    # rsync --relative + the OUTPUT_DIR/./<rel> form recreates any subfolder
+    # layout under dest (e.g. calib/x.jpg lands at <dest>/calib/x.jpg).
+    srcs = [os.path.join(OUTPUT_DIR, ".", r) for r in rels]
+    cmd = ["rsync", "-a", "--relative", "--info=progress2", "--"] + srcs + [dest + "/"]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -500,10 +553,10 @@ def _transfer_worker(srcs, dest):
                     _xfer["percent"] = int(m.group(1))
         proc.wait()
         rc = proc.returncode
-        bad = [os.path.basename(p) for p in srcs
-               if not (os.path.exists(os.path.join(dest, os.path.basename(p)))
-                       and os.path.getsize(os.path.join(dest, os.path.basename(p)))
-                       == os.path.getsize(p))]
+        bad = [r for r in rels
+               if not (os.path.exists(os.path.join(dest, r))
+                       and os.path.getsize(os.path.join(dest, r))
+                       == os.path.getsize(os.path.join(OUTPUT_DIR, r)))]
         with _xfer_lock:
             _xfer["done"] = True
             _xfer["active"] = False
@@ -526,17 +579,21 @@ def api_transfer():
     with _xfer_lock:
         if _xfer["active"]:
             return jsonify(ok=False, error="A transfer is already running."), 409
-    names = (request.get_json(silent=True) or {}).get("names") or []
-    srcs = [p for p in (_safe_local(n) for n in names) if p and os.path.isfile(p)]
-    if not srcs:
+    paths = (request.get_json(silent=True) or {}).get("paths") or []
+    rels = []
+    for rel in paths:
+        p = _safe_join(OUTPUT_DIR, rel)
+        if p and os.path.isfile(p):
+            rels.append((rel or "").strip("/"))
+    if not rels:
         return jsonify(ok=False, error="No valid files selected."), 400
     dest = os.path.join(USB_MNT, USB_SUBDIR)
     os.makedirs(dest, exist_ok=True)
     with _xfer_lock:
         _xfer.update(active=True, percent=0, line="", done=False, ok=None, error=None,
-                     names=[os.path.basename(p) for p in srcs])
-    threading.Thread(target=_transfer_worker, args=(srcs, dest), daemon=True).start()
-    return jsonify(ok=True, count=len(srcs))
+                     names=[os.path.basename(r) for r in rels])
+    threading.Thread(target=_transfer_worker, args=(rels, dest), daemon=True).start()
+    return jsonify(ok=True, count=len(rels))
 
 
 @app.route("/api/transfer_status")
@@ -549,18 +606,23 @@ def api_transfer_status():
 def api_delete():
     if _is_running():
         return jsonify(ok=False, error="Stop recording before deleting."), 409
-    names = (request.get_json(silent=True) or {}).get("names") or []
+    data = request.get_json(silent=True) or {}
+    loc = data.get("loc", "video")
+    paths = data.get("paths") or []
+    root = LOCS.get(loc)
+    if root is None or (loc == "ssd" and not _ssd_mounted()):
+        return jsonify(ok=False, error="bad location"), 400
     deleted, errors = [], []
-    for n in names:
-        p = _safe_local(n)
+    for rel in paths:
+        p = _safe_join(root, rel)
         if p and os.path.isfile(p):
             try:
                 os.remove(p)
-                deleted.append(n)
+                deleted.append(rel)
             except OSError as e:
-                errors.append({"name": n, "error": repr(e)})
+                errors.append({"name": rel, "error": repr(e)})
         else:
-            errors.append({"name": n, "error": "not found"})
+            errors.append({"name": rel, "error": "not found"})
     return jsonify(ok=not errors, deleted=deleted, errors=errors)
 
 
@@ -694,15 +756,18 @@ FILES_PAGE = """<!doctype html>
 <style>
  :root { color-scheme: dark; }
  body { font-family: system-ui, sans-serif; margin:0; background:#111; color:#eee; }
- .wrap { max-width:720px; margin:0 auto; padding:20px; }
+ .wrap { max-width:760px; margin:0 auto; padding:20px; }
  h1 { font-size:1.2rem; }
- a.back { color:#7fb2d9; text-decoration:none; }
+ a.back { color:#7fb2d9; text-decoration:none; font-size:.9rem; }
  .card { padding:14px; border-radius:10px; background:#1b1b1b; margin-bottom:16px; }
  .banner { background:#5a1f1f; color:#ffdede; padding:12px; border-radius:10px; margin-bottom:16px; }
- button { padding:12px 16px; font-size:1rem; font-weight:700; border:0; border-radius:10px;
+ button { padding:10px 14px; font-size:1rem; font-weight:700; border:0; border-radius:10px;
           color:#fff; background:#2a6f9e; margin:4px 4px 4px 0; }
- button.danger { background:#b3271e; } button.go { background:#1f8a3b; }
+ button.danger { background:#b3271e; } button.go { background:#1f8a3b; } button.ghost { background:#333; }
  button:disabled { opacity:.35; }
+ .tab { background:#333; } .tab.active { background:#2a6f9e; }
+ input[type=text] { width:100%; box-sizing:border-box; background:#222; color:#eee;
+                    border:1px solid #444; border-radius:8px; padding:10px; font-size:1rem; }
  table { width:100%; border-collapse:collapse; font-size:.92rem; }
  th,td { padding:6px 8px; border-bottom:1px solid #222; text-align:left; }
  td.sz { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
@@ -710,14 +775,22 @@ FILES_PAGE = """<!doctype html>
  .bar { height:14px; background:#333; border-radius:7px; overflow:hidden; }
  .bar > div { height:100%; width:0; background:#1f8a3b; transition:width .3s; }
  .name { word-break:break-all; }
+ .dir .name { color:#7fb2d9; cursor:pointer; }
+ #crumbs a { color:#7fb2d9; text-decoration:none; } #crumbs { margin-bottom:8px; }
 </style></head><body><div class="wrap">
- <h1>&#128193; Manage Files <a class="back" href="/">&larr; back to recorder</a></h1>
- <div id="recbanner" class="banner" style="display:none">Recording in progress — file
-   management is disabled to protect the recording. Stop recording first.</div>
+ <h1>&#128193; Manage Files &nbsp;<a class="back" href="/">&larr; back to recorder</a></h1>
+ <div id="recbanner" class="banner" style="display:none">Recording in progress — transfer
+   and delete are disabled to protect the recording. You can still browse and mount.</div>
 
  <div class="card">
-   <div id="ssd">…</div>
+   <button class="tab" id="tab-video" onclick="switchLoc('video')">Orin recordings</button>
+   <button class="tab" id="tab-ssd" onclick="switchLoc('ssd')">External SSD</button>
+   <div id="ssd" class="muted" style="margin-top:10px">…</div>
    <div id="ssdbtn" style="margin-top:8px"></div>
+ </div>
+
+ <div class="card">
+   <input type="text" id="search" placeholder="Search this drive (recursive)…" oninput="onSearch()">
  </div>
 
  <div class="card" id="xfercard" style="display:none">
@@ -727,96 +800,152 @@ FILES_PAGE = """<!doctype html>
  </div>
 
  <div class="card">
-   <button class="go" id="btnxfer" onclick="transfer()">&#8681; Transfer selected</button>
-   <button class="danger" id="btndel" onclick="del()">&#128465; Delete selected</button>
-   <button onclick="load()">&#8635; Refresh</button>
+   <button class="go" id="btnxfer" onclick="transfer()">&#8681; Transfer &rarr; SSD</button>
+   <button class="danger" id="btndel" onclick="del()">&#128465; Delete</button>
+   <button class="ghost" onclick="load()">&#8635; Refresh</button>
    <div class="muted" id="selnote" style="margin-top:8px"></div>
  </div>
 
  <div class="card">
+   <div id="crumbs"></div>
    <table>
      <thead><tr>
        <th><input type="checkbox" id="all" onchange="toggleAll()"></th>
-       <th>File</th><th class="sz">Size</th><th>On SSD</th>
+       <th>Name</th><th class="sz">Size</th><th id="hssd">On SSD</th>
      </tr></thead>
      <tbody id="rows"></tbody>
    </table>
+   <div id="note" class="muted" style="margin-top:8px"></div>
  </div>
 </div>
 <script>
 const $ = id => document.getElementById(id);
 const post = (u,b) => fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},
                               body:JSON.stringify(b||{})}).then(r=>r.json());
-let mounted=false, recording=false;
+const esc = s => (''+s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
-function selected(){ return [...document.querySelectorAll('.sel:checked')].map(c=>c.dataset.name); }
+let state = {loc:'video', path:'', q:'', parent:null};
+let mounted=false, recording=false, xferActive=false;
+
+function selected(){ return [...document.querySelectorAll('.sel:checked')].map(c=>c.dataset.path); }
 function toggleAll(){ document.querySelectorAll('.sel').forEach(c=>c.checked=$('all').checked); updateSel(); }
 function updateSel(){
   const n=selected().length;
-  $('selnote').textContent = n? (n+' selected') : 'Select files above, then Transfer or Delete.';
-  $('btnxfer').disabled = recording || !mounted || !n;
+  $('selnote').textContent = n ? (n+' selected')
+    : 'Tap a folder to open it. Tick files, then Transfer or Delete.';
+  $('btnxfer').disabled = recording || !mounted || state.loc!=='video' || !n;
   $('btndel').disabled  = recording || !n;
 }
-
 function ssdCell(f){
-  if(!mounted) return '<span class="muted">—</span>';
+  if(state.loc!=='video' || !mounted) return '';
   if(f.match) return '<span class="ok">&#10003; verified</span>';
   if(f.on_ssd) return '<span class="warn">&#9888; size differs</span>';
   return '<span class="muted">not copied</span>';
 }
+function crumbs(){
+  const rootLabel = state.loc==='ssd' ? 'SSD' : 'Recordings';
+  let html = '<a href="#" data-crumb="">'+rootLabel+'</a>', acc='';
+  if(state.path) state.path.split('/').forEach(seg => {
+    acc = acc ? acc+'/'+seg : seg;
+    html += ' / <a href="#" data-crumb="'+esc(acc)+'">'+esc(seg)+'</a>';
+  });
+  return html;
+}
 
 async function load(){
-  const s = await (await fetch('/api/files')).json();
-  recording = s.recording; mounted = s.ssd.mounted;
+  const u = '/api/browse?loc='+encodeURIComponent(state.loc)
+          + '&path='+encodeURIComponent(state.path)
+          + '&q='+encodeURIComponent(state.q);
+  const s = await (await fetch(u)).json();
+  recording = s.recording; mounted = s.ssd.mounted; state.parent = s.parent;
   $('recbanner').style.display = recording ? 'block' : 'none';
+  $('tab-video').className = 'tab' + (state.loc==='video'?' active':'');
+  $('tab-ssd').className   = 'tab' + (state.loc==='ssd'?' active':'');
+  $('hssd').textContent = state.loc==='video' ? 'On SSD' : '';
 
-  // SSD status + mount/unmount button
+  // SSD status + mount/unmount
   let html, btn='';
   if(!s.ssd.present){ html='No SSD detected — plug it in, then Refresh.'; }
   else if(!s.ssd.mounted){ html='SSD detected, not mounted.';
     btn='<button class="go" onclick="mount()">Mount SSD</button>'; }
-  else { html='Mounted at '+s.ssd.mountpoint+' — free '+s.ssd.free+' of '+s.ssd.total
-             +' &nbsp;(copies go to '+s.ssd.mountpoint+'/'+s.ssd.subdir+'/)';
+  else { html='SSD mounted at '+s.ssd.mountpoint+' — free '+s.ssd.free+' of '+s.ssd.total
+             +' (transfers land in '+s.ssd.subdir+'/)';
     btn='<button onclick="unmount()">Unmount SSD</button>'; }
-  $('ssd').innerHTML = html; $('ssdbtn').innerHTML = recording ? '' : btn;
+  $('ssd').innerHTML = html; $('ssdbtn').innerHTML = btn;
 
-  // file rows
-  $('rows').innerHTML = s.files.length ? s.files.map(f =>
-    '<tr><td><input type="checkbox" class="sel" data-name="'+f.name+'" onchange="updateSel()"></td>'+
-    '<td class="name">'+f.name+'</td><td class="sz">'+f.size_h+'</td><td>'+ssdCell(f)+'</td></tr>'
-  ).join('') : '<tr><td colspan="4" class="muted">No files in '+s.output_dir+'.</td></tr>';
+  // breadcrumb (hidden while searching)
+  $('crumbs').innerHTML = (s.search || s.error) ? '' : crumbs();
+
+  // rows
+  if(s.error){
+    $('rows').innerHTML = '<tr><td colspan="4" class="muted">'+esc(s.error)+'</td></tr>';
+  } else if(!s.entries.length){
+    $('rows').innerHTML = '<tr><td colspan="4" class="muted">'
+      + (s.search?'No matches.':'Empty folder.')+'</td></tr>';
+  } else {
+    const up = (!s.search && state.parent!==null)
+      ? '<tr class="dir" data-goto="'+esc(state.parent)+'"><td></td>'
+        +'<td class="name">&#128193; ..</td><td></td><td></td></tr>' : '';
+    $('rows').innerHTML = up + s.entries.map(f => {
+      if(f.is_dir) return '<tr class="dir" data-goto="'+esc(f.path)+'"><td></td>'
+        + '<td class="name">&#128193; '+esc(f.name)+'</td><td></td><td></td></tr>';
+      const label = s.search ? f.path : f.name;
+      return '<tr><td><input type="checkbox" class="sel" data-path="'+esc(f.path)+'"></td>'
+        + '<td class="name">'+esc(label)+'</td><td class="sz">'+f.size_h+'</td>'
+        + '<td>'+ssdCell(f)+'</td></tr>';
+    }).join('');
+  }
+  $('note').textContent = s.truncated ? 'Showing first 1000 matches — narrow your search.' : '';
   $('all').checked=false;
   updateSel();
 }
+
+// folder navigation + crumb clicks via delegation (handles any filename safely)
+$('rows').addEventListener('click', e => {
+  const tr = e.target.closest('tr.dir'); if(!tr) return;
+  state.path = tr.dataset.goto; state.q=''; $('search').value=''; load();
+});
+$('rows').addEventListener('change', e => { if(e.target.classList.contains('sel')) updateSel(); });
+$('crumbs').addEventListener('click', e => {
+  const a = e.target.closest('a[data-crumb]'); if(!a) return;
+  e.preventDefault(); state.path = a.dataset.crumb; state.q=''; $('search').value=''; load();
+});
+
+function switchLoc(loc){ state.loc=loc; state.path=''; state.q=''; $('search').value=''; load(); }
+let searchTimer;
+function onSearch(){ clearTimeout(searchTimer);
+  searchTimer=setTimeout(()=>{ state.q=$('search').value.trim(); load(); }, 300); }
 
 async function mount(){ const r=await post('/api/mount'); if(!r.ok) alert(r.error||'mount failed'); load(); }
 async function unmount(){ const r=await post('/api/unmount'); if(!r.ok) alert(r.error||'unmount failed'); load(); }
 
 async function transfer(){
-  const names = selected(); if(!names.length) return;
-  const r = await post('/api/transfer', {names});
+  const paths = selected(); if(!paths.length) return;
+  const r = await post('/api/transfer', {paths});
   if(!r.ok){ alert(r.error||'transfer failed'); return; }
-  $('xfercard').style.display='block'; $('btnxfer').disabled=true; $('btndel').disabled=true;
+  xferActive=true; $('xfercard').style.display='block';
+  $('btnxfer').disabled=true; $('btndel').disabled=true;
   const t = setInterval(async () => {
     const s = await (await fetch('/api/transfer_status')).json();
     $('xferpct').textContent = s.percent+'%'; $('xferbar').style.width = s.percent+'%';
     $('xferline').textContent = s.line||'';
-    if(s.done){ clearInterval(t); $('xfercard').style.display='none';
+    if(s.done){ clearInterval(t); xferActive=false; $('xfercard').style.display='none';
       if(!s.ok) alert('Transfer error: '+(s.error||'unknown')); load(); }
   }, 1000);
 }
 
 async function del(){
-  const names = selected(); if(!names.length) return;
-  if(!confirm('Delete '+names.length+' file(s) from the Orin? This cannot be undone.\\n\\n'
-              +'(Verify the SSD copies first — deletes are permanent.)')) return;
-  const r = await post('/api/delete', {names});
+  const paths = selected(); if(!paths.length) return;
+  const where = state.loc==='ssd' ? 'the SSD' : 'the Orin';
+  if(!confirm('Delete '+paths.length+' file(s) from '+where+'? This cannot be undone.\\n\\n'
+              +'(Verify copies first — deletes are permanent.)')) return;
+  const r = await post('/api/delete', {loc: state.loc, paths});
   if(!r.ok) alert('Some files could not be deleted:\\n'+JSON.stringify(r.errors,null,1));
   load();
 }
 
 load();
-setInterval(() => { if($('xfercard').style.display==='none') load(); }, 5000);
+setInterval(() => { if(!xferActive && !state.q && !selected().length) load(); }, 5000);
 </script></body></html>"""
 
 
