@@ -404,6 +404,14 @@ def _ssd_info():
 # Browsable locations: the Orin recordings drive and the external SSD.
 LOCS = {"video": OUTPUT_DIR, "ssd": USB_MNT}
 
+# OS-generated junk that Windows/macOS drop on removable drives (not part of
+# exFAT). Hidden by default in the explorer; a "Show hidden" toggle reveals them.
+_HIDDEN_NAMES = {"$RECYCLE.BIN", "System Volume Information", "lost+found", "found.000"}
+
+
+def _is_hidden(name):
+    return name.startswith(".") or name in _HIDDEN_NAMES
+
 
 def _safe_join(root, rel):
     """Absolute path for <root>/<rel>, or None if it escapes <root> (traversal)."""
@@ -465,6 +473,7 @@ def api_browse():
     loc = request.args.get("loc", "video")
     rel = request.args.get("path", "")
     q = (request.args.get("q") or "").strip()
+    show_hidden = request.args.get("hidden") == "1"
     resp = {"loc": loc, "path": "", "parent": None, "entries": [], "search": bool(q),
             "truncated": False, "recording": _is_running(), "ssd": _ssd_info(), "error": None}
     root = LOCS.get(loc)
@@ -486,8 +495,12 @@ def api_browse():
         if q:
             n = 0
             for dp, dirs, files in os.walk(base):
+                if not show_hidden:
+                    dirs[:] = [d for d in dirs if not _is_hidden(d)]  # prune hidden trees
                 dirs.sort()
                 for fn in sorted(files):
+                    if not show_hidden and _is_hidden(fn):
+                        continue
                     if q.lower() in fn.lower():
                         fp = os.path.join(dp, fn)
                         resp["entries"].append(_entry(loc, fp, os.path.relpath(fp, root_r)))
@@ -496,9 +509,10 @@ def api_browse():
                             resp["truncated"] = True
                             return jsonify(resp)
         else:
+            names = [n for n in os.listdir(base) if show_hidden or not _is_hidden(n)]
             items = [_entry(loc, os.path.join(base, name),
                             os.path.join(cur, name) if cur else name)
-                     for name in os.listdir(base)]
+                     for name in names]
             items.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
             resp["entries"] = items
     except OSError as ex:                            # noqa: BLE001
@@ -791,6 +805,9 @@ FILES_PAGE = """<!doctype html>
 
  <div class="card">
    <input type="text" id="search" placeholder="Search this drive (recursive)…" oninput="onSearch()">
+   <label class="muted" style="display:block; margin-top:10px">
+     <input type="checkbox" id="hidden" onchange="load()"> Show hidden / system files
+     (<span class="muted">$RECYCLE.BIN, .Spotlight-V100, …</span>)</label>
  </div>
 
  <div class="card" id="xfercard" style="display:none">
@@ -855,7 +872,8 @@ function crumbs(){
 async function load(){
   const u = '/api/browse?loc='+encodeURIComponent(state.loc)
           + '&path='+encodeURIComponent(state.path)
-          + '&q='+encodeURIComponent(state.q);
+          + '&q='+encodeURIComponent(state.q)
+          + '&hidden='+($('hidden').checked?'1':'0');
   const s = await (await fetch(u)).json();
   recording = s.recording; mounted = s.ssd.mounted; state.parent = s.parent;
   $('recbanner').style.display = recording ? 'block' : 'none';
