@@ -2,11 +2,20 @@
 """
 server.py - Web control panel for record.py (Jetson Orin Nano camera rig)
 
-Mobile-friendly LAN page: live camera preview, Start/Stop, status, live thermal
-readout, calibration snapshots, and an optional thermal-log toggle. Drives record.py.
+Mobile-friendly LAN page: live camera preview, Start/Stop, status, an audio
+toggle, a live thermal readout, and a "Manage Files" page. Drives record.py.
+Thermals are always logged to a file alongside each recording (run under sudo).
 
-  START -> stop idle preview, launch `record.py --preview-port <P> ...`
+  START -> stop idle preview, launch `record.py --preview-port <P> --log-thermals ...`
   STOP  -> SIGINT the recorder (clean EOS), then restart idle preview
+
+Manage Files (/files) - reached from a button that greys out while recording. A
+file explorer for BOTH drives (tabs: Orin /mnt/video and the external SSD): browse
+folders, breadcrumb navigation, and a recursive search box. Mount/unmount the SSD,
+transfer selected files to it (background rsync with progress + byte-size
+verification, subfolder layout preserved), and delete files on either drive.
+Transfer/delete are refused while recording; all paths are confined to their
+drive root (no traversal). The /snapshot route is retained (no button).
 
 PREVIEW (on-demand when idle; always-on while recording):
   The camera can only be opened by one process, and the preview pipeline draws
@@ -32,8 +41,10 @@ Run:
     # browse from your phone to http://<orin-ip>:8080   (hostname -I)
 """
 
+import datetime
 import glob
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -53,11 +64,21 @@ PREVIEW_W, PREVIEW_H = 1280, 400
 SETTLE = 0.6                  # seconds to let the camera/port free during a swap
 CALIB_DIR = os.path.join(OUTPUT_DIR, "calib")  # calibration snapshots land here
 
+# External SSD for field offload (keep UUID in sync with field-offload/).
+SSD_UUID = "5E64-018F"        # this drive's exFAT UUID (lsblk -f)
+USB_MNT = "/mnt/usb"          # where we mount it
+USB_SUBDIR = "orin-video"     # folder recordings are copied into on the SSD
+
 app = Flask(__name__)
 
 _lock = threading.Lock()
 _state = {"proc": None, "started": None, "preview": None, "suspended": False,
           "rec_preview": True}   # whether the active recording built a preview tee
+
+# Background file-transfer job (rsync /mnt/video -> SSD). One at a time.
+_xfer = {"active": False, "percent": 0, "line": "", "done": False,
+         "ok": None, "error": None, "warning": None, "names": []}
+_xfer_lock = threading.Lock()
 
 
 def _is_running():
@@ -193,6 +214,7 @@ def status():
                    file=_newest_recording() if running else None,
                    elapsed=elapsed,
                    preview=preview,
+                   storage=_storage_info(),
                    server_root=(getattr(os, "geteuid", lambda: 1)() == 0))
 
 
@@ -251,13 +273,15 @@ def start():
     want_preview = bool(data.get("preview", True))   # live preview tee during recording
     _sync_preview()                              # free the camera + preview port
     time.sleep(SETTLE)
-    cmd = ["python3", RECORD_SCRIPT, "--output-dir", OUTPUT_DIR]
+    # Thermals are always logged to a file next to the video (server runs under
+    # sudo); quality uses record.py's default (no flag).
+    cmd = ["python3", RECORD_SCRIPT, "--output-dir", OUTPUT_DIR, "--log-thermals"]
     if want_preview:                             # omit -> record with no preview tee
         cmd += ["--preview-port", str(PREVIEW_TCP)]
-    if data.get("log_thermals"):
-        cmd.append("--log-thermals")
-    if data.get("quality"):
-        cmd += ["--quality", str(int(data["quality"]))]
+    # Audio is ON by default in record.py (auto-detected USB mic, hot-plug,
+    # written as a separate WAV + sync sidecar). The checkbox only DISABLES it.
+    if data.get("audio") is False:
+        cmd.append("--no-audio")
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with _lock:
@@ -341,6 +365,315 @@ def snapshot():
     return jsonify(ok=True, file=os.path.basename(saved), count=count)
 
 
+# --------------------------------------------------------------------------
+# File management: list /mnt/video, mount/unmount the SSD, transfer + verify,
+# delete. All run as root (the server runs under sudo). Transfer runs in a
+# background thread with progress; everything else is quick and synchronous.
+# --------------------------------------------------------------------------
+def _ssd_dev():
+    return f"/dev/disk/by-uuid/{SSD_UUID}"
+
+
+def _ssd_present():
+    return os.path.exists(_ssd_dev())
+
+
+def _ssd_mounted():
+    return os.path.ismount(USB_MNT)
+
+
+def _human(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{int(n)} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def _ssd_info():
+    info = {"uuid": SSD_UUID, "present": _ssd_present(), "mounted": _ssd_mounted(),
+            "mountpoint": USB_MNT, "subdir": USB_SUBDIR, "free": None, "total": None}
+    if info["mounted"]:
+        try:
+            st = os.statvfs(USB_MNT)
+            info["total"] = _human(st.f_blocks * st.f_frsize)
+            info["free"] = _human(st.f_bavail * st.f_frsize)
+        except OSError:
+            pass
+    return info
+
+
+# Browsable locations: the Orin recordings drive and the external SSD.
+LOCS = {"video": OUTPUT_DIR, "ssd": USB_MNT}
+
+# OS-generated junk that Windows/macOS drop on removable drives (not part of
+# exFAT). Hidden by default in the explorer; a "Show hidden" toggle reveals them.
+_HIDDEN_NAMES = {"$RECYCLE.BIN", "System Volume Information", "lost+found", "found.000"}
+
+
+def _is_hidden(name):
+    return name.startswith(".") or name in _HIDDEN_NAMES
+
+
+def _safe_join(root, rel):
+    """Absolute path for <root>/<rel>, or None if it escapes <root> (traversal)."""
+    rel = (rel or "").strip("/")
+    p = os.path.realpath(os.path.join(root, rel))
+    root_r = os.path.realpath(root)
+    return p if (p == root_r or p.startswith(root_r + os.sep)) else None
+
+
+def _entry(loc, abspath, rel):
+    """One browse entry (file or folder). Carries size + date (the file's mtime -
+    when it was written; for a write-once recording that's its creation time).
+    For the 'video' location, files also carry SSD mirror status: a file at the
+    SAME relative path under /mnt/usb/orin-video/ with a MATCHING BYTE SIZE
+    (verification is by path + size, not a content hash)."""
+    is_dir = os.path.isdir(abspath)
+    e = {"name": os.path.basename(abspath), "path": rel, "is_dir": is_dir,
+         "size": None, "size_h": "", "mtime": None, "date": "",
+         "on_ssd": None, "match": None}
+    try:
+        st = os.stat(abspath)
+        e["mtime"] = st.st_mtime
+        e["date"] = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+        if not is_dir:
+            e["size"] = st.st_size
+            e["size_h"] = _human(st.st_size)
+    except OSError:
+        pass
+    if is_dir:
+        return e
+    if loc == "video" and _ssd_mounted():
+        dp = os.path.join(USB_MNT, USB_SUBDIR, rel)
+        if os.path.exists(dp):
+            e["on_ssd"] = True
+            try:
+                e["match"] = (os.path.getsize(dp) == e["size"])
+            except OSError:
+                e["match"] = False
+        else:
+            e["on_ssd"] = False
+            e["match"] = False
+    return e
+
+
+def _run_ok(cmd, timeout=None):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+    except Exception as e:                           # noqa: BLE001
+        return False, repr(e)
+
+
+def _storage_info(path=OUTPUT_DIR):
+    """Total / used / free for a filesystem (defaults to the NVMe at /mnt/video)."""
+    try:
+        st = os.statvfs(path)
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        used = total - free
+        return {"total": _human(total), "free": _human(free), "used": _human(used),
+                "pct": round(100 * used / total) if total else 0, "free_bytes": free}
+    except OSError:
+        return None
+
+
+@app.route("/files")
+def files_page():
+    return FILES_PAGE
+
+
+@app.route("/api/browse")
+def api_browse():
+    """List a folder within a location, or (with ?q=) recursively search it.
+
+      loc  = video | ssd
+      path = folder relative to that location's root (default: root)
+      q    = optional filter; when set, walks the tree and returns matching files
+    """
+    loc = request.args.get("loc", "video")
+    rel = request.args.get("path", "")
+    q = (request.args.get("q") or "").strip()
+    show_hidden = request.args.get("hidden") == "1"
+    resp = {"loc": loc, "path": "", "parent": None, "entries": [], "search": bool(q),
+            "truncated": False, "recording": _is_running(), "ssd": _ssd_info(),
+            "storage": _storage_info(), "error": None}
+    root = LOCS.get(loc)
+    if root is None:
+        resp["error"] = "unknown location"
+        return jsonify(resp)
+    if loc == "ssd" and not _ssd_mounted():
+        resp["error"] = "SSD not mounted."
+        return jsonify(resp)
+    base = _safe_join(root, rel)
+    if base is None or not os.path.isdir(base):
+        resp["error"] = "folder not found"
+        return jsonify(resp)
+    root_r = os.path.realpath(root)
+    cur = "" if base == root_r else os.path.relpath(base, root_r)
+    resp["path"] = cur
+    resp["parent"] = None if cur == "" else os.path.dirname(cur)
+    try:
+        if q:
+            n = 0
+            for dp, dirs, files in os.walk(base):
+                if not show_hidden:
+                    dirs[:] = [d for d in dirs if not _is_hidden(d)]  # prune hidden trees
+                dirs.sort()
+                for fn in sorted(files):
+                    if not show_hidden and _is_hidden(fn):
+                        continue
+                    if q.lower() in fn.lower():
+                        fp = os.path.join(dp, fn)
+                        resp["entries"].append(_entry(loc, fp, os.path.relpath(fp, root_r)))
+                        n += 1
+                        if n >= 1000:
+                            resp["truncated"] = True
+                            return jsonify(resp)
+        else:
+            names = [n for n in os.listdir(base) if show_hidden or not _is_hidden(n)]
+            items = [_entry(loc, os.path.join(base, name),
+                            os.path.join(cur, name) if cur else name)
+                     for name in names]
+            items.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+            resp["entries"] = items
+    except OSError as ex:                            # noqa: BLE001
+        resp["error"] = repr(ex)
+    return jsonify(resp)
+
+
+@app.route("/api/mount", methods=["POST"])
+def api_mount():
+    if not _ssd_present():
+        return jsonify(ok=False, error="No SSD detected (its UUID isn't present). Plug it in.")
+    if _ssd_mounted():
+        return jsonify(ok=True, already=True)
+    os.makedirs(USB_MNT, exist_ok=True)
+    out = ""
+    for cmd in (["mount", _ssd_dev(), USB_MNT],
+                ["mount", "-t", "exfat", _ssd_dev(), USB_MNT],
+                ["mount.exfat-fuse", _ssd_dev(), USB_MNT]):  # FUSE fallback (this Orin)
+        _, out = _run_ok(cmd, timeout=30)
+        if _ssd_mounted():
+            return jsonify(ok=True)
+    return jsonify(ok=False, error=f"mount failed: {out or 'unknown'}")
+
+
+@app.route("/api/unmount", methods=["POST"])
+def api_unmount():
+    with _xfer_lock:
+        if _xfer["active"]:
+            return jsonify(ok=False,
+                           error="A transfer is in progress — wait for it to finish."), 409
+    if not _ssd_mounted():
+        return jsonify(ok=True, already=True)
+    _run_ok(["sync"], timeout=30)
+    ok, out = _run_ok(["umount", USB_MNT], timeout=30)
+    if ok and not _ssd_mounted():
+        return jsonify(ok=True)
+    return jsonify(ok=False, error=f"unmount failed (drive in use?): {out or 'unknown'}")
+
+
+def _transfer_worker(rels, dest):
+    # --relative + the OUTPUT_DIR/./<rel> form recreates any subfolder layout
+    # under dest (e.g. calib/x.jpg -> <dest>/calib/x.jpg).
+    # NOTE: no -a here. exFAT has no Unix owner/group/permissions, so -a's
+    # attribute preservation fails with "rsync exit 23" even when the DATA copies
+    # fine. We copy data + mtimes and skip the attrs exFAT can't hold; the
+    # byte-size verify below is the authoritative success check.
+    srcs = [os.path.join(OUTPUT_DIR, ".", r) for r in rels]
+    cmd = ["rsync", "-r", "--times", "--relative",
+           "--no-perms", "--no-owner", "--no-group", "--omit-dir-times",
+           "--info=progress2", "--"] + srcs + [dest + "/"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            m = re.search(r"(\d+)%", line)
+            with _xfer_lock:
+                _xfer["line"] = line
+                if m:
+                    _xfer["percent"] = int(m.group(1))
+        proc.wait()
+        rc = proc.returncode
+        bad = [r for r in rels
+               if not (os.path.exists(os.path.join(dest, r))
+                       and os.path.getsize(os.path.join(dest, r))
+                       == os.path.getsize(os.path.join(OUTPUT_DIR, r)))]
+        with _xfer_lock:
+            _xfer["done"] = True
+            _xfer["active"] = False
+            _xfer["ok"] = (not bad)                   # authoritative = byte-size verify
+            _xfer["percent"] = 100 if not bad else _xfer["percent"]
+            _xfer["error"] = f"verify failed for: {bad}" if bad else None
+            # rc!=0 with a clean verify = benign (e.g. exFAT attr warnings)
+            _xfer["warning"] = (f"rsync exit {rc} (attributes only; data copied "
+                                f"and byte-size verified)") if (rc != 0 and not bad) else None
+    except Exception as e:                           # noqa: BLE001
+        with _xfer_lock:
+            _xfer.update(done=True, active=False, ok=False, error=repr(e))
+
+
+@app.route("/api/transfer", methods=["POST"])
+def api_transfer():
+    if _is_running():
+        return jsonify(ok=False, error="Stop recording before transferring."), 409
+    if not _ssd_mounted():
+        return jsonify(ok=False, error="SSD is not mounted."), 409
+    with _xfer_lock:
+        if _xfer["active"]:
+            return jsonify(ok=False, error="A transfer is already running."), 409
+    paths = (request.get_json(silent=True) or {}).get("paths") or []
+    rels = []
+    for rel in paths:
+        p = _safe_join(OUTPUT_DIR, rel)
+        if p and os.path.isfile(p):
+            rels.append((rel or "").strip("/"))
+    if not rels:
+        return jsonify(ok=False, error="No valid files selected."), 400
+    dest = os.path.join(USB_MNT, USB_SUBDIR)
+    os.makedirs(dest, exist_ok=True)
+    with _xfer_lock:
+        _xfer.update(active=True, percent=0, line="", done=False, ok=None, error=None,
+                     warning=None, names=[os.path.basename(r) for r in rels])
+    threading.Thread(target=_transfer_worker, args=(rels, dest), daemon=True).start()
+    return jsonify(ok=True, count=len(rels))
+
+
+@app.route("/api/transfer_status")
+def api_transfer_status():
+    with _xfer_lock:
+        return jsonify(dict(_xfer))
+
+
+@app.route("/api/delete", methods=["POST"])
+def api_delete():
+    if _is_running():
+        return jsonify(ok=False, error="Stop recording before deleting."), 409
+    data = request.get_json(silent=True) or {}
+    loc = data.get("loc", "video")
+    paths = data.get("paths") or []
+    root = LOCS.get(loc)
+    if root is None or (loc == "ssd" and not _ssd_mounted()):
+        return jsonify(ok=False, error="bad location"), 400
+    deleted, errors = [], []
+    for rel in paths:
+        p = _safe_join(root, rel)
+        if p and os.path.isfile(p):
+            try:
+                os.remove(p)
+                deleted.append(rel)
+            except OSError as e:
+                errors.append({"name": rel, "error": repr(e)})
+        else:
+            errors.append({"name": rel, "error": "not found"})
+    return jsonify(ok=not errors, deleted=deleted, errors=errors)
+
+
 PAGE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -359,8 +692,12 @@ PAGE = """<!doctype html>
  @keyframes pulse { 50% { opacity:.3; } }
  button { width:100%; padding:22px; font-size:1.3rem; font-weight:700; border:0;
           border-radius:12px; margin:8px 0; color:#fff; }
- #start { background:#1f8a3b; } #stop { background:#b3271e; } #snap { background:#2a6f9e; }
+ #start { background:#1f8a3b; } #stop { background:#b3271e; }
  button:disabled { opacity:.35; }
+ .btnlink { display:block; text-align:center; text-decoration:none; padding:18px;
+            font-size:1.15rem; font-weight:700; border-radius:12px; margin:8px 0;
+            color:#fff; background:#2a6f9e; }
+ .btnlink.disabled { opacity:.35; pointer-events:none; }
  label { display:block; margin:8px 0; }
  input[type=number] { width:70px; background:#222; color:#eee; border:1px solid #444;
                       border-radius:6px; padding:6px; }
@@ -376,26 +713,20 @@ PAGE = """<!doctype html>
    <img id="preview" src="/preview.mjpg" alt="preview">
  </div>
  <div class="card">
-   <label><input type="checkbox" id="showpv" checked> Show preview</label>
-   <div id="pvnote" class="muted"></div>
- </div>
- <div class="card">
    <span class="dot" id="dot"></span><span id="statetext">&hellip;</span>
    <div id="detail" class="muted"></div>
+   <div id="storage" class="muted" style="margin-top:6px"></div>
  </div>
  <div class="card">
    <label><input type="checkbox" id="pvrec" checked> Live preview while recording</label>
    <div class="muted">Off &rarr; camera is dedicated to recording (no preview until you stop).</div>
-   <label><input type="checkbox" id="logth"> Log thermals to file</label>
-   <label>Quality <input type="number" id="quality" value="85" min="1" max="100"></label>
+   <label><input type="checkbox" id="audio" checked> Record audio (USB mic)</label>
+   <div class="muted">On by default. Separate WAV + sync sidecar; auto-starts if a mic is present (or plugged in mid-record). Untick for video only. Thermals always logged.</div>
    <div id="rootnote" class="muted"></div>
  </div>
  <button id="start">&#9679; Start Recording</button>
  <button id="stop" disabled>&#9632; Stop Recording</button>
- <div class="card">
-   <button id="snap">&#128247; Snapshot (calibration)</button>
-   <div id="snapnote" class="muted">Full-res stills &rarr; /mnt/video/calib</div>
- </div>
+ <a id="manage" href="/files" class="btnlink">&#128193; Manage Files</a>
  <div class="card">
    <label><input type="checkbox" id="showth"> Show live thermals</label>
    <div id="thermals" style="display:none">
@@ -410,24 +741,23 @@ const post = (u,b) => fetch(u,{method:'POST',headers:{'Content-Type':'applicatio
                               body:JSON.stringify(b||{})}).then(r=>r.json());
 const fmt = s => Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
 const tclass = c => c>=80?'hot':c>=65?'warn':'ok';
-
-// Preview show/hide. When off, drop the stream (src='') so the browser closes the
-// connection -> no Wi-Fi traffic, no phone battery, and (when idle) the server
-// releases the camera and stops the preview pipeline entirely. previewAvailable is
-// false while a recording started with "Live preview while recording" unchecked --
-// there's no stream to fetch then, so we don't try.
-let previewAvailable = true;
-function previewWanted(){ return $('showpv').checked && previewAvailable; }
-function reconnectPreview(){ if(previewWanted()) $('preview').src = '/preview.mjpg?' + Date.now(); }
-function applyPreviewState(){
-  if(previewWanted()){ $('preview').style.display='block'; }
-  else { $('preview').style.display='none'; $('preview').src=''; }
-  $('pvnote').textContent =
-    !previewAvailable ? 'Preview off for this recording (started with live preview disabled).' :
-    !$('showpv').checked ? 'Hidden — preview stopped and camera released while idle (recording is unaffected).' : '';
+function storageHtml(st){
+  if(!st) return '';
+  const gb = st.free_bytes/1e9, cls = gb<40?'hot':gb<150?'warn':'ok';
+  return '&#128190; NVMe: <b>'+st.used+'</b> / '+st.total+' used ('+st.pct+'%) &middot; '
+       + '<span class="'+cls+'">'+st.free+' free</span>';
 }
-$('preview').onerror = () => { if(previewWanted()) setTimeout(reconnectPreview, 1200); };
-$('showpv').onchange = () => { applyPreviewState(); if(previewWanted()) reconnectPreview(); };
+
+// Preview is always shown when a stream exists. previewAvailable is false only
+// while a recording started with "Live preview while recording" unticked -- then
+// there's no stream to fetch, so we hide the <img> and don't retry.
+let previewAvailable = true;
+function reconnectPreview(){ if(previewAvailable) $('preview').src = '/preview.mjpg?' + Date.now(); }
+function applyPreviewState(){
+  if(previewAvailable){ $('preview').style.display='block'; }
+  else { $('preview').style.display='none'; $('preview').src=''; }
+}
+$('preview').onerror = () => { if(previewAvailable) setTimeout(reconnectPreview, 1200); };
 
 let wasRunning = null;
 async function refreshStatus(){
@@ -436,36 +766,24 @@ async function refreshStatus(){
     $('dot').className = 'dot' + (s.running?' rec':'');
     $('statetext').textContent = s.running ? 'RECORDING — '+fmt(s.elapsed) : 'Idle';
     $('detail').textContent = s.running && s.file ? s.file : '';
+    $('storage').innerHTML = storageHtml(s.storage);
     $('start').disabled = s.running;
     $('stop').disabled  = !s.running;
-    $('snap').disabled  = s.running;
-    $('rootnote').textContent = (!s.server_root && $('logth').checked)
-      ? 'Note: logging to file needs the server run under sudo.' : '';
-    // track whether a preview stream exists right now (idle, or recording-with-tee)
+    $('manage').classList.toggle('disabled', s.running);  // no file mgmt while recording
+    $('rootnote').textContent = !s.server_root
+      ? 'Note: thermal logging needs the server run under sudo.' : '';
     const prevAvail = previewAvailable;
     previewAvailable = (s.preview !== false);
     if(prevAvail !== previewAvailable) applyPreviewState();
-    // camera handed over on a state change -> nudge the preview to reconnect
     if((wasRunning !== null && wasRunning !== s.running) || (prevAvail !== previewAvailable))
       setTimeout(reconnectPreview, 1500);
     wasRunning = s.running;
   }catch(e){ $('statetext').textContent = 'server unreachable'; }
 }
 $('start').onclick = async () => { $('start').disabled=true;
-  await post('/start',{log_thermals:$('logth').checked, quality:+$('quality').value,
-                       preview:$('pvrec').checked});
+  await post('/start',{preview:$('pvrec').checked, audio:$('audio').checked});
   refreshStatus(); };
 $('stop').onclick  = async () => { $('stop').disabled=true; await post('/stop'); refreshStatus(); };
-$('snap').onclick  = async () => {
-  $('snap').disabled=true; $('snapnote').textContent='Capturing…';
-  const r = await post('/snapshot');
-  $('snapnote').textContent = r.ok
-    ? 'Saved '+r.file+' — '+r.count+' shots in /mnt/video/calib'
-    : 'Error: '+(r.error||'failed');
-  $('snap').disabled=false;
-  setTimeout(reconnectPreview, 1500);   // preview blinked during the grab
-};
-$('logth').onchange = refreshStatus;
 $('showth').onchange = () => { $('thermals').style.display = $('showth').checked?'block':'none'; };
 
 async function refreshThermals(){
@@ -483,6 +801,265 @@ async function refreshThermals(){
 setInterval(refreshStatus, 1500);
 setInterval(refreshThermals, 2000);
 refreshStatus();
+</script></body></html>"""
+
+
+FILES_PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manage Files</title>
+<style>
+ :root { color-scheme: dark; }
+ body { font-family: system-ui, sans-serif; margin:0; background:#111; color:#eee; }
+ .wrap { max-width:760px; margin:0 auto; padding:20px; }
+ h1 { font-size:1.2rem; }
+ a.back { color:#7fb2d9; text-decoration:none; font-size:.9rem; }
+ .card { padding:14px; border-radius:10px; background:#1b1b1b; margin-bottom:16px; }
+ .banner { background:#5a1f1f; color:#ffdede; padding:12px; border-radius:10px; margin-bottom:16px; }
+ button { padding:10px 14px; font-size:1rem; font-weight:700; border:0; border-radius:10px;
+          color:#fff; background:#2a6f9e; margin:4px 4px 4px 0; }
+ button.danger { background:#b3271e; } button.go { background:#1f8a3b; } button.ghost { background:#333; }
+ button:disabled { opacity:.35; }
+ .tab { background:#333; } .tab.active { background:#2a6f9e; }
+ input[type=text] { width:100%; box-sizing:border-box; background:#222; color:#eee;
+                    border:1px solid #444; border-radius:8px; padding:10px; font-size:1rem; }
+ table { width:100%; border-collapse:collapse; font-size:.92rem; }
+ th,td { padding:6px 8px; border-bottom:1px solid #222; text-align:left; }
+ td.sz { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+ td.dt, th.dt { white-space:nowrap; color:#bbb; font-variant-numeric:tabular-nums; }
+ th.sort { cursor:pointer; user-select:none; } th.sort:hover { color:#fff; }
+ .ok{color:#4caf50}.warn{color:#ffb300}.hot{color:#e33}.muted{color:#888;}
+ .bar { height:14px; background:#333; border-radius:7px; overflow:hidden; }
+ .bar > div { height:100%; width:0; background:#1f8a3b; transition:width .3s; }
+ .name { word-break:break-all; }
+ .dir .name { color:#7fb2d9; cursor:pointer; }
+ #crumbs a { color:#7fb2d9; text-decoration:none; } #crumbs { margin-bottom:8px; }
+</style></head><body><div class="wrap">
+ <h1>&#128193; Manage Files &nbsp;<a class="back" href="/">&larr; back to recorder</a></h1>
+ <div id="recbanner" class="banner" style="display:none">Recording in progress — transfer
+   and delete are disabled to protect the recording. You can still browse and mount.</div>
+
+ <div class="card">
+   <div id="nvme" class="muted" style="margin-bottom:12px"></div>
+   <button class="tab" id="tab-video" onclick="switchLoc('video')">Orin recordings</button>
+   <button class="tab" id="tab-ssd" onclick="switchLoc('ssd')">External SSD</button>
+   <div id="ssd" class="muted" style="margin-top:10px">…</div>
+   <div id="ssdbtn" style="margin-top:8px"></div>
+ </div>
+
+ <div class="card" id="xfercard" style="display:none">
+   <div>Transferring… <span id="xferpct">0%</span></div>
+   <div class="bar"><div id="xferbar"></div></div>
+   <div id="xferline" class="muted" style="margin-top:6px"></div>
+ </div>
+
+ <div class="card">
+   <button class="go" id="btnxfer" onclick="transfer()">&#8681; Transfer &rarr; SSD</button>
+   <button class="danger" id="btndel" onclick="del()">&#128465; Delete</button>
+   <button class="ghost" onclick="load()">&#8635; Refresh</button>
+   <div class="muted" id="selnote" style="margin-top:8px"></div>
+ </div>
+
+ <div class="card">
+   <input type="text" id="search" placeholder="Search this drive (recursive)…" oninput="onSearch()">
+   <label class="muted" style="display:block; margin:10px 0">
+     <input type="checkbox" id="hidden" onchange="load()"> Show hidden / system files</label>
+   <div id="crumbs"></div>
+   <table>
+     <thead><tr>
+       <th><input type="checkbox" id="all" onchange="toggleAll()"></th>
+       <th class="sort" data-sort="name">Name</th>
+       <th class="sort sz" data-sort="size">Size</th>
+       <th class="sort dt" data-sort="date">Date</th>
+       <th class="sort" id="hssd" data-sort="ssd">On SSD</th>
+     </tr></thead>
+     <tbody id="rows"></tbody>
+   </table>
+   <div id="note" class="muted" style="margin-top:8px"></div>
+ </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const post = (u,b) => fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},
+                              body:JSON.stringify(b||{})}).then(r=>r.json());
+const esc = s => (''+s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function storageHtml(st){
+  if(!st) return '';
+  const gb = st.free_bytes/1e9, cls = gb<40?'hot':gb<150?'warn':'ok';
+  return '&#128190; NVMe /mnt/video: <b>'+st.used+'</b> / '+st.total+' used ('+st.pct+'%) &middot; '
+       + '<span class="'+cls+'">'+st.free+' free</span>';
+}
+
+let state = {loc:'video', path:'', q:'', parent:null, autoSub:false};
+let mounted=false, recording=false, xferActive=false;
+let lastData = null, sort = {key:'name', asc:true};
+
+function selected(){ return [...document.querySelectorAll('.sel:checked')].map(c=>c.dataset.path); }
+function toggleAll(){ document.querySelectorAll('.sel').forEach(c=>c.checked=$('all').checked); updateSel(); }
+function updateSel(){
+  const n=selected().length;
+  $('selnote').textContent = n ? (n+' selected')
+    : 'Tap a folder to open it. Tick files, then Transfer or Delete.';
+  $('btnxfer').disabled = recording || !mounted || state.loc!=='video' || !n || xferActive;
+  $('btndel').disabled  = recording || !n || xferActive;
+}
+function ssdCell(f){
+  if(state.loc!=='video' || !mounted) return '';
+  if(f.match) return '<span class="ok">&#10003; verified</span>';
+  if(f.on_ssd) return '<span class="warn">&#9888; size differs</span>';
+  return '<span class="muted">not copied</span>';
+}
+function crumbs(){
+  const rootLabel = state.loc==='ssd' ? 'SSD' : 'Recordings';
+  let html = '<a href="#" data-crumb="">'+rootLabel+'</a>', acc='';
+  if(state.path) state.path.split('/').forEach(seg => {
+    acc = acc ? acc+'/'+seg : seg;
+    html += ' / <a href="#" data-crumb="'+esc(acc)+'">'+esc(seg)+'</a>';
+  });
+  return html;
+}
+
+async function load(){
+  const u = '/api/browse?loc='+encodeURIComponent(state.loc)
+          + '&path='+encodeURIComponent(state.path)
+          + '&q='+encodeURIComponent(state.q)
+          + '&hidden='+($('hidden').checked?'1':'0');
+  const s = await (await fetch(u)).json();
+  // On first open of the SSD tab, drop straight into orin-video/ if it's there
+  // (the SSD root stays one breadcrumb click away). Only fires on the tab switch.
+  if(state.autoSub){
+    state.autoSub = false;
+    if(!s.error && !state.path && (s.entries||[]).some(e => e.is_dir && e.name==='orin-video')){
+      state.path = 'orin-video'; return load();
+    }
+  }
+  recording = s.recording; mounted = s.ssd.mounted; state.parent = s.parent;
+  $('nvme').innerHTML = storageHtml(s.storage);
+  $('recbanner').style.display = recording ? 'block' : 'none';
+  $('tab-video').className = 'tab' + (state.loc==='video'?' active':'');
+  $('tab-ssd').className   = 'tab' + (state.loc==='ssd'?' active':'');
+
+  // SSD status + mount/unmount
+  let html, btn='';
+  if(!s.ssd.present){ html='No SSD detected — plug it in, then Refresh.'; }
+  else if(!s.ssd.mounted){ html='SSD detected, not mounted.';
+    btn='<button class="go" onclick="mount()">Mount SSD</button>'; }
+  else { html='SSD mounted at '+s.ssd.mountpoint+' — free '+s.ssd.free+' of '+s.ssd.total
+             +' (transfers land in '+s.ssd.subdir+'/)';
+    btn='<button id="btnunmount" onclick="unmount()"'+(xferActive?' disabled':'')
+        +'>Unmount SSD</button>'; }
+  $('ssd').innerHTML = html; $('ssdbtn').innerHTML = btn;
+
+  // breadcrumb (hidden while searching)
+  $('crumbs').innerHTML = (s.search || s.error) ? '' : crumbs();
+
+  lastData = s;
+  $('note').textContent = s.truncated ? 'Showing first 1000 matches — narrow your search.' : '';
+  renderRows();
+}
+
+// --- rows + client-side sorting ------------------------------------------
+function ssdRank(f){ return f.match ? 3 : f.on_ssd ? 2 : (f.on_ssd===false ? 1 : 0); }
+function cmp(a,b){
+  let av, bv;
+  if(sort.key==='size'){ av=a.size||0; bv=b.size||0; }
+  else if(sort.key==='date'){ av=a.mtime||0; bv=b.mtime||0; }
+  else if(sort.key==='ssd'){ av=ssdRank(a); bv=ssdRank(b); }
+  else { av=(a.path||a.name||'').toLowerCase(); bv=(b.path||b.name||'').toLowerCase(); }
+  const d = av<bv ? -1 : av>bv ? 1 : 0;
+  return sort.asc ? d : -d;
+}
+function rowHtml(f, search){
+  if(f.is_dir) return '<tr class="dir" data-goto="'+esc(f.path)+'"><td></td>'
+    + '<td class="name">&#128193; '+esc(f.name)+'</td><td></td>'
+    + '<td class="dt">'+esc(f.date||'')+'</td><td></td></tr>';
+  const label = search ? f.path : f.name;
+  return '<tr><td><input type="checkbox" class="sel" data-path="'+esc(f.path)+'"></td>'
+    + '<td class="name">'+esc(label)+'</td><td class="sz">'+f.size_h+'</td>'
+    + '<td class="dt">'+esc(f.date||'')+'</td><td>'+ssdCell(f)+'</td></tr>';
+}
+function renderRows(){
+  const s = lastData; if(!s) return;
+  // header labels + sort arrow (On SSD is blank on the SSD tab)
+  const labels = {name:'Name', size:'Size', date:'Date', ssd:(s.loc==='video'?'On SSD':'')};
+  document.querySelectorAll('th[data-sort]').forEach(th => {
+    const k = th.dataset.sort;
+    th.textContent = labels[k] + (sort.key===k && labels[k] ? (sort.asc?' \\u25B2':' \\u25BC') : '');
+  });
+  if(s.error){ $('rows').innerHTML='<tr><td colspan="5" class="muted">'+esc(s.error)+'</td></tr>';
+    $('all').checked=false; updateSel(); return; }
+  const dirs = s.entries.filter(e=>e.is_dir).sort((a,b)=>a.name.toLowerCase()<b.name.toLowerCase()?-1:1);
+  const files = s.entries.filter(e=>!e.is_dir).slice().sort(cmp);
+  const list = s.search ? files : dirs.concat(files);   // folders always first when browsing
+  if(!list.length){ $('rows').innerHTML='<tr><td colspan="5" class="muted">'
+      + (s.search?'No matches.':'Empty folder.')+'</td></tr>'; $('all').checked=false; updateSel(); return; }
+  const up = (!s.search && state.parent!==null)
+    ? '<tr class="dir" data-goto="'+esc(state.parent)+'"><td></td>'
+      +'<td class="name">&#128193; ..</td><td></td><td></td><td></td></tr>' : '';
+  $('rows').innerHTML = up + list.map(f => rowHtml(f, s.search)).join('');
+  $('all').checked=false;
+  updateSel();
+}
+
+// folder navigation + crumb clicks via delegation (handles any filename safely)
+$('rows').addEventListener('click', e => {
+  const tr = e.target.closest('tr.dir'); if(!tr) return;
+  state.path = tr.dataset.goto; state.q=''; $('search').value=''; load();
+});
+$('rows').addEventListener('change', e => { if(e.target.classList.contains('sel')) updateSel(); });
+$('crumbs').addEventListener('click', e => {
+  const a = e.target.closest('a[data-crumb]'); if(!a) return;
+  e.preventDefault(); state.path = a.dataset.crumb; state.q=''; $('search').value=''; load();
+});
+// click a column header to sort (client-side; toggles asc/desc). No refetch.
+document.querySelector('thead').addEventListener('click', e => {
+  const th = e.target.closest('th[data-sort]'); if(!th) return;
+  const k = th.dataset.sort;
+  if(sort.key===k) sort.asc = !sort.asc; else { sort.key=k; sort.asc=true; }
+  renderRows();
+});
+
+function switchLoc(loc){
+  state.loc=loc; state.path=''; state.q=''; $('search').value='';
+  state.autoSub = (loc==='ssd');   // on the SSD tab, jump into orin-video/ if it exists
+  load();
+}
+let searchTimer;
+function onSearch(){ clearTimeout(searchTimer);
+  searchTimer=setTimeout(()=>{ state.q=$('search').value.trim(); load(); }, 300); }
+
+async function mount(){ const r=await post('/api/mount'); if(!r.ok) alert(r.error||'mount failed'); load(); }
+async function unmount(){ const r=await post('/api/unmount'); if(!r.ok) alert(r.error||'unmount failed'); load(); }
+
+async function transfer(){
+  const paths = selected(); if(!paths.length) return;
+  const r = await post('/api/transfer', {paths});
+  if(!r.ok){ alert(r.error||'transfer failed'); return; }
+  xferActive=true; $('xfercard').style.display='block';
+  $('btnxfer').disabled=true; $('btndel').disabled=true;
+  if($('btnunmount')) $('btnunmount').disabled=true;   // no unmount mid-transfer
+  const t = setInterval(async () => {
+    const s = await (await fetch('/api/transfer_status')).json();
+    $('xferpct').textContent = s.percent+'%'; $('xferbar').style.width = s.percent+'%';
+    $('xferline').textContent = s.line||'';
+    if(s.done){ clearInterval(t); xferActive=false; $('xfercard').style.display='none';
+      if(!s.ok) alert('Transfer error: '+(s.error||'unknown')); load(); }
+  }, 1000);
+}
+
+async function del(){
+  const paths = selected(); if(!paths.length) return;
+  const where = state.loc==='ssd' ? 'the SSD' : 'the Orin';
+  if(!confirm('Delete '+paths.length+' file(s) from '+where+'? This cannot be undone.\\n\\n'
+              +'(Verify copies first — deletes are permanent.)')) return;
+  const r = await post('/api/delete', {loc: state.loc, paths});
+  if(!r.ok) alert('Some files could not be deleted:\\n'+JSON.stringify(r.errors,null,1));
+  load();
+}
+
+load();
+setInterval(() => { if(!xferActive && !state.q && !selected().length) load(); }, 5000);
 </script></body></html>"""
 
 
