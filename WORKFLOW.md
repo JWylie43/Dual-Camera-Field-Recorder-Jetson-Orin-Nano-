@@ -13,12 +13,16 @@ Commands note which machine they run on. Replace `game_YYYY-MM-DD_HH-MM-SS` with
 
 | Fact | Value |
 |---|---|
-| Recordings live on the Orin at | `/mnt/video/*.mkv` (+ `*.tegrastats.log`) |
-| Recording bitrate (real game footage, q85) | ~**2.15 GB/min** ≈ **~130 GB/hr** |
+| Recordings live on the Orin at | `/mnt/video/` |
+| Each take produces | `game_TS.mkv` (video) · `game_TS_aN.wav` (audio, one per mic segment) · `game_TS.sync.json` (A/V sync anchors) · optional `game_TS.tegrastats.log` |
+| Recording bitrate (real game footage, q85) | ~**2.15 GB/min** ≈ **~130 GB/hr** (audio adds only ~**0.35 GB/hr**) |
 | A ~75‑min game | ~**155–170 GB** |
 | External SSD (SanDisk, exFAT) mounts at | `/mnt/usb` |
-| Stitcher output codec | MPEG‑4 Part 2 (`mp4v`) in `.mp4` |
+| Copy glob — grab a whole take | `game_TS*` (**no dot** — the dot form misses `_aN.wav`) |
+| Audio is a SEPARATE file, synced in post | `merge_av.py` reads the sidecar (see §2.5) |
+| Stitcher output codec | MPEG‑4 Part 2 (`mp4v`) in `.mp4` (**drops audio** — re‑add with `merge_av.py`) |
 | Parallel stitch needs an **indexed** file | remux first (see below) |
+| Auto‑offload on plug‑in (optional) | `field-offload/` — udev + systemd (see §1h) |
 
 **Golden rule:** *copy → verify → only then delete.* Never delete a recording off the Orin until the copy is verified.
 
@@ -65,23 +69,25 @@ df -h /mnt/usb
 ### 1c. See what you have and pick files
 
 ```bash
-ls -lht /mnt/video/*.mkv /mnt/video/*.tegrastats.log
+ls -lht /mnt/video/game_*
 ```
 
 ### 1d. Copy (transfer)
 
-The exFAT mount is root‑owned, so use `sudo`. The `.*` grabs each recording's `.mkv` **and** its `.tegrastats.log`:
+The exFAT mount is root‑owned, so use `sudo`. Use the trailing `*` (**not** `.*`) so the glob grabs the whole take — `.mkv`, every `_aN.wav`, the `.sync.json`, and any `.tegrastats.log`:
 
 ```bash
-sudo rsync -avh --progress /mnt/video/game_YYYY-MM-DD_HH-MM-SS.* /mnt/usb/
+sudo rsync -avh --progress /mnt/video/game_YYYY-MM-DD_HH-MM-SS* /mnt/usb/
 ```
+
+> ⚠️ The old `game_TS.*` pattern (dot) **misses the audio** — `game_TS_a1.wav` has no dot right after the timestamp. Always use `game_TS*`.
 
 Multiple recordings in one go:
 
 ```bash
 sudo rsync -avh --progress \
-  /mnt/video/game_A.* \
-  /mnt/video/game_B.* \
+  /mnt/video/game_A* \
+  /mnt/video/game_B* \
   /mnt/usb/
 ```
 
@@ -118,9 +124,10 @@ Wait for the prompt to return — **that's the signal it's safe to unplug.** Ski
 **Only after the copy is verified.** The NVMe fills fast (~130 GB/hr), so offload + delete every 2–3 games.
 
 ```bash
-sudo rm /mnt/video/game_YYYY-MM-DD_HH-MM-SS.mkv \
-        /mnt/video/game_YYYY-MM-DD_HH-MM-SS.tegrastats.log
+sudo rm /mnt/video/game_YYYY-MM-DD_HH-MM-SS*
 ```
+
+(That removes the whole take — video, audio segments, sidecar, and log.)
 
 Check free space:
 
@@ -129,6 +136,36 @@ df -h /mnt/video
 ```
 
 > A full drive mid‑recording produces an **unfinalized (non‑seekable) MKV** — keep headroom.
+
+### 1h. Automatic offload on plug‑in (optional, hands‑free)
+
+Instead of the manual mount + rsync above, you can have the Orin **auto‑mount the SSD and copy everything the moment you plug it in**. Files live in [`field-offload/`](field-offload/): a udev rule fires on the labeled drive → a systemd service → a script that mounts, `rsync`s all of `/mnt/video`, and unmounts.
+
+- **Copy only** — it never deletes from the Orin (the golden rule holds; delete stays manual after you verify).
+- **Only your drive triggers it** — it matches the SSD's exFAT **label**, so a random USB stick does nothing.
+- **Incremental** — re‑plugging only copies new takes.
+
+**Install (once, on the Orin):**
+
+```bash
+sudo ~/orin-recorder/field-offload/install.sh
+```
+
+**Label your SSD to match the rule** (default label `ORINDUMP`; drive must be unmounted):
+
+```bash
+sudo exfatlabel /dev/sda1 ORINDUMP
+```
+
+(Check the current label with `lsblk -f`. To use a different label, edit it in both `orin-offload.sh` and `99-orin-offload.rules`, or re‑run `install.sh` after editing.)
+
+**Use it:** just plug the SSD in. Watch progress and see when it's safe to unplug:
+
+```bash
+tail -f /var/log/orin-offload.log
+```
+
+The log prints `unmounted /mnt/usb - safe to unplug.` when the copy is done and the drive is released.
 
 ---
 
@@ -141,6 +178,31 @@ ffmpeg -fflags +genpts -i "game_YYYY-MM-DD_HH-MM-SS.mkv" -c copy "game_seekable.
 ```
 
 Use the `_seekable.mkv` for playback **and** for fast parallel stitching.
+
+---
+
+## 2.5 Add the recorded audio (desktop or Mac)
+
+Audio is recorded as a **separate `.wav`** (not muxed into the MKV — that keeps the video bulletproof if the mic drops), and aligned in post from the `.sync.json` sidecar. `recorder/merge_av.py` reads the sidecar and muxes video + every audio segment into one synced file, delaying each segment by its captured offset.
+
+**Onto the raw recording:**
+
+```bash
+python3 recorder/merge_av.py "game_YYYY-MM-DD_HH-MM-SS.sync.json"
+```
+
+→ writes `game_YYYY-MM-DD_HH-MM-SS.withaudio.mkv`.
+
+**Onto a stitched panorama** (the stitcher drops audio, so re‑attach it after §3). The frame timeline is unchanged, so the same sidecar aligns it:
+
+```bash
+python3 recorder/merge_av.py "game_YYYY-MM-DD_HH-MM-SS.sync.json" --video "stitched.mp4" --out "stitched_withaudio.mkv"
+```
+
+Notes:
+- Keep the `.mkv`, `_aN.wav`, and `.sync.json` **together in one folder** — `merge_av.py` finds the video/WAVs relative to the sidecar.
+- No audio segments in the sidecar → the take was video‑only (no mic seen); nothing to merge, and that's fine.
+- A take with no mic at first, then plugged in mid‑game, merges with correct **silence before the mic came online** — that's the anchor alignment, not a bug.
 
 ---
 
@@ -215,14 +277,16 @@ The two counts (parallel vs single) should match; expect roughly `fps × seconds
 If you'd rather transfer over Ethernet instead of the SSD, from the **desktop/Mac** (use the Orin's **wired** IP for full speed):
 
 ```bash
-rsync -avP joe@192.168.86.150:'/mnt/video/game_YYYY-MM-DD_HH-MM-SS.*' ~/Desktop/orin-recordings/
+rsync -avP joe@192.168.86.150:'/mnt/video/game_YYYY-MM-DD_HH-MM-SS*' ~/Desktop/orin-recordings/
 ```
 
 Windows (built‑in `scp`):
 
 ```
-scp joe@192.168.86.150:"/mnt/video/game_YYYY-MM-DD_HH-MM-SS.*" F:\orin-recordings\
+scp joe@192.168.86.150:"/mnt/video/game_YYYY-MM-DD_HH-MM-SS*" F:\orin-recordings\
 ```
+
+(Trailing `*`, not `.*`, so the audio `_aN.wav` and `.sync.json` come along too.)
 
 Then verify sizes on the desktop:
 

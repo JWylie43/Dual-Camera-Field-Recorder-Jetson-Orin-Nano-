@@ -1,0 +1,9 @@
+# Auto-offload: when the SSD labeled ORINDUMP is plugged in, run the offload
+# service. Matching by filesystem LABEL means only THIS drive triggers it (a
+# random USB stick won't), and it works no matter which /dev/sdX it lands on.
+#
+# udev must not run long tasks itself (it kills them), so we hand off to systemd
+# via SYSTEMD_WANTS - the service does the mount + copy + unmount.
+#
+# If you change the label, change it here AND in orin-offload.sh.
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="ORINDUMP", TAG+="systemd", ENV{SYSTEMD_WANTS}="orin-offload.service"

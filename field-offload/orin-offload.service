@@ -1,0 +1,9 @@
+[Unit]
+Description=Offload /mnt/video to the field SSD when it is plugged in
+# Started by udev (99-orin-offload.rules) via SYSTEMD_WANTS - not enabled at boot.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/orin-offload.sh
+# Big copies can take a while; don't let systemd time it out.
+TimeoutStartSec=0
