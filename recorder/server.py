@@ -77,7 +77,7 @@ _state = {"proc": None, "started": None, "preview": None, "suspended": False,
 
 # Background file-transfer job (rsync /mnt/video -> SSD). One at a time.
 _xfer = {"active": False, "percent": 0, "line": "", "done": False,
-         "ok": None, "error": None, "names": []}
+         "ok": None, "error": None, "warning": None, "names": []}
 _xfer_lock = threading.Lock()
 
 
@@ -557,10 +557,16 @@ def api_unmount():
 
 
 def _transfer_worker(rels, dest):
-    # rsync --relative + the OUTPUT_DIR/./<rel> form recreates any subfolder
-    # layout under dest (e.g. calib/x.jpg lands at <dest>/calib/x.jpg).
+    # --relative + the OUTPUT_DIR/./<rel> form recreates any subfolder layout
+    # under dest (e.g. calib/x.jpg -> <dest>/calib/x.jpg).
+    # NOTE: no -a here. exFAT has no Unix owner/group/permissions, so -a's
+    # attribute preservation fails with "rsync exit 23" even when the DATA copies
+    # fine. We copy data + mtimes and skip the attrs exFAT can't hold; the
+    # byte-size verify below is the authoritative success check.
     srcs = [os.path.join(OUTPUT_DIR, ".", r) for r in rels]
-    cmd = ["rsync", "-a", "--relative", "--info=progress2", "--"] + srcs + [dest + "/"]
+    cmd = ["rsync", "-r", "--times", "--relative",
+           "--no-perms", "--no-owner", "--no-group", "--omit-dir-times",
+           "--info=progress2", "--"] + srcs + [dest + "/"]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -582,11 +588,12 @@ def _transfer_worker(rels, dest):
         with _xfer_lock:
             _xfer["done"] = True
             _xfer["active"] = False
-            _xfer["ok"] = (rc == 0 and not bad)
-            if _xfer["ok"]:
-                _xfer["percent"] = 100
-            else:
-                _xfer["error"] = f"rsync exit {rc}" + (f"; verify failed: {bad}" if bad else "")
+            _xfer["ok"] = (not bad)                   # authoritative = byte-size verify
+            _xfer["percent"] = 100 if not bad else _xfer["percent"]
+            _xfer["error"] = f"verify failed for: {bad}" if bad else None
+            # rc!=0 with a clean verify = benign (e.g. exFAT attr warnings)
+            _xfer["warning"] = (f"rsync exit {rc} (attributes only; data copied "
+                                f"and byte-size verified)") if (rc != 0 and not bad) else None
     except Exception as e:                           # noqa: BLE001
         with _xfer_lock:
             _xfer.update(done=True, active=False, ok=False, error=repr(e))
@@ -613,7 +620,7 @@ def api_transfer():
     os.makedirs(dest, exist_ok=True)
     with _xfer_lock:
         _xfer.update(active=True, percent=0, line="", done=False, ok=None, error=None,
-                     names=[os.path.basename(r) for r in rels])
+                     warning=None, names=[os.path.basename(r) for r in rels])
     threading.Thread(target=_transfer_worker, args=(rels, dest), daemon=True).start()
     return jsonify(ok=True, count=len(rels))
 
