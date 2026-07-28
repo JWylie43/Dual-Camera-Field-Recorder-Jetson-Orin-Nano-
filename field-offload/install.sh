@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 #
-# install.sh - install the auto-offload-on-plug service on the Orin.
+# install.sh - install the auto-MOUNT-on-plug service + the manual offload script.
 # Run on the Orin:  sudo ./field-offload/install.sh
+#
+# Result: plugging in the SSD auto-mounts it at /mnt/usb (no copy). You then run
+# `sudo offload.sh` whenever you want to transfer.
 #
 set -euo pipefail
 
@@ -12,21 +15,24 @@ fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-echo "==> Installing offload script -> /usr/local/bin/orin-offload.sh"
-install -m 0755 "$HERE/orin-offload.sh" /usr/local/bin/orin-offload.sh
+echo "==> Installing mount script   -> /usr/local/bin/orin-automount.sh"
+install -m 0755 "$HERE/orin-automount.sh" /usr/local/bin/orin-automount.sh
 
-echo "==> Installing systemd service -> /etc/systemd/system/orin-offload.service"
-install -m 0644 "$HERE/orin-offload.service" /etc/systemd/system/orin-offload.service
+echo "==> Installing offload script -> /usr/local/bin/offload.sh"
+install -m 0755 "$HERE/offload.sh" /usr/local/bin/offload.sh
+
+echo "==> Installing systemd service -> /etc/systemd/system/orin-automount.service"
+install -m 0644 "$HERE/orin-automount.service" /etc/systemd/system/orin-automount.service
 systemctl daemon-reload
 
-echo "==> Installing udev rule -> /etc/udev/rules.d/99-orin-offload.rules"
-install -m 0644 "$HERE/99-orin-offload.rules" /etc/udev/rules.d/99-orin-offload.rules
+echo "==> Installing udev rule -> /etc/udev/rules.d/99-orin-automount.rules"
+install -m 0644 "$HERE/99-orin-automount.rules" /etc/udev/rules.d/99-orin-automount.rules
 udevadm control --reload
 
 echo
-echo "Matched by this drive's filesystem UUID (5E64-018F) - unique to it."
-echo "Confirm it still matches:  lsblk -f   (the UUID column for your SSD)."
-echo "If you ever reformat/replace the SSD, update the UUID in BOTH"
-echo "orin-offload.sh and 99-orin-offload.rules, then re-run this installer."
+echo "Done. Keyed to this drive's UUID (5E64-018F) - confirm with: lsblk -f"
+echo "If you reformat/replace the SSD, update the UUID in orin-automount.sh AND"
+echo "99-orin-automount.rules, then re-run this installer."
 echo
-echo "Then just plug the SSD in. Watch it:  tail -f /var/log/orin-offload.log"
+echo "Plug the SSD in  -> it auto-mounts at /mnt/usb  (watch: tail -f /var/log/orin-automount.log)"
+echo "Transfer when ready:  sudo offload.sh"

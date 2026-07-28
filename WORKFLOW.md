@@ -22,7 +22,7 @@ Commands note which machine they run on. Replace `game_YYYY-MM-DD_HH-MM-SS` with
 | Audio is a SEPARATE file, synced in post | `merge_av.py` reads the sidecar (see §2.5) |
 | Stitcher output codec | MPEG‑4 Part 2 (`mp4v`) in `.mp4` (**drops audio** — re‑add with `merge_av.py`) |
 | Parallel stitch needs an **indexed** file | remux first (see below) |
-| Auto‑offload on plug‑in (optional) | `field-offload/` — udev + systemd (see §1h) |
+| Auto‑mount SSD on plug‑in, then `sudo offload.sh` | `field-offload/` — udev + systemd (see §1h) |
 
 **Golden rule:** *copy → verify → only then delete.* Never delete a recording off the Orin until the copy is verified.
 
@@ -137,13 +137,12 @@ df -h /mnt/video
 
 > A full drive mid‑recording produces an **unfinalized (non‑seekable) MKV** — keep headroom.
 
-### 1h. Automatic offload on plug‑in (optional, hands‑free)
+### 1h. Auto‑mount on plug‑in + one‑command transfer (optional)
 
-Instead of the manual mount + rsync above, you can have the Orin **auto‑mount the SSD and copy everything the moment you plug it in**. Files live in [`field-offload/`](field-offload/): a udev rule fires on the labeled drive → a systemd service → a script that mounts, `rsync`s all of `/mnt/video`, and unmounts.
+So you don't have to mount by hand every time, you can have the Orin **auto‑mount the SSD when you plug it in** — and then run **one command** to transfer when you're ready. Nothing copies automatically. Files live in [`field-offload/`](field-offload/): a udev rule fires on this drive → a systemd service → a script that just **mounts** it at `/mnt/usb`.
 
-- **Copy only** — it never deletes from the Orin (the golden rule holds; delete stays manual after you verify).
-- **Only *this* drive triggers it** — it matches the SSD's filesystem **UUID** (`5E64-018F`), unique to this drive. (Not the label: this SanDisk's label `Extreme SSD` is the factory default shared by every Extreme.) A random USB stick — even another SanDisk Extreme — does nothing.
-- **Incremental** — re‑plugging only copies new takes.
+- **Auto‑mount only** — plugging in mounts the drive; it never copies or deletes on its own.
+- **Only *this* drive triggers it** — matched by filesystem **UUID** (`5E64-018F`), unique to this drive. (Not the label: this SanDisk's label `Extreme SSD` is the factory default shared by every Extreme.) A random USB stick — even another SanDisk Extreme — does nothing.
 
 **Install (once, on the Orin):**
 
@@ -151,7 +150,15 @@ Instead of the manual mount + rsync above, you can have the Orin **auto‑mount 
 sudo ~/orin-recorder/field-offload/install.sh
 ```
 
-No labeling needed — it's keyed to the UUID. Confirm the UUID still matches with `lsblk -f`. If you ever **reformat or replace** the SSD, its UUID changes: update it in both `orin-offload.sh` and `99-orin-offload.rules`, then re‑run `install.sh`.
+**Transfer whenever you want** (after the drive has auto‑mounted):
+
+```bash
+sudo offload.sh
+```
+
+That runs an incremental, copy‑only `rsync` of all of `/mnt/video` → `/mnt/usb/orin-video/` (re‑running only copies new takes; it never deletes — verify, then delete manually per the golden rule).
+
+Keyed to the UUID — confirm it still matches with `lsblk -f`. If you ever **reformat or replace** the SSD, its UUID changes: update it in both `orin-automount.sh` and `99-orin-automount.rules`, then re‑run `install.sh`.
 
 **Use it:** just plug the SSD in. Watch progress and see when it's safe to unplug:
 
