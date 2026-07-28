@@ -214,6 +214,7 @@ def status():
                    file=_newest_recording() if running else None,
                    elapsed=elapsed,
                    preview=preview,
+                   storage=_storage_info(),
                    server_root=(getattr(os, "geteuid", lambda: 1)() == 0))
 
 
@@ -465,6 +466,19 @@ def _run_ok(cmd, timeout=None):
         return False, repr(e)
 
 
+def _storage_info(path=OUTPUT_DIR):
+    """Total / used / free for a filesystem (defaults to the NVMe at /mnt/video)."""
+    try:
+        st = os.statvfs(path)
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        used = total - free
+        return {"total": _human(total), "free": _human(free), "used": _human(used),
+                "pct": round(100 * used / total) if total else 0, "free_bytes": free}
+    except OSError:
+        return None
+
+
 @app.route("/files")
 def files_page():
     return FILES_PAGE
@@ -483,7 +497,8 @@ def api_browse():
     q = (request.args.get("q") or "").strip()
     show_hidden = request.args.get("hidden") == "1"
     resp = {"loc": loc, "path": "", "parent": None, "entries": [], "search": bool(q),
-            "truncated": False, "recording": _is_running(), "ssd": _ssd_info(), "error": None}
+            "truncated": False, "recording": _is_running(), "ssd": _ssd_info(),
+            "storage": _storage_info(), "error": None}
     root = LOCS.get(loc)
     if root is None:
         resp["error"] = "unknown location"
@@ -700,6 +715,7 @@ PAGE = """<!doctype html>
  <div class="card">
    <span class="dot" id="dot"></span><span id="statetext">&hellip;</span>
    <div id="detail" class="muted"></div>
+   <div id="storage" class="muted" style="margin-top:6px"></div>
  </div>
  <div class="card">
    <label><input type="checkbox" id="pvrec" checked> Live preview while recording</label>
@@ -725,6 +741,12 @@ const post = (u,b) => fetch(u,{method:'POST',headers:{'Content-Type':'applicatio
                               body:JSON.stringify(b||{})}).then(r=>r.json());
 const fmt = s => Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
 const tclass = c => c>=80?'hot':c>=65?'warn':'ok';
+function storageHtml(st){
+  if(!st) return '';
+  const gb = st.free_bytes/1e9, cls = gb<40?'hot':gb<150?'warn':'ok';
+  return '&#128190; NVMe: <b>'+st.used+'</b> / '+st.total+' used ('+st.pct+'%) &middot; '
+       + '<span class="'+cls+'">'+st.free+' free</span>';
+}
 
 // Preview is always shown when a stream exists. previewAvailable is false only
 // while a recording started with "Live preview while recording" unticked -- then
@@ -744,6 +766,7 @@ async function refreshStatus(){
     $('dot').className = 'dot' + (s.running?' rec':'');
     $('statetext').textContent = s.running ? 'RECORDING — '+fmt(s.elapsed) : 'Idle';
     $('detail').textContent = s.running && s.file ? s.file : '';
+    $('storage').innerHTML = storageHtml(s.storage);
     $('start').disabled = s.running;
     $('stop').disabled  = !s.running;
     $('manage').classList.toggle('disabled', s.running);  // no file mgmt while recording
@@ -806,7 +829,7 @@ FILES_PAGE = """<!doctype html>
  td.sz { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
  td.dt, th.dt { white-space:nowrap; color:#bbb; font-variant-numeric:tabular-nums; }
  th.sort { cursor:pointer; user-select:none; } th.sort:hover { color:#fff; }
- .ok{color:#4caf50}.warn{color:#ffb300}.muted{color:#888;}
+ .ok{color:#4caf50}.warn{color:#ffb300}.hot{color:#e33}.muted{color:#888;}
  .bar { height:14px; background:#333; border-radius:7px; overflow:hidden; }
  .bar > div { height:100%; width:0; background:#1f8a3b; transition:width .3s; }
  .name { word-break:break-all; }
@@ -818,6 +841,7 @@ FILES_PAGE = """<!doctype html>
    and delete are disabled to protect the recording. You can still browse and mount.</div>
 
  <div class="card">
+   <div id="nvme" class="muted" style="margin-bottom:12px"></div>
    <button class="tab" id="tab-video" onclick="switchLoc('video')">Orin recordings</button>
    <button class="tab" id="tab-ssd" onclick="switchLoc('ssd')">External SSD</button>
    <div id="ssd" class="muted" style="margin-top:10px">…</div>
@@ -860,6 +884,12 @@ const $ = id => document.getElementById(id);
 const post = (u,b) => fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},
                               body:JSON.stringify(b||{})}).then(r=>r.json());
 const esc = s => (''+s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function storageHtml(st){
+  if(!st) return '';
+  const gb = st.free_bytes/1e9, cls = gb<40?'hot':gb<150?'warn':'ok';
+  return '&#128190; NVMe /mnt/video: <b>'+st.used+'</b> / '+st.total+' used ('+st.pct+'%) &middot; '
+       + '<span class="'+cls+'">'+st.free+' free</span>';
+}
 
 let state = {loc:'video', path:'', q:'', parent:null};
 let mounted=false, recording=false, xferActive=false;
@@ -897,6 +927,7 @@ async function load(){
           + '&hidden='+($('hidden').checked?'1':'0');
   const s = await (await fetch(u)).json();
   recording = s.recording; mounted = s.ssd.mounted; state.parent = s.parent;
+  $('nvme').innerHTML = storageHtml(s.storage);
   $('recbanner').style.display = recording ? 'block' : 'none';
   $('tab-video').className = 'tab' + (state.loc==='video'?' active':'');
   $('tab-ssd').className   = 'tab' + (state.loc==='ssd'?' active':'');
