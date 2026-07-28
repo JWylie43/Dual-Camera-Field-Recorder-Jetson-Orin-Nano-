@@ -2,11 +2,17 @@
 """
 server.py - Web control panel for record.py (Jetson Orin Nano camera rig)
 
-Mobile-friendly LAN page: live camera preview, Start/Stop, status, live thermal
-readout, calibration snapshots, and an optional thermal-log toggle. Drives record.py.
+Mobile-friendly LAN page: live camera preview, Start/Stop, status, an audio
+toggle, a live thermal readout, and a "Manage Files" page. Drives record.py.
+Thermals are always logged to a file alongside each recording (run under sudo).
 
-  START -> stop idle preview, launch `record.py --preview-port <P> ...`
+  START -> stop idle preview, launch `record.py --preview-port <P> --log-thermals ...`
   STOP  -> SIGINT the recorder (clean EOS), then restart idle preview
+
+Manage Files (/files) - only when idle (greyed out while recording): list the
+recordings on /mnt/video, mount/unmount the external SSD, transfer selected
+files to it (background rsync with progress + byte-size verification), and
+delete originals. The /snapshot route is retained (no button) for calibration.
 
 PREVIEW (on-demand when idle; always-on while recording):
   The camera can only be opened by one process, and the preview pipeline draws
@@ -34,6 +40,7 @@ Run:
 
 import glob
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -53,11 +60,21 @@ PREVIEW_W, PREVIEW_H = 1280, 400
 SETTLE = 0.6                  # seconds to let the camera/port free during a swap
 CALIB_DIR = os.path.join(OUTPUT_DIR, "calib")  # calibration snapshots land here
 
+# External SSD for field offload (keep UUID in sync with field-offload/).
+SSD_UUID = "5E64-018F"        # this drive's exFAT UUID (lsblk -f)
+USB_MNT = "/mnt/usb"          # where we mount it
+USB_SUBDIR = "orin-video"     # folder recordings are copied into on the SSD
+
 app = Flask(__name__)
 
 _lock = threading.Lock()
 _state = {"proc": None, "started": None, "preview": None, "suspended": False,
           "rec_preview": True}   # whether the active recording built a preview tee
+
+# Background file-transfer job (rsync /mnt/video -> SSD). One at a time.
+_xfer = {"active": False, "percent": 0, "line": "", "done": False,
+         "ok": None, "error": None, "names": []}
+_xfer_lock = threading.Lock()
 
 
 def _is_running():
@@ -251,19 +268,15 @@ def start():
     want_preview = bool(data.get("preview", True))   # live preview tee during recording
     _sync_preview()                              # free the camera + preview port
     time.sleep(SETTLE)
-    cmd = ["python3", RECORD_SCRIPT, "--output-dir", OUTPUT_DIR]
+    # Thermals are always logged to a file next to the video (server runs under
+    # sudo); quality uses record.py's default (no flag).
+    cmd = ["python3", RECORD_SCRIPT, "--output-dir", OUTPUT_DIR, "--log-thermals"]
     if want_preview:                             # omit -> record with no preview tee
         cmd += ["--preview-port", str(PREVIEW_TCP)]
-    if data.get("log_thermals"):
-        cmd.append("--log-thermals")
-    if data.get("quality"):
-        cmd += ["--quality", str(int(data["quality"]))]
     # Audio is ON by default in record.py (auto-detected USB mic, hot-plug,
     # written as a separate WAV + sync sidecar). The checkbox only DISABLES it.
     if data.get("audio") is False:
         cmd.append("--no-audio")
-    elif data.get("audio_device"):
-        cmd += ["--audio-device", str(data["audio_device"])]
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with _lock:
@@ -347,6 +360,210 @@ def snapshot():
     return jsonify(ok=True, file=os.path.basename(saved), count=count)
 
 
+# --------------------------------------------------------------------------
+# File management: list /mnt/video, mount/unmount the SSD, transfer + verify,
+# delete. All run as root (the server runs under sudo). Transfer runs in a
+# background thread with progress; everything else is quick and synchronous.
+# --------------------------------------------------------------------------
+def _ssd_dev():
+    return f"/dev/disk/by-uuid/{SSD_UUID}"
+
+
+def _ssd_present():
+    return os.path.exists(_ssd_dev())
+
+
+def _ssd_mounted():
+    return os.path.ismount(USB_MNT)
+
+
+def _human(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{int(n)} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def _ssd_info():
+    info = {"uuid": SSD_UUID, "present": _ssd_present(), "mounted": _ssd_mounted(),
+            "mountpoint": USB_MNT, "subdir": USB_SUBDIR, "free": None, "total": None}
+    if info["mounted"]:
+        try:
+            st = os.statvfs(USB_MNT)
+            info["total"] = _human(st.f_blocks * st.f_frsize)
+            info["free"] = _human(st.f_bavail * st.f_frsize)
+        except OSError:
+            pass
+    return info
+
+
+def _ssd_size(name):
+    p = os.path.join(USB_MNT, USB_SUBDIR, name)
+    try:
+        return os.path.getsize(p)
+    except OSError:
+        return None
+
+
+def _list_files():
+    """Every file in /mnt/video, with size and (if mounted) its SSD copy status."""
+    mounted = _ssd_mounted()
+    out = []
+    for path in sorted(glob.glob(os.path.join(OUTPUT_DIR, "*"))):
+        if not os.path.isfile(path):
+            continue
+        name = os.path.basename(path)
+        size = os.path.getsize(path)
+        m = re.match(r"(game_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})", name)
+        entry = {"name": name, "size": size, "size_h": _human(size),
+                 "stem": m.group(1) if m else name}
+        if mounted:
+            ssz = _ssd_size(name)
+            entry["on_ssd"] = ssz is not None
+            entry["match"] = (ssz == size)
+        else:
+            entry["on_ssd"] = None
+            entry["match"] = None
+        out.append(entry)
+    return out
+
+
+def _safe_local(name):
+    """Absolute path in OUTPUT_DIR for a basename, or None if it escapes the dir."""
+    if not name or "/" in name or name in (".", ".."):
+        return None
+    p = os.path.realpath(os.path.join(OUTPUT_DIR, name))
+    return p if os.path.dirname(p) == os.path.realpath(OUTPUT_DIR) else None
+
+
+def _run_ok(cmd, timeout=None):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+    except Exception as e:                           # noqa: BLE001
+        return False, repr(e)
+
+
+@app.route("/files")
+def files_page():
+    return FILES_PAGE
+
+
+@app.route("/api/files")
+def api_files():
+    return jsonify(recording=_is_running(), output_dir=OUTPUT_DIR,
+                   ssd=_ssd_info(), files=_list_files())
+
+
+@app.route("/api/mount", methods=["POST"])
+def api_mount():
+    if not _ssd_present():
+        return jsonify(ok=False, error="No SSD detected (its UUID isn't present). Plug it in.")
+    if _ssd_mounted():
+        return jsonify(ok=True, already=True)
+    os.makedirs(USB_MNT, exist_ok=True)
+    out = ""
+    for cmd in (["mount", _ssd_dev(), USB_MNT],
+                ["mount", "-t", "exfat", _ssd_dev(), USB_MNT],
+                ["mount.exfat-fuse", _ssd_dev(), USB_MNT]):  # FUSE fallback (this Orin)
+        _, out = _run_ok(cmd, timeout=30)
+        if _ssd_mounted():
+            return jsonify(ok=True)
+    return jsonify(ok=False, error=f"mount failed: {out or 'unknown'}")
+
+
+@app.route("/api/unmount", methods=["POST"])
+def api_unmount():
+    if not _ssd_mounted():
+        return jsonify(ok=True, already=True)
+    _run_ok(["sync"], timeout=30)
+    ok, out = _run_ok(["umount", USB_MNT], timeout=30)
+    if ok and not _ssd_mounted():
+        return jsonify(ok=True)
+    return jsonify(ok=False, error=f"unmount failed (drive in use?): {out or 'unknown'}")
+
+
+def _transfer_worker(srcs, dest):
+    cmd = ["rsync", "-a", "--info=progress2", "--"] + srcs + [dest + "/"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            m = re.search(r"(\d+)%", line)
+            with _xfer_lock:
+                _xfer["line"] = line
+                if m:
+                    _xfer["percent"] = int(m.group(1))
+        proc.wait()
+        rc = proc.returncode
+        bad = [os.path.basename(p) for p in srcs
+               if not (os.path.exists(os.path.join(dest, os.path.basename(p)))
+                       and os.path.getsize(os.path.join(dest, os.path.basename(p)))
+                       == os.path.getsize(p))]
+        with _xfer_lock:
+            _xfer["done"] = True
+            _xfer["active"] = False
+            _xfer["ok"] = (rc == 0 and not bad)
+            if _xfer["ok"]:
+                _xfer["percent"] = 100
+            else:
+                _xfer["error"] = f"rsync exit {rc}" + (f"; verify failed: {bad}" if bad else "")
+    except Exception as e:                           # noqa: BLE001
+        with _xfer_lock:
+            _xfer.update(done=True, active=False, ok=False, error=repr(e))
+
+
+@app.route("/api/transfer", methods=["POST"])
+def api_transfer():
+    if _is_running():
+        return jsonify(ok=False, error="Stop recording before transferring."), 409
+    if not _ssd_mounted():
+        return jsonify(ok=False, error="SSD is not mounted."), 409
+    with _xfer_lock:
+        if _xfer["active"]:
+            return jsonify(ok=False, error="A transfer is already running."), 409
+    names = (request.get_json(silent=True) or {}).get("names") or []
+    srcs = [p for p in (_safe_local(n) for n in names) if p and os.path.isfile(p)]
+    if not srcs:
+        return jsonify(ok=False, error="No valid files selected."), 400
+    dest = os.path.join(USB_MNT, USB_SUBDIR)
+    os.makedirs(dest, exist_ok=True)
+    with _xfer_lock:
+        _xfer.update(active=True, percent=0, line="", done=False, ok=None, error=None,
+                     names=[os.path.basename(p) for p in srcs])
+    threading.Thread(target=_transfer_worker, args=(srcs, dest), daemon=True).start()
+    return jsonify(ok=True, count=len(srcs))
+
+
+@app.route("/api/transfer_status")
+def api_transfer_status():
+    with _xfer_lock:
+        return jsonify(dict(_xfer))
+
+
+@app.route("/api/delete", methods=["POST"])
+def api_delete():
+    if _is_running():
+        return jsonify(ok=False, error="Stop recording before deleting."), 409
+    names = (request.get_json(silent=True) or {}).get("names") or []
+    deleted, errors = [], []
+    for n in names:
+        p = _safe_local(n)
+        if p and os.path.isfile(p):
+            try:
+                os.remove(p)
+                deleted.append(n)
+            except OSError as e:
+                errors.append({"name": n, "error": repr(e)})
+        else:
+            errors.append({"name": n, "error": "not found"})
+    return jsonify(ok=not errors, deleted=deleted, errors=errors)
+
+
 PAGE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -365,8 +582,12 @@ PAGE = """<!doctype html>
  @keyframes pulse { 50% { opacity:.3; } }
  button { width:100%; padding:22px; font-size:1.3rem; font-weight:700; border:0;
           border-radius:12px; margin:8px 0; color:#fff; }
- #start { background:#1f8a3b; } #stop { background:#b3271e; } #snap { background:#2a6f9e; }
+ #start { background:#1f8a3b; } #stop { background:#b3271e; }
  button:disabled { opacity:.35; }
+ .btnlink { display:block; text-align:center; text-decoration:none; padding:18px;
+            font-size:1.15rem; font-weight:700; border-radius:12px; margin:8px 0;
+            color:#fff; background:#2a6f9e; }
+ .btnlink.disabled { opacity:.35; pointer-events:none; }
  label { display:block; margin:8px 0; }
  input[type=number] { width:70px; background:#222; color:#eee; border:1px solid #444;
                       border-radius:6px; padding:6px; }
@@ -382,28 +603,19 @@ PAGE = """<!doctype html>
    <img id="preview" src="/preview.mjpg" alt="preview">
  </div>
  <div class="card">
-   <label><input type="checkbox" id="showpv" checked> Show preview</label>
-   <div id="pvnote" class="muted"></div>
- </div>
- <div class="card">
    <span class="dot" id="dot"></span><span id="statetext">&hellip;</span>
    <div id="detail" class="muted"></div>
  </div>
  <div class="card">
    <label><input type="checkbox" id="pvrec" checked> Live preview while recording</label>
    <div class="muted">Off &rarr; camera is dedicated to recording (no preview until you stop).</div>
-   <label><input type="checkbox" id="logth"> Log thermals to file</label>
    <label><input type="checkbox" id="audio" checked> Record audio (USB mic)</label>
-   <div class="muted">On by default. Separate WAV + sync sidecar; auto-starts if a mic is present (or plugged in mid-record). Untick for video only.</div>
-   <label>Quality <input type="number" id="quality" value="85" min="1" max="100"></label>
+   <div class="muted">On by default. Separate WAV + sync sidecar; auto-starts if a mic is present (or plugged in mid-record). Untick for video only. Thermals always logged.</div>
    <div id="rootnote" class="muted"></div>
  </div>
  <button id="start">&#9679; Start Recording</button>
  <button id="stop" disabled>&#9632; Stop Recording</button>
- <div class="card">
-   <button id="snap">&#128247; Snapshot (calibration)</button>
-   <div id="snapnote" class="muted">Full-res stills &rarr; /mnt/video/calib</div>
- </div>
+ <a id="manage" href="/files" class="btnlink">&#128193; Manage Files</a>
  <div class="card">
    <label><input type="checkbox" id="showth"> Show live thermals</label>
    <div id="thermals" style="display:none">
@@ -419,23 +631,16 @@ const post = (u,b) => fetch(u,{method:'POST',headers:{'Content-Type':'applicatio
 const fmt = s => Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
 const tclass = c => c>=80?'hot':c>=65?'warn':'ok';
 
-// Preview show/hide. When off, drop the stream (src='') so the browser closes the
-// connection -> no Wi-Fi traffic, no phone battery, and (when idle) the server
-// releases the camera and stops the preview pipeline entirely. previewAvailable is
-// false while a recording started with "Live preview while recording" unchecked --
-// there's no stream to fetch then, so we don't try.
+// Preview is always shown when a stream exists. previewAvailable is false only
+// while a recording started with "Live preview while recording" unticked -- then
+// there's no stream to fetch, so we hide the <img> and don't retry.
 let previewAvailable = true;
-function previewWanted(){ return $('showpv').checked && previewAvailable; }
-function reconnectPreview(){ if(previewWanted()) $('preview').src = '/preview.mjpg?' + Date.now(); }
+function reconnectPreview(){ if(previewAvailable) $('preview').src = '/preview.mjpg?' + Date.now(); }
 function applyPreviewState(){
-  if(previewWanted()){ $('preview').style.display='block'; }
+  if(previewAvailable){ $('preview').style.display='block'; }
   else { $('preview').style.display='none'; $('preview').src=''; }
-  $('pvnote').textContent =
-    !previewAvailable ? 'Preview off for this recording (started with live preview disabled).' :
-    !$('showpv').checked ? 'Hidden — preview stopped and camera released while idle (recording is unaffected).' : '';
 }
-$('preview').onerror = () => { if(previewWanted()) setTimeout(reconnectPreview, 1200); };
-$('showpv').onchange = () => { applyPreviewState(); if(previewWanted()) reconnectPreview(); };
+$('preview').onerror = () => { if(previewAvailable) setTimeout(reconnectPreview, 1200); };
 
 let wasRunning = null;
 async function refreshStatus(){
@@ -446,35 +651,21 @@ async function refreshStatus(){
     $('detail').textContent = s.running && s.file ? s.file : '';
     $('start').disabled = s.running;
     $('stop').disabled  = !s.running;
-    $('snap').disabled  = s.running;
-    $('rootnote').textContent = (!s.server_root && $('logth').checked)
-      ? 'Note: logging to file needs the server run under sudo.' : '';
-    // track whether a preview stream exists right now (idle, or recording-with-tee)
+    $('manage').classList.toggle('disabled', s.running);  // no file mgmt while recording
+    $('rootnote').textContent = !s.server_root
+      ? 'Note: thermal logging needs the server run under sudo.' : '';
     const prevAvail = previewAvailable;
     previewAvailable = (s.preview !== false);
     if(prevAvail !== previewAvailable) applyPreviewState();
-    // camera handed over on a state change -> nudge the preview to reconnect
     if((wasRunning !== null && wasRunning !== s.running) || (prevAvail !== previewAvailable))
       setTimeout(reconnectPreview, 1500);
     wasRunning = s.running;
   }catch(e){ $('statetext').textContent = 'server unreachable'; }
 }
 $('start').onclick = async () => { $('start').disabled=true;
-  await post('/start',{log_thermals:$('logth').checked, quality:+$('quality').value,
-                       preview:$('pvrec').checked, audio:$('audio').checked});
-  // audio:true -> default (auto USB mic); audio:false -> record.py gets --no-audio
+  await post('/start',{preview:$('pvrec').checked, audio:$('audio').checked});
   refreshStatus(); };
 $('stop').onclick  = async () => { $('stop').disabled=true; await post('/stop'); refreshStatus(); };
-$('snap').onclick  = async () => {
-  $('snap').disabled=true; $('snapnote').textContent='Capturing…';
-  const r = await post('/snapshot');
-  $('snapnote').textContent = r.ok
-    ? 'Saved '+r.file+' — '+r.count+' shots in /mnt/video/calib'
-    : 'Error: '+(r.error||'failed');
-  $('snap').disabled=false;
-  setTimeout(reconnectPreview, 1500);   // preview blinked during the grab
-};
-$('logth').onchange = refreshStatus;
 $('showth').onchange = () => { $('thermals').style.display = $('showth').checked?'block':'none'; };
 
 async function refreshThermals(){
@@ -492,6 +683,140 @@ async function refreshThermals(){
 setInterval(refreshStatus, 1500);
 setInterval(refreshThermals, 2000);
 refreshStatus();
+</script></body></html>"""
+
+
+FILES_PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manage Files</title>
+<style>
+ :root { color-scheme: dark; }
+ body { font-family: system-ui, sans-serif; margin:0; background:#111; color:#eee; }
+ .wrap { max-width:720px; margin:0 auto; padding:20px; }
+ h1 { font-size:1.2rem; }
+ a.back { color:#7fb2d9; text-decoration:none; }
+ .card { padding:14px; border-radius:10px; background:#1b1b1b; margin-bottom:16px; }
+ .banner { background:#5a1f1f; color:#ffdede; padding:12px; border-radius:10px; margin-bottom:16px; }
+ button { padding:12px 16px; font-size:1rem; font-weight:700; border:0; border-radius:10px;
+          color:#fff; background:#2a6f9e; margin:4px 4px 4px 0; }
+ button.danger { background:#b3271e; } button.go { background:#1f8a3b; }
+ button:disabled { opacity:.35; }
+ table { width:100%; border-collapse:collapse; font-size:.92rem; }
+ th,td { padding:6px 8px; border-bottom:1px solid #222; text-align:left; }
+ td.sz { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+ .ok{color:#4caf50}.warn{color:#ffb300}.muted{color:#888;}
+ .bar { height:14px; background:#333; border-radius:7px; overflow:hidden; }
+ .bar > div { height:100%; width:0; background:#1f8a3b; transition:width .3s; }
+ .name { word-break:break-all; }
+</style></head><body><div class="wrap">
+ <h1>&#128193; Manage Files <a class="back" href="/">&larr; back to recorder</a></h1>
+ <div id="recbanner" class="banner" style="display:none">Recording in progress — file
+   management is disabled to protect the recording. Stop recording first.</div>
+
+ <div class="card">
+   <div id="ssd">…</div>
+   <div id="ssdbtn" style="margin-top:8px"></div>
+ </div>
+
+ <div class="card" id="xfercard" style="display:none">
+   <div>Transferring… <span id="xferpct">0%</span></div>
+   <div class="bar"><div id="xferbar"></div></div>
+   <div id="xferline" class="muted" style="margin-top:6px"></div>
+ </div>
+
+ <div class="card">
+   <button class="go" id="btnxfer" onclick="transfer()">&#8681; Transfer selected</button>
+   <button class="danger" id="btndel" onclick="del()">&#128465; Delete selected</button>
+   <button onclick="load()">&#8635; Refresh</button>
+   <div class="muted" id="selnote" style="margin-top:8px"></div>
+ </div>
+
+ <div class="card">
+   <table>
+     <thead><tr>
+       <th><input type="checkbox" id="all" onchange="toggleAll()"></th>
+       <th>File</th><th class="sz">Size</th><th>On SSD</th>
+     </tr></thead>
+     <tbody id="rows"></tbody>
+   </table>
+ </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const post = (u,b) => fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},
+                              body:JSON.stringify(b||{})}).then(r=>r.json());
+let mounted=false, recording=false;
+
+function selected(){ return [...document.querySelectorAll('.sel:checked')].map(c=>c.dataset.name); }
+function toggleAll(){ document.querySelectorAll('.sel').forEach(c=>c.checked=$('all').checked); updateSel(); }
+function updateSel(){
+  const n=selected().length;
+  $('selnote').textContent = n? (n+' selected') : 'Select files above, then Transfer or Delete.';
+  $('btnxfer').disabled = recording || !mounted || !n;
+  $('btndel').disabled  = recording || !n;
+}
+
+function ssdCell(f){
+  if(!mounted) return '<span class="muted">—</span>';
+  if(f.match) return '<span class="ok">&#10003; verified</span>';
+  if(f.on_ssd) return '<span class="warn">&#9888; size differs</span>';
+  return '<span class="muted">not copied</span>';
+}
+
+async function load(){
+  const s = await (await fetch('/api/files')).json();
+  recording = s.recording; mounted = s.ssd.mounted;
+  $('recbanner').style.display = recording ? 'block' : 'none';
+
+  // SSD status + mount/unmount button
+  let html, btn='';
+  if(!s.ssd.present){ html='No SSD detected — plug it in, then Refresh.'; }
+  else if(!s.ssd.mounted){ html='SSD detected, not mounted.';
+    btn='<button class="go" onclick="mount()">Mount SSD</button>'; }
+  else { html='Mounted at '+s.ssd.mountpoint+' — free '+s.ssd.free+' of '+s.ssd.total
+             +' &nbsp;(copies go to '+s.ssd.mountpoint+'/'+s.ssd.subdir+'/)';
+    btn='<button onclick="unmount()">Unmount SSD</button>'; }
+  $('ssd').innerHTML = html; $('ssdbtn').innerHTML = recording ? '' : btn;
+
+  // file rows
+  $('rows').innerHTML = s.files.length ? s.files.map(f =>
+    '<tr><td><input type="checkbox" class="sel" data-name="'+f.name+'" onchange="updateSel()"></td>'+
+    '<td class="name">'+f.name+'</td><td class="sz">'+f.size_h+'</td><td>'+ssdCell(f)+'</td></tr>'
+  ).join('') : '<tr><td colspan="4" class="muted">No files in '+s.output_dir+'.</td></tr>';
+  $('all').checked=false;
+  updateSel();
+}
+
+async function mount(){ const r=await post('/api/mount'); if(!r.ok) alert(r.error||'mount failed'); load(); }
+async function unmount(){ const r=await post('/api/unmount'); if(!r.ok) alert(r.error||'unmount failed'); load(); }
+
+async function transfer(){
+  const names = selected(); if(!names.length) return;
+  const r = await post('/api/transfer', {names});
+  if(!r.ok){ alert(r.error||'transfer failed'); return; }
+  $('xfercard').style.display='block'; $('btnxfer').disabled=true; $('btndel').disabled=true;
+  const t = setInterval(async () => {
+    const s = await (await fetch('/api/transfer_status')).json();
+    $('xferpct').textContent = s.percent+'%'; $('xferbar').style.width = s.percent+'%';
+    $('xferline').textContent = s.line||'';
+    if(s.done){ clearInterval(t); $('xfercard').style.display='none';
+      if(!s.ok) alert('Transfer error: '+(s.error||'unknown')); load(); }
+  }, 1000);
+}
+
+async function del(){
+  const names = selected(); if(!names.length) return;
+  if(!confirm('Delete '+names.length+' file(s) from the Orin? This cannot be undone.\\n\\n'
+              +'(Verify the SSD copies first — deletes are permanent.)')) return;
+  const r = await post('/api/delete', {names});
+  if(!r.ok) alert('Some files could not be deleted:\\n'+JSON.stringify(r.errors,null,1));
+  load();
+}
+
+load();
+setInterval(() => { if($('xfercard').style.display==='none') load(); }, 5000);
 </script></body></html>"""
 
 
