@@ -118,6 +118,8 @@ class Config:
     audio_channels = 1              # mono is plenty for a field mic
     audio_sample_format = "S16LE"   # 16-bit PCM (~5.5 MB/min mono; tiny vs 40 GB/hr video)
     audio_poll_seconds = 2.0        # how often the supervisor re-checks for the mic
+    audio_settle_seconds = 1.2      # wait after a mic appears before opening it (USB/ALSA
+                                    # lists the card a moment before the PCM is openable)
 
     output_dir = "/mnt/video"       # the NVMe mount point (records land here)
     filename_prefix = "game"        # output files: game_YYYY-MM-DD_HH-MM-SS.mkv
@@ -343,7 +345,7 @@ def video_pipeline_desc(cfg, output_path):
     return " ".join(_video_chain(cfg, output_path))
 
 
-def audio_pipeline_desc(cfg, wav_path):
+def audio_pipeline_desc(cfg, device, wav_path):
     """One audio segment: USB mic -> S16LE PCM -> WAV file (run via capture.py).
 
     Source named 'asrc' for capture.py's anchor probe. A leaky queue keeps a mic
@@ -353,7 +355,7 @@ def audio_pipeline_desc(cfg, wav_path):
     caps = (f"audio/x-raw,rate={cfg.audio_rate},channels={cfg.audio_channels},"
             f"format={cfg.audio_sample_format}")
     return " ".join([
-        "alsasrc", f"device={cfg.audio_device}", "name=asrc", "do-timestamp=true",
+        "alsasrc", f"device={device}", "name=asrc", "do-timestamp=true",
         "!", "queue", "max-size-buffers=200", "leaky=downstream",
         "!", "audioconvert", "!", "audioresample",
         "!", caps,
@@ -473,6 +475,19 @@ def spawn_capture(desc, probe_name, on_anchor):
     return proc
 
 
+def _remove_if_empty(path):
+    """Delete a segment WAV that never captured audio (a failed open attempt).
+
+    'Never anchored' means no first buffer ever flowed, so the file is just an
+    empty/header-only WAV - clutter we don't want next to the real segments.
+    """
+    try:
+        if path and os.path.exists(path) and os.path.getsize(path) < 1024:
+            os.remove(path)
+    except OSError:
+        pass
+
+
 def _sigint_and_wait(proc, timeout):
     """SIGINT a capture process (-> clean EOS in capture.py) and reap it."""
     if proc is None or proc.poll() is not None:
@@ -502,29 +517,48 @@ def audio_supervisor(cfg, sidecar, base_stem, stop_event):
     """
     seg_index = 0
     audio_proc = None
+    seg = None                                        # {"wav":..., "anchored":bool} for the live segment
+
+    def cleanup_failed(s):
+        # A segment that never anchored captured no audio (failed/empty open) -
+        # drop its empty WAV so only real segments sit next to the video.
+        if s is not None and not s["anchored"]:
+            _remove_if_empty(s["wav"])
+
     try:
         while not stop_event.is_set():
             if audio_proc is None or audio_proc.poll() is not None:
-                audio_proc = None                     # previous segment ended (or none yet)
-                device = cfg.audio_device or detect_audio_device()
+                cleanup_failed(seg)                   # the attempt that just ended
+                audio_proc = None
+                seg = None
+                # Forced device stays fixed; otherwise re-detect (a replugged mic
+                # can land on a new card number).
+                device = cfg.audio_device if _device_was_forced else detect_audio_device()
                 if device:
-                    cfg.audio_device = device
+                    # A just-plugged USB mic is listed before its PCM is openable;
+                    # let it settle so we don't burn a failed open attempt.
+                    stop_event.wait(cfg.audio_settle_seconds)
+                    if stop_event.is_set():
+                        break
+                    device = cfg.audio_device if _device_was_forced else detect_audio_device()
+                if device:
                     seg_index += 1
                     wav_path = f"{base_stem}_a{seg_index}.wav"
-                    desc = audio_pipeline_desc(cfg, wav_path)
+                    seg = {"wav": wav_path, "anchored": False}
                     print(f"  audio: mic {device} -> segment {seg_index} "
                           f"({os.path.basename(wav_path)})")
+
+                    def on_anchor(ns, utc, wp=wav_path, s=seg):
+                        s["anchored"] = True
+                        sidecar.add_audio_segment(wp, ns, utc)
+
                     audio_proc = spawn_capture(
-                        desc, "asrc",
-                        lambda ns, utc, wp=wav_path: sidecar.add_audio_segment(wp, ns, utc))
-                    # If we auto-detected, don't pin the device - re-detect next
-                    # segment (a replugged mic can land on a new card number).
-                    if not _device_was_forced:
-                        cfg.audio_device = None
+                        audio_pipeline_desc(cfg, device, wav_path), "asrc", on_anchor)
             stop_event.wait(cfg.audio_poll_seconds)
     finally:
         if audio_proc is not None:
             _sigint_and_wait(audio_proc, 15)
+        cleanup_failed(seg)
 
 
 # Set once in main(): True if the user passed --audio-device (so we keep it fixed
@@ -644,12 +678,8 @@ def record(cfg, seconds=None, dry_run=False, measure=False, log_thermals=False):
         print(" ", video_pipeline_desc(cfg, output_path))
         if audio_on:
             print("\nAudio segment pipeline that would run (via capture.py):")
-            demo = dict(device=cfg.audio_device or "plughw:<auto>")
-            cfg2 = cfg
-            saved = cfg2.audio_device
-            cfg2.audio_device = demo["device"]
-            print(" ", audio_pipeline_desc(cfg2, base_stem + "_a1.wav"))
-            cfg2.audio_device = saved
+            demo_dev = cfg.audio_device or "plughw:<auto-detected USB mic>"
+            print(" ", audio_pipeline_desc(cfg, demo_dev, base_stem + "_a1.wav"))
         print(f"\nSidecar that would be written: {sidecar_path}")
         return None
 
