@@ -547,6 +547,10 @@ def api_mount():
 
 @app.route("/api/unmount", methods=["POST"])
 def api_unmount():
+    with _xfer_lock:
+        if _xfer["active"]:
+            return jsonify(ok=False,
+                           error="A transfer is in progress — wait for it to finish."), 409
     if not _ssd_mounted():
         return jsonify(ok=True, already=True)
     _run_ok(["sync"], timeout=30)
@@ -867,8 +871,8 @@ function updateSel(){
   const n=selected().length;
   $('selnote').textContent = n ? (n+' selected')
     : 'Tap a folder to open it. Tick files, then Transfer or Delete.';
-  $('btnxfer').disabled = recording || !mounted || state.loc!=='video' || !n;
-  $('btndel').disabled  = recording || !n;
+  $('btnxfer').disabled = recording || !mounted || state.loc!=='video' || !n || xferActive;
+  $('btndel').disabled  = recording || !n || xferActive;
 }
 function ssdCell(f){
   if(state.loc!=='video' || !mounted) return '';
@@ -904,7 +908,8 @@ async function load(){
     btn='<button class="go" onclick="mount()">Mount SSD</button>'; }
   else { html='SSD mounted at '+s.ssd.mountpoint+' — free '+s.ssd.free+' of '+s.ssd.total
              +' (transfers land in '+s.ssd.subdir+'/)';
-    btn='<button onclick="unmount()">Unmount SSD</button>'; }
+    btn='<button id="btnunmount" onclick="unmount()"'+(xferActive?' disabled':'')
+        +'>Unmount SSD</button>'; }
   $('ssd').innerHTML = html; $('ssdbtn').innerHTML = btn;
 
   // breadcrumb (hidden while searching)
@@ -990,6 +995,7 @@ async function transfer(){
   if(!r.ok){ alert(r.error||'transfer failed'); return; }
   xferActive=true; $('xfercard').style.display='block';
   $('btnxfer').disabled=true; $('btndel').disabled=true;
+  if($('btnunmount')) $('btnunmount').disabled=true;   // no unmount mid-transfer
   const t = setInterval(async () => {
     const s = await (await fetch('/api/transfer_status')).json();
     $('xferpct').textContent = s.percent+'%'; $('xferbar').style.width = s.percent+'%';
