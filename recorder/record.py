@@ -20,43 +20,73 @@ Why MJPEG / why this pipeline (the hard-won lessons):
   * Every queue is leaky=downstream so the VIC's small buffer pool can never be
     starved into a deadlock - under pressure it drops a frame instead of stalling.
   * Container is MKV (matroskamux): crash-resilient. The MKV gets its duration +
-    seek index only on a clean EOS, which this script sends on stop (SIGINT). A
+    seek index only on a clean EOS, which capture.py sends on stop (SIGINT). A
     file killed with SIGTERM shows Duration: N/A and won't scrub. MJPEG-in-MKV
     needs VLC to play.
 
-Optional live preview (--preview-port N):
-  Adds a `tee` that splits the captured frames into two branches:
-    record  branch: full-res JPEG -> file        (NVJPG engine)
-    preview branch: downscaled JPEG -> tcpserversink on port N   (NVJPG1 engine)
-  This lets server.py show a live in-browser preview WHILE recording. The second
-  JPEG encode runs on the Orin's second hardware JPEG engine, so it barely costs
-  anything and the leaky queues keep the preview branch from ever back-pressuring
-  the recording branch. Without the flag, the recorder runs preview-free as
-  before.
+--------------------------------------------------------------------------------
+Audio (on by default, best-effort, fault-isolated from video)
+--------------------------------------------------------------------------------
+The Orin has NO analog audio input, so audio needs a USB Audio Class (UAC) mic -
+any class-compliant USB mic / interface shows up as an ALSA card with no driver
+work. Audio is recorded as a SEPARATE process writing its own WAV file, NOT muxed
+into the video MKV. Why separate:
 
-Pipeline (default, no preview):
+  * VIDEO MUST SURVIVE AUDIO FAILURE. If the mic is unplugged mid-record, its
+    capture process errors and dies - but the video capture is a totally
+    separate OS process that shares nothing with it, so video keeps recording,
+    guaranteed. (You cannot get that guarantee inside one gst pipeline: a fatal
+    source error there tears down the whole pipeline, video included.)
+  * HOT-PLUG / RESUME. A supervisor thread watches for the mic. Whenever a mic
+    is present and audio isn't currently recording, it starts a NEW audio
+    segment (a fresh WAV). Unplug -> that segment ends; replug -> a new segment
+    starts. No mic at start -> no audio, but the sidecar is still written.
+
+Sync between the two files is by timestamp, done in post. WAV carries no
+timestamps, and MKV stores only relative per-frame offsets, so we record an
+absolute CAPTURE-TIME ANCHOR for each stream on the shared CLOCK_MONOTONIC clock
+into a SIDECAR json ("<stem>.sync.json"):
+
+    align: shift each audio segment by (segment.anchor_ns - video.anchor_ns)/1e9 s
+
+capture.py reads each stream's first-buffer clock time and reports it to this
+supervisor over stdout; THIS process is the sole writer of the sidecar (behind a
+lock, written atomically), so the capture processes can never race on it. Merge
+the files later on the desktop with merge_av.py (which also re-attaches audio to
+a stitched panorama, since the stitcher drops audio).
+
+Pipeline (video, default, no preview):
   nvv4l2camerasrc -> NVMM,UYVY -> nvvidconv -> I420 -> queue(leaky)
     -> nvjpegenc -> jpegparse -> matroskamux -> filesink
+Pipeline (audio segment):
+  alsasrc -> queue(leaky) -> audioconvert -> audioresample -> S16LE -> wavenc -> filesink
 
 Usage:
-    python3 record.py                 # record until Enter / Ctrl+C
+    python3 record.py                 # record video + audio (if a mic is present)
+    python3 record.py --no-audio      # video only
     python3 record.py --seconds 30    # fixed 30 seconds
+    python3 record.py --audio-device plughw:2,0   # force a specific mic
     python3 record.py --seconds 600 --log-thermals   # soak test + thermal log
-    python3 record.py --measure --seconds 20         # self-test: sustained fps
+    python3 record.py --measure --seconds 20         # self-test: sustained fps (no audio)
     python3 record.py --preview-port 8090            # also serve preview (server.py uses this)
-    python3 record.py --dry-run       # print the pipeline, don't run
+    python3 record.py --dry-run       # print the pipelines, don't run
 """
 
 import argparse
 import datetime
+import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 
 # Multipart boundary for the preview MJPEG stream. MUST match server.py.
 PREVIEW_BOUNDARY = "spinframe"
+
+CAPTURE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "capture.py")
 
 
 class Config:
@@ -77,6 +107,18 @@ class Config:
     preview_height = 400
     preview_quality = 50
 
+    # Audio (on by default; --no-audio disables). Mic must be a USB Audio Class
+    # device (the Orin has no analog input). audio_device None -> auto-detect the
+    # first USB capture card from `arecord -l`; override with --audio-device.
+    # Recorded as WAV/PCM: no codec (zero encode CPU), and no trailer to finalize,
+    # so an abrupt unplug at worst leaves a stale length field the merge repairs.
+    audio_enabled = True
+    audio_device = None             # e.g. "plughw:2,0"; None = auto-detect each segment
+    audio_rate = 48000              # 48 kHz
+    audio_channels = 1              # mono is plenty for a field mic
+    audio_sample_format = "S16LE"   # 16-bit PCM (~5.5 MB/min mono; tiny vs 40 GB/hr video)
+    audio_poll_seconds = 2.0        # how often the supervisor re-checks for the mic
+
     output_dir = "/mnt/video"       # the NVMe mount point (records land here)
     filename_prefix = "game"        # output files: game_YYYY-MM-DD_HH-MM-SS.mkv
 
@@ -92,8 +134,30 @@ def _run(cmd, check=True):
     return subprocess.run(cmd, check=check, capture_output=True, text=True)
 
 
+def _gi_gst_ok():
+    """Can we import the GStreamer Python bindings? capture.py needs them."""
+    try:
+        import gi
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst  # noqa: F401
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _utc_now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+# --------------------------------------------------------------------------
+# Prerequisite checks
+# --------------------------------------------------------------------------
 def check_prerequisites(cfg, measure=False):
-    """Fail early with a clear message if something basic is wrong."""
+    """Fail early with a clear message if something basic is wrong.
+
+    Audio problems are NEVER fatal here - audio is best-effort. Missing camera /
+    GStreamer / disk is fatal; a missing mic just means video-only.
+    """
     problems = []
 
     if shutil.which("gst-launch-1.0") is None:
@@ -109,6 +173,16 @@ def check_prerequisites(cfg, measure=False):
         problems.append(f"Camera device {cfg.device} does not exist. "
                         f"Check `ls /dev/video*` and the ribbon connection.")
 
+    if not measure:
+        # The real recorder drives the pipeline from capture.py (python-gi), so
+        # both are hard requirements (--measure still uses plain gst-launch).
+        if not os.path.exists(CAPTURE_SCRIPT):
+            problems.append(f"capture.py not found next to record.py ({CAPTURE_SCRIPT}).")
+        if not _gi_gst_ok():
+            problems.append("python3-gi (GStreamer Python bindings) not found - the "
+                            "recorder needs it. Install: sudo apt install python3-gi "
+                            "gir1.2-gstreamer-1.0.")
+
     if not measure:  # in --measure we never touch the disk
         if not os.path.isdir(cfg.output_dir):
             problems.append(f"Output directory {cfg.output_dir} does not exist. "
@@ -118,6 +192,16 @@ def check_prerequisites(cfg, measure=False):
                             f"Try: sudo chown $USER:$USER {cfg.output_dir}")
 
     return problems
+
+
+def audio_warnings(cfg):
+    """Non-fatal audio-only checks (gi + capture.py are already fatal-checked)."""
+    warns = []
+    if shutil.which("gst-inspect-1.0") and \
+            _run(["gst-inspect-1.0", "wavenc"], check=False).returncode != 0:
+        warns.append("wavenc not found; audio disabled. "
+                     "Install with: sudo apt install gstreamer1.0-plugins-good.")
+    return warns
 
 
 def apply_controls(cfg, dry_run=False):
@@ -134,6 +218,39 @@ def apply_controls(cfg, dry_run=False):
                   f"{result.stderr.strip() or 'unknown error'}")
         else:
             print(f"  set {ctrl}")
+
+
+# --------------------------------------------------------------------------
+# Audio device detection - find the first USB capture card via `arecord -l`.
+# Output lines look like:  card 2: Device [USB Audio Device], device 0: ...
+# We return an ALSA "plughw:<card>,<device>" string. plughw (vs raw hw) lets
+# ALSA convert the card's native rate/format to what the pipeline asks for, so
+# any class-compliant mic just works regardless of its native sample rate. We
+# re-detect for every segment because a mic often re-enumerates to a new card
+# number when it's replugged (hw:2 -> hw:3).
+# --------------------------------------------------------------------------
+def detect_audio_device():
+    if shutil.which("arecord") is None:
+        return None
+    result = _run(["arecord", "-l"], check=False)
+    if result.returncode != 0:
+        return None
+    usb_card = None
+    any_card = None
+    for line in result.stdout.splitlines():
+        m = re.match(r"\s*card (\d+):.*?device (\d+):", line)
+        if not m:
+            continue
+        card, device = m.group(1), m.group(2)
+        if any_card is None:
+            any_card = (card, device)
+        if "usb" in line.lower():
+            usb_card = (card, device)
+            break
+    chosen = usb_card or any_card
+    if chosen is None:
+        return None
+    return f"plughw:{chosen[0]},{chosen[1]}"
 
 
 # --------------------------------------------------------------------------
@@ -172,6 +289,9 @@ def stop_thermal_log(proc):
 
 # --------------------------------------------------------------------------
 # Pipeline construction
+#   - _video_chain / video_pipeline_desc: the real recording (run via capture.py)
+#   - build_pipeline: the --measure self-test only (plain gst-launch, no disk)
+#   - audio_pipeline_desc: one audio segment (run via capture.py)
 # --------------------------------------------------------------------------
 def _record_branch(cfg, output_path):
     """Full-res JPEG -> MKV file (runs on the primary NVJPG engine)."""
@@ -194,18 +314,60 @@ def _preview_branch(cfg):
     ]
 
 
-def build_pipeline(cfg, output_path, measure=False):
-    """
-    Build the gst-launch argument list.
+def _video_chain(cfg, output_path):
+    """The real-recording video element chain (no preview, or tee'd preview).
 
-    measure=True swaps the muxer+filesink for fpsdisplaysink+fakesink (no disk).
-    cfg.preview_port set -> tee the stream into record + preview branches.
+    The source is named 'vsrc' so capture.py can attach the first-frame anchor
+    probe. Everything downstream is byte-for-byte the proven 30fps pipeline.
     """
+    nvmm_caps = (f"video/x-raw(memory:NVMM),format={cfg.pixel_format},"
+                 f"width={cfg.width},height={cfg.height},framerate={cfg.fps}/1")
+    src = ["nvv4l2camerasrc", f"device={cfg.device}", "name=vsrc", "!", nvmm_caps]
+    if cfg.preview_port:
+        return src + [
+            "!", "tee", "name=t",
+            "t.", "!", "queue", "max-size-buffers=8", "leaky=downstream", "!",
+        ] + _record_branch(cfg, output_path) + [
+            "t.", "!", "queue", "max-size-buffers=4", "leaky=downstream", "!",
+        ] + _preview_branch(cfg)
+    return src + [
+        "!", "nvvidconv", "!", "video/x-raw,format=I420",
+        "!", "queue", "max-size-buffers=8", "leaky=downstream",
+        "!", "nvjpegenc", f"quality={cfg.jpeg_quality}", "!", "jpegparse",
+        "!", "matroskamux", "!", "filesink", f"location={output_path}",
+    ]
+
+
+def video_pipeline_desc(cfg, output_path):
+    """gst-launch-style description string for capture.py."""
+    return " ".join(_video_chain(cfg, output_path))
+
+
+def audio_pipeline_desc(cfg, wav_path):
+    """One audio segment: USB mic -> S16LE PCM -> WAV file (run via capture.py).
+
+    Source named 'asrc' for capture.py's anchor probe. A leaky queue keeps a mic
+    hiccup from backing up; audioconvert+audioresample turn any UAC mic's native
+    format into the 48 kHz mono S16LE we store.
+    """
+    caps = (f"audio/x-raw,rate={cfg.audio_rate},channels={cfg.audio_channels},"
+            f"format={cfg.audio_sample_format}")
+    return " ".join([
+        "alsasrc", f"device={cfg.audio_device}", "name=asrc", "do-timestamp=true",
+        "!", "queue", "max-size-buffers=200", "leaky=downstream",
+        "!", "audioconvert", "!", "audioresample",
+        "!", caps,
+        "!", "wavenc",
+        "!", "filesink", f"location={wav_path}",
+    ])
+
+
+def build_pipeline(cfg, output_path, measure=False):
+    """gst-launch argument list. Used only for --measure (and --dry-run display)."""
     nvmm_caps = (f"video/x-raw(memory:NVMM),format={cfg.pixel_format},"
                  f"width={cfg.width},height={cfg.height},framerate={cfg.fps}/1")
     flags = ["-e", "-v"] if measure else ["-e"]
     src = ["nvv4l2camerasrc", f"device={cfg.device}", "!", nvmm_caps]
-
     if measure:
         chain = src + [
             "!", "nvvidconv", "!", "video/x-raw,format=I420",
@@ -213,23 +375,8 @@ def build_pipeline(cfg, output_path, measure=False):
             "!", "nvjpegenc", f"quality={cfg.jpeg_quality}", "!", "jpegparse",
             "!", "fpsdisplaysink", "video-sink=fakesink", "sync=false", "text-overlay=false",
         ]
-    elif cfg.preview_port:
-        # tee -> [record branch] + [preview branch]; each branch starts with its
-        # own leaky queue so a slow branch can never back-pressure the other.
-        chain = src + [
-            "!", "tee", "name=t",
-            "t.", "!", "queue", "max-size-buffers=8", "leaky=downstream", "!",
-        ] + _record_branch(cfg, output_path) + [
-            "t.", "!", "queue", "max-size-buffers=4", "leaky=downstream", "!",
-        ] + _preview_branch(cfg)
     else:
-        chain = src + [
-            "!", "nvvidconv", "!", "video/x-raw,format=I420",
-            "!", "queue", "max-size-buffers=8", "leaky=downstream",
-            "!", "nvjpegenc", f"quality={cfg.jpeg_quality}", "!", "jpegparse",
-            "!", "matroskamux", "!", "filesink", f"location={output_path}",
-        ]
-
+        chain = _video_chain(cfg, output_path)
     return ["gst-launch-1.0"] + flags + chain
 
 
@@ -238,47 +385,189 @@ def make_output_path(cfg):
     return os.path.join(cfg.output_dir, f"{cfg.filename_prefix}_{stamp}.mkv")
 
 
-def record(cfg, seconds=None, dry_run=False, measure=False, log_thermals=False):
-    output_path = None if measure else make_output_path(cfg)
+# --------------------------------------------------------------------------
+# Sidecar - THE single source of truth for A/V alignment, written ONLY here.
+# Every mutation takes the lock and writes atomically (temp file + os.replace),
+# so a reader can never see a half-written file and the capture processes (which
+# never open it) can't race on it.
+# --------------------------------------------------------------------------
+class Sidecar:
+    def __init__(self, path, video_file, cfg):
+        self.path = path
+        self._lock = threading.Lock()
+        self.data = {
+            "version": 1,
+            "clock": "CLOCK_MONOTONIC (gst SystemClock), nanoseconds",
+            "created_utc": _utc_now_iso(),
+            "align": "shift each audio segment by (segment.anchor_ns - video.anchor_ns)/1e9 seconds",
+            "video": {
+                "file": os.path.basename(video_file),
+                "anchor_ns": None,        # filled in when the first frame is captured
+                "anchor_utc": None,
+            },
+            "audio": {
+                "rate": cfg.audio_rate,
+                "channels": cfg.audio_channels,
+                "sample_format": cfg.audio_sample_format,
+            },
+            "audio_segments": [],         # one entry per time the mic was recording
+        }
+        self._flush()
 
+    def _flush(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)        # atomic on POSIX
+
+    def set_video_anchor(self, anchor_ns, anchor_utc):
+        with self._lock:
+            self.data["video"]["anchor_ns"] = anchor_ns
+            self.data["video"]["anchor_utc"] = anchor_utc
+            self._flush()
+
+    def add_audio_segment(self, wav_file, anchor_ns, anchor_utc):
+        with self._lock:
+            self.data["audio_segments"].append({
+                "file": os.path.basename(wav_file),
+                "anchor_ns": anchor_ns,
+                "anchor_utc": anchor_utc,
+            })
+            self._flush()
+
+    def finalize(self):
+        with self._lock:
+            self.data["ended_utc"] = _utc_now_iso()
+            self._flush()
+
+
+# --------------------------------------------------------------------------
+# Capture process management
+# --------------------------------------------------------------------------
+def spawn_capture(desc, probe_name, on_anchor):
+    """Launch capture.py for one stream; call on_anchor(ns, utc) on its first buffer.
+
+    start_new_session so a SIGINT to record.py doesn't hit the capture directly -
+    the supervisor decides when each capture stops (and how, cleanly).
+    """
+    proc = subprocess.Popen(
+        ["python3", CAPTURE_SCRIPT, "--pipeline", desc, "--probe", probe_name],
+        stdout=subprocess.PIPE, stderr=None, text=True, start_new_session=True)
+
+    def reader():
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("ANCHOR"):
+                parts = line.split(maxsplit=2)
+                if len(parts) >= 2:
+                    try:
+                        ns = int(parts[1])
+                    except ValueError:
+                        continue
+                    utc = parts[2] if len(parts) > 2 else ""
+                    on_anchor(ns, utc)
+
+    threading.Thread(target=reader, daemon=True).start()
+    return proc
+
+
+def _sigint_and_wait(proc, timeout):
+    """SIGINT a capture process (-> clean EOS in capture.py) and reap it."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.send_signal(signal.SIGINT)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def audio_supervisor(cfg, sidecar, base_stem, stop_event):
+    """Hot-plug loop: keep an audio segment recording whenever a mic is present.
+
+    A new WAV per segment (never reopen an old one - resume-into-the-same-WAV
+    would corrupt the implicit sample-index timing). Each segment reports its own
+    capture anchor, so each lines up to the video independently with real silent
+    gaps where the mic was gone. This thread owns the audio process lifecycle,
+    including the final clean stop.
+    """
+    seg_index = 0
+    audio_proc = None
+    try:
+        while not stop_event.is_set():
+            if audio_proc is None or audio_proc.poll() is not None:
+                audio_proc = None                     # previous segment ended (or none yet)
+                device = cfg.audio_device or detect_audio_device()
+                if device:
+                    cfg.audio_device = device
+                    seg_index += 1
+                    wav_path = f"{base_stem}_a{seg_index}.wav"
+                    desc = audio_pipeline_desc(cfg, wav_path)
+                    print(f"  audio: mic {device} -> segment {seg_index} "
+                          f"({os.path.basename(wav_path)})")
+                    audio_proc = spawn_capture(
+                        desc, "asrc",
+                        lambda ns, utc, wp=wav_path: sidecar.add_audio_segment(wp, ns, utc))
+                    # If we auto-detected, don't pin the device - re-detect next
+                    # segment (a replugged mic can land on a new card number).
+                    if not _device_was_forced:
+                        cfg.audio_device = None
+            stop_event.wait(cfg.audio_poll_seconds)
+    finally:
+        if audio_proc is not None:
+            _sigint_and_wait(audio_proc, 15)
+
+
+# Set once in main(): True if the user passed --audio-device (so we keep it fixed
+# instead of re-detecting each segment).
+_device_was_forced = False
+
+
+def _print_header(cfg, output_path, sidecar_path, audio_on, measure):
     print(f"Device      : {cfg.device}")
     print(f"Resolution  : {cfg.width}x{cfg.height} @ {cfg.fps}fps ({cfg.pixel_format})")
     print(f"Encoder     : MJPEG (hardware NVJPG), quality={cfg.jpeg_quality}")
     print(f"Storage est : ~40 GB/hr @ q85 (varies; ~12 hr on 500 GB)")
-    if cfg.preview_port and not measure:
-        print(f"Preview     : tcpserversink :{cfg.preview_port} "
-              f"({cfg.preview_width}x{cfg.preview_height} MJPEG, 2nd JPEG engine)")
     if measure:
         print("Mode        : MEASURE (no disk write; benchmarking sustained fps)")
+        return
+    if audio_on:
+        forced = cfg.audio_device if _device_was_forced else "auto-detect USB mic"
+        print(f"Audio       : {cfg.audio_channels}ch {cfg.audio_sample_format} @ "
+              f"{cfg.audio_rate} Hz WAV, separate process ({forced}); hot-plug on")
     else:
-        print(f"Output      : {output_path}")
+        print("Audio       : disabled (video only)")
+    if cfg.preview_port:
+        print(f"Preview     : tcpserversink :{cfg.preview_port} "
+              f"({cfg.preview_width}x{cfg.preview_height} MJPEG, 2nd JPEG engine)")
+    print(f"Output      : {output_path}")
+    print(f"Sidecar     : {sidecar_path}")
 
+
+# --------------------------------------------------------------------------
+# Recording
+# --------------------------------------------------------------------------
+def _record_measure(cfg, seconds, log_thermals):
+    """The --measure self-test: unchanged plain gst-launch path, no disk, no audio."""
+    _print_header(cfg, None, None, audio_on=False, measure=True)
     thermal_log_path = None
     if log_thermals:
-        if output_path:
-            thermal_log_path = os.path.splitext(output_path)[0] + ".tegrastats.log"
-        else:
-            stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            thermal_log_path = os.path.join(cfg.output_dir, f"thermal_{stamp}.log")
-        print(f"Thermal log : {thermal_log_path} (tegrastats every "
-              f"{cfg.thermal_interval_ms/1000:.0f}s)")
-    print()
-
-    print("Applying camera controls:")
-    apply_controls(cfg, dry_run=dry_run)
-    print()
-
-    pipeline = build_pipeline(cfg, output_path, measure=measure)
-
-    if dry_run:
-        print("Pipeline that would run:")
-        print(" ", " ".join(pipeline))
-        return
-
-    print("Starting...")
-    if measure:
-        print("  Watch 'current' (should hold ~30.0) and 'dropped' (should stay 0).")
-        print("  'average' starts high then settles to ~30 - startup burst, not drops.")
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        thermal_log_path = os.path.join(cfg.output_dir, f"thermal_{stamp}.log")
+        print(f"Thermal log : {thermal_log_path}")
+    print("\nApplying camera controls:")
+    apply_controls(cfg)
+    print("\nStarting...")
+    print("  Watch 'current' (should hold ~30.0) and 'dropped' (should stay 0).")
     if seconds:
         print(f"  (will stop automatically after {seconds} seconds)")
     else:
@@ -287,27 +576,10 @@ def record(cfg, seconds=None, dry_run=False, measure=False, log_thermals=False):
 
     thermal_proc = start_thermal_log(thermal_log_path, cfg.thermal_interval_ms) \
         if log_thermals else None
-
-    # start_new_session: own process group, so SIGINT reaches the whole pipeline
-    # for a clean EOS (finalized, playable MKV).
-    proc = subprocess.Popen(pipeline, start_new_session=True)
+    proc = subprocess.Popen(build_pipeline(cfg, None, measure=True), start_new_session=True)
 
     def stop():
-        if proc.poll() is None:
-            print("\nStopping (finalizing MKV)...")
-            try:
-                proc.send_signal(signal.SIGINT)
-            except ProcessLookupError:
-                pass
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                print("  did not finalize in time; terminating.")
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+        _sigint_and_wait(proc, 15)
 
     try:
         if seconds:
@@ -327,40 +599,166 @@ def record(cfg, seconds=None, dry_run=False, measure=False, log_thermals=False):
     finally:
         stop_thermal_log(thermal_proc)
 
-    rc = proc.poll()
-    print()
+    print(f"\nMeasure run finished (GStreamer exit code: {proc.poll()}).")
+    if thermal_log_path:
+        print(f"Thermal log: {thermal_log_path}")
+
+
+def record(cfg, seconds=None, dry_run=False, measure=False, log_thermals=False):
     if measure:
-        print(f"Measure run finished (GStreamer exit code: {rc}).")
-        if thermal_log_path:
-            print(f"Thermal log: {thermal_log_path}")
+        if dry_run:
+            print("Pipeline that would run (measure):")
+            print(" ", " ".join(build_pipeline(cfg, None, measure=True)))
+            return None
+        return _record_measure(cfg, seconds, log_thermals)
+
+    output_path = make_output_path(cfg)
+    base_stem = os.path.splitext(output_path)[0]
+    sidecar_path = base_stem + ".sync.json"
+
+    # Decide audio once, up front (best-effort: warn and disable, never fail).
+    audio_on = cfg.audio_enabled
+    if audio_on:
+        for w in audio_warnings(cfg):
+            print(f"  audio warning: {w}")
+            audio_on = False
+    if audio_on and not (_device_was_forced or detect_audio_device()):
+        print("  audio: no USB mic detected at start; will start recording audio "
+              "automatically if one is plugged in.")
+
+    _print_header(cfg, output_path, sidecar_path, audio_on, measure=False)
+
+    thermal_log_path = None
+    if log_thermals:
+        thermal_log_path = base_stem + ".tegrastats.log"
+        print(f"Thermal log : {thermal_log_path} (tegrastats every "
+              f"{cfg.thermal_interval_ms / 1000:.0f}s)")
+    print()
+
+    print("Applying camera controls:")
+    apply_controls(cfg, dry_run=dry_run)
+    print()
+
+    if dry_run:
+        print("Video pipeline that would run (via capture.py):")
+        print(" ", video_pipeline_desc(cfg, output_path))
+        if audio_on:
+            print("\nAudio segment pipeline that would run (via capture.py):")
+            demo = dict(device=cfg.audio_device or "plughw:<auto>")
+            cfg2 = cfg
+            saved = cfg2.audio_device
+            cfg2.audio_device = demo["device"]
+            print(" ", audio_pipeline_desc(cfg2, base_stem + "_a1.wav"))
+            cfg2.audio_device = saved
+        print(f"\nSidecar that would be written: {sidecar_path}")
         return None
 
+    print("Starting...")
+    if seconds:
+        print(f"  (will stop automatically after {seconds} seconds)")
+    else:
+        print("  Press Enter to stop (or Ctrl+C).")
+    print()
+
+    thermal_proc = start_thermal_log(thermal_log_path, cfg.thermal_interval_ms) \
+        if log_thermals else None
+
+    sidecar = Sidecar(sidecar_path, output_path, cfg)
+
+    video_proc = spawn_capture(
+        video_pipeline_desc(cfg, output_path), "vsrc", sidecar.set_video_anchor)
+
+    stop_event = threading.Event()
+    audio_thread = None
+    if audio_on:
+        audio_thread = threading.Thread(
+            target=audio_supervisor, args=(cfg, sidecar, base_stem, stop_event), daemon=True)
+        audio_thread.start()
+
+    stopped = {"done": False}
+
+    def stop():
+        if stopped["done"]:
+            return
+        stopped["done"] = True
+        print("\nStopping (finalizing files)...")
+        stop_event.set()                          # tell the audio supervisor to wind down
+        _sigint_and_wait(video_proc, 15)          # clean EOS -> finalized MKV
+        if audio_thread is not None:
+            audio_thread.join(timeout=25)         # supervisor SIGINTs its own audio proc
+        sidecar.finalize()
+
+    try:
+        if seconds:
+            try:
+                video_proc.wait(timeout=seconds)
+            except subprocess.TimeoutExpired:
+                pass
+            stop()
+        else:
+            try:
+                input()
+            except EOFError:
+                # No TTY (e.g. launched by server.py): block until SIGINT arrives.
+                try:
+                    video_proc.wait()
+                except KeyboardInterrupt:
+                    pass
+            stop()
+    except KeyboardInterrupt:
+        stop()
+    finally:
+        stop_thermal_log(thermal_proc)
+
+    _report(cfg, output_path, sidecar_path, seconds, thermal_log_path)
+    return output_path
+
+
+def _report(cfg, output_path, sidecar_path, seconds, thermal_log_path):
+    print()
     if os.path.exists(output_path):
         size_mb = os.path.getsize(output_path) / 1_000_000
         print(f"Done. Wrote {output_path} ({size_mb:.1f} MB)")
         if seconds:
-            print(f"  Effective rate: ~{size_mb/seconds*3600/1000:.0f} GB/hour")
-            print(f"  Verify frame count (expect ~{cfg.fps*seconds}):")
-            print(f"    ffprobe -v error -count_frames -select_streams v:0 \\")
-            print(f"      -show_entries stream=nb_read_frames -of csv=p=0 '{output_path}'")
+            print(f"  Effective rate: ~{size_mb / seconds * 3600 / 1000:.0f} GB/hour")
         if size_mb < 0.1:
             print("  NOTE: file is suspiciously small - check the camera signal.")
         print("  Play with VLC (default players may not open MJPEG-in-MKV).")
-        if thermal_log_path and os.path.exists(thermal_log_path):
-            print(f"  Thermal log: {thermal_log_path}")
     else:
-        print(f"WARNING: expected output {output_path} was not created. "
-              f"GStreamer exit code: {rc}")
-    return output_path
+        print(f"WARNING: expected output {output_path} was not created.")
+
+    # Report the audio segments recorded (read back from the sidecar we wrote).
+    try:
+        with open(sidecar_path) as f:
+            data = json.load(f)
+        segs = data.get("audio_segments", [])
+        print(f"  Sidecar: {sidecar_path}")
+        if segs:
+            print(f"  Audio  : {len(segs)} segment(s):")
+            for s in segs:
+                p = os.path.join(cfg.output_dir, s["file"])
+                mb = os.path.getsize(p) / 1_000_000 if os.path.exists(p) else 0.0
+                print(f"           {s['file']} ({mb:.1f} MB)")
+            print("  Merge audio + video later on the desktop:")
+            print(f"    python3 merge_av.py '{sidecar_path}'")
+        else:
+            print("  Audio  : none recorded (no mic seen during this take).")
+    except Exception:                             # noqa: BLE001
+        pass
+
+    if thermal_log_path and os.path.exists(thermal_log_path):
+        print(f"  Thermal log: {thermal_log_path}")
 
 
 def main():
+    global _device_was_forced
     parser = argparse.ArgumentParser(
-        description="Record the combined stereo stream to hardware-MJPEG MKV on the NVMe.")
+        description="Record the combined stereo stream to hardware-MJPEG MKV on the NVMe, "
+                    "with optional fault-isolated USB-mic audio + a sync sidecar.")
     parser.add_argument("--seconds", type=int, default=None,
                         help="Record a fixed number of seconds, then stop.")
     parser.add_argument("--measure", action="store_true",
-                        help="Benchmark sustained fps with NO disk write (self-test).")
+                        help="Benchmark sustained fps with NO disk write (self-test, no audio).")
     parser.add_argument("--log-thermals", action="store_true",
                         help="Log tegrastats to a file next to the video. Needs root.")
     parser.add_argument("--thermal-interval", type=int, default=Config.thermal_interval_ms,
@@ -369,6 +767,11 @@ def main():
     parser.add_argument("--preview-port", type=int, default=None,
                         help="Also serve a downscaled MJPEG preview via tcpserversink "
                              "on this port (used by server.py for in-browser preview).")
+    parser.add_argument("--no-audio", action="store_true",
+                        help="Disable audio (record video only). Audio is ON by default.")
+    parser.add_argument("--audio-device", default=None,
+                        help="Force a specific ALSA capture device, e.g. plughw:2,0 "
+                             "(default: auto-detect the first USB mic, re-detected per segment).")
     parser.add_argument("--device", default=Config.device,
                         help=f"V4L2 device (default: {Config.device})")
     parser.add_argument("--output-dir", default=Config.output_dir,
@@ -376,7 +779,7 @@ def main():
     parser.add_argument("--quality", type=int, default=Config.jpeg_quality,
                         help=f"MJPEG quality 0-100 (default: {Config.jpeg_quality})")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Print the controls and pipeline without running.")
+                        help="Print the controls and pipelines without running.")
     args = parser.parse_args()
 
     cfg = Config()
@@ -385,6 +788,11 @@ def main():
     cfg.jpeg_quality = args.quality
     cfg.thermal_interval_ms = args.thermal_interval
     cfg.preview_port = args.preview_port
+
+    # Audio: on by default; never in --measure (no file is written).
+    cfg.audio_enabled = (not args.no_audio) and (not args.measure)
+    cfg.audio_device = args.audio_device
+    _device_was_forced = args.audio_device is not None
 
     problems = check_prerequisites(cfg, measure=args.measure)
     if problems:

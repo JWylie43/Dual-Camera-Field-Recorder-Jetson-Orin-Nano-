@@ -258,6 +258,12 @@ def start():
         cmd.append("--log-thermals")
     if data.get("quality"):
         cmd += ["--quality", str(int(data["quality"]))]
+    # Audio is ON by default in record.py (auto-detected USB mic, hot-plug,
+    # written as a separate WAV + sync sidecar). The checkbox only DISABLES it.
+    if data.get("audio") is False:
+        cmd.append("--no-audio")
+    elif data.get("audio_device"):
+        cmd += ["--audio-device", str(data["audio_device"])]
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with _lock:
@@ -387,6 +393,8 @@ PAGE = """<!doctype html>
    <label><input type="checkbox" id="pvrec" checked> Live preview while recording</label>
    <div class="muted">Off &rarr; camera is dedicated to recording (no preview until you stop).</div>
    <label><input type="checkbox" id="logth"> Log thermals to file</label>
+   <label><input type="checkbox" id="audio" checked> Record audio (USB mic)</label>
+   <div class="muted">On by default. Separate WAV + sync sidecar; auto-starts if a mic is present (or plugged in mid-record). Untick for video only.</div>
    <label>Quality <input type="number" id="quality" value="85" min="1" max="100"></label>
    <div id="rootnote" class="muted"></div>
  </div>
@@ -453,7 +461,8 @@ async function refreshStatus(){
 }
 $('start').onclick = async () => { $('start').disabled=true;
   await post('/start',{log_thermals:$('logth').checked, quality:+$('quality').value,
-                       preview:$('pvrec').checked});
+                       preview:$('pvrec').checked, audio:$('audio').checked});
+  // audio:true -> default (auto USB mic); audio:false -> record.py gets --no-audio
   refreshStatus(); };
 $('stop').onclick  = async () => { $('stop').disabled=true; await post('/stop'); refreshStatus(); };
 $('snap').onclick  = async () => {
