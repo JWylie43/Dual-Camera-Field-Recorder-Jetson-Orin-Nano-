@@ -24,12 +24,13 @@ Its three jobs:
      (e.g. the mic being unplugged) it makes a best-effort finalize and exits
      non-zero so the supervisor knows the segment ended.
 
-Anchor clock: GstSystemClock defaults to CLOCK_MONOTONIC, and every process on
-this Orin reads that same machine-wide monotonic clock. The absolute capture
-time of a buffer = pipeline.base_time + buffer.pts (both in monotonic ns). So
-the supervisor can line two independently-started streams up exactly by
-subtracting their anchors - no shared pipeline, no shared clock object needed,
-just the same underlying monotonic timeline.
+Anchor clock: we read the OS CLOCK_MONOTONIC (time.clock_gettime_ns) the instant
+the first buffer reaches the source pad. Every capture.py process on this Orin
+reads that same machine-wide monotonic clock, so the supervisor can line two
+independently-started streams up exactly by subtracting their anchors - no shared
+pipeline and no shared clock object needed, just the same underlying monotonic
+timeline. (base_time+PTS would be the buffer's own stamp, but get_base_time()
+reads back 0 for a live pipeline here, so the direct clock read is what's robust.)
 
 Usage (invoked by record.py, not by hand):
     python3 capture.py --pipeline "<gst pipeline description>" --probe vsrc
@@ -39,6 +40,7 @@ import argparse
 import datetime
 import signal
 import sys
+import time
 
 import gi
 gi.require_version("Gst", "1.0")
@@ -77,16 +79,17 @@ def main():
     def on_first_buffer(pad, info):
         if state["anchored"]:
             return Gst.PadProbeReturn.REMOVE
-        buf = info.get_buffer()
-        base = pipeline.get_base_time()
-        pts = buf.pts if buf is not None else Gst.CLOCK_TIME_NONE
-        if base != Gst.CLOCK_TIME_NONE and pts != Gst.CLOCK_TIME_NONE:
-            anchor_ns = base + pts                # the buffer's own capture time
-        else:                                     # fallback: read the clock right now
-            clk = pipeline.get_clock()
-            anchor_ns = clk.get_time() if clk is not None else 0
+        # Read the OS CLOCK_MONOTONIC directly the instant the first buffer
+        # reaches the source pad. For a live source the probe fires as the buffer
+        # is pushed, so this is ~its capture time. Every capture.py process reads
+        # this same machine-wide monotonic clock, so the supervisor can subtract
+        # two anchors to recover the real start skew between streams.
+        # (We used base_time+PTS first, but get_base_time() reads back 0 for a
+        # live pipeline on this platform, collapsing to running-time and losing
+        # the skew - reading the monotonic clock directly is robust.)
+        anchor_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
         state["anchored"] = True
-        print(f"ANCHOR {int(anchor_ns)} {_utc_now_iso()}", flush=True)
+        print(f"ANCHOR {anchor_ns} {_utc_now_iso()}", flush=True)
         return Gst.PadProbeReturn.REMOVE          # fire once, then get out of the data path
 
     srcpad = src.get_static_pad("src")
