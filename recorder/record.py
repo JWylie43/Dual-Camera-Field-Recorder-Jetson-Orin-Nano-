@@ -230,27 +230,27 @@ def apply_controls(cfg, dry_run=False):
 # number when it's replugged (hw:2 -> hw:3).
 # --------------------------------------------------------------------------
 def detect_audio_device():
+    """Return plughw:<card>,<device> for the first USB capture card, else None.
+
+    USB-only ON PURPOSE. The Orin's only real mic input is a USB Audio Class
+    device. It ALSO exposes the Tegra 'APE' XBAR/ADMAIF routing fabric as capture
+    cards - those are NOT microphones: opening one "succeeds" but yields no audio
+    and never errors, which would wedge the hot-plug supervisor. So we match only
+    lines that mention USB and otherwise report "no mic" (use --audio-device to
+    force a non-USB device if you ever need to).
+    """
     if shutil.which("arecord") is None:
         return None
     result = _run(["arecord", "-l"], check=False)
     if result.returncode != 0:
         return None
-    usb_card = None
-    any_card = None
     for line in result.stdout.splitlines():
-        m = re.match(r"\s*card (\d+):.*?device (\d+):", line)
-        if not m:
+        if "usb" not in line.lower():
             continue
-        card, device = m.group(1), m.group(2)
-        if any_card is None:
-            any_card = (card, device)
-        if "usb" in line.lower():
-            usb_card = (card, device)
-            break
-    chosen = usb_card or any_card
-    if chosen is None:
-        return None
-    return f"plughw:{chosen[0]},{chosen[1]}"
+        m = re.match(r"\s*card (\d+):.*?device (\d+):", line)
+        if m:
+            return f"plughw:{m.group(1)},{m.group(2)}"
+    return None
 
 
 # --------------------------------------------------------------------------

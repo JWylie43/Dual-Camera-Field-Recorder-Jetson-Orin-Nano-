@@ -46,7 +46,7 @@ printf '    %-18s ' "python3-gi"
 python3 -c 'import gi; gi.require_version("Gst","1.0"); from gi.repository import Gst' >/dev/null 2>&1 \
   && echo OK || echo "MISSING (audio will be skipped; install python3-gi gir1.2-gstreamer-1.0)"
 printf '    %-18s ' "USB mic"
-arecord -l 2>/dev/null | grep -qi 'card .*device' \
+arecord -l 2>/dev/null | grep -qi 'usb' \
   && echo "present" || echo "none (fine - plug one in anytime; recording still runs video)"
 
 echo
