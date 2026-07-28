@@ -891,7 +891,7 @@ function storageHtml(st){
        + '<span class="'+cls+'">'+st.free+' free</span>';
 }
 
-let state = {loc:'video', path:'', q:'', parent:null};
+let state = {loc:'video', path:'', q:'', parent:null, autoSub:false};
 let mounted=false, recording=false, xferActive=false;
 let lastData = null, sort = {key:'name', asc:true};
 
@@ -926,6 +926,14 @@ async function load(){
           + '&q='+encodeURIComponent(state.q)
           + '&hidden='+($('hidden').checked?'1':'0');
   const s = await (await fetch(u)).json();
+  // On first open of the SSD tab, drop straight into orin-video/ if it's there
+  // (the SSD root stays one breadcrumb click away). Only fires on the tab switch.
+  if(state.autoSub){
+    state.autoSub = false;
+    if(!s.error && !state.path && (s.entries||[]).some(e => e.is_dir && e.name==='orin-video')){
+      state.path = 'orin-video'; return load();
+    }
+  }
   recording = s.recording; mounted = s.ssd.mounted; state.parent = s.parent;
   $('nvme').innerHTML = storageHtml(s.storage);
   $('recbanner').style.display = recording ? 'block' : 'none';
@@ -1012,7 +1020,11 @@ document.querySelector('thead').addEventListener('click', e => {
   renderRows();
 });
 
-function switchLoc(loc){ state.loc=loc; state.path=''; state.q=''; $('search').value=''; load(); }
+function switchLoc(loc){
+  state.loc=loc; state.path=''; state.q=''; $('search').value='';
+  state.autoSub = (loc==='ssd');   // on the SSD tab, jump into orin-video/ if it exists
+  load();
+}
 let searchTimer;
 function onSearch(){ clearTimeout(searchTimer);
   searchTimer=setTimeout(()=>{ state.q=$('search').value.trim(); load(); }, 300); }
