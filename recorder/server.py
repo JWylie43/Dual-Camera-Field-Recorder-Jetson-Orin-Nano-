@@ -41,6 +41,7 @@ Run:
     # browse from your phone to http://<orin-ip>:8080   (hostname -I)
 """
 
+import datetime
 import glob
 import os
 import re
@@ -422,19 +423,26 @@ def _safe_join(root, rel):
 
 
 def _entry(loc, abspath, rel):
-    """One browse entry (file or folder). For the 'video' location, files also
-    carry SSD mirror status: present at /mnt/usb/orin-video/<rel> with matching
-    byte size (that's the verification)."""
+    """One browse entry (file or folder). Carries size + date (the file's mtime -
+    when it was written; for a write-once recording that's its creation time).
+    For the 'video' location, files also carry SSD mirror status: a file at the
+    SAME relative path under /mnt/usb/orin-video/ with a MATCHING BYTE SIZE
+    (verification is by path + size, not a content hash)."""
     is_dir = os.path.isdir(abspath)
     e = {"name": os.path.basename(abspath), "path": rel, "is_dir": is_dir,
-         "size": None, "size_h": "", "on_ssd": None, "match": None}
-    if is_dir:
-        return e
+         "size": None, "size_h": "", "mtime": None, "date": "",
+         "on_ssd": None, "match": None}
     try:
-        e["size"] = os.path.getsize(abspath)
-        e["size_h"] = _human(e["size"])
+        st = os.stat(abspath)
+        e["mtime"] = st.st_mtime
+        e["date"] = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+        if not is_dir:
+            e["size"] = st.st_size
+            e["size_h"] = _human(st.st_size)
     except OSError:
         pass
+    if is_dir:
+        return e
     if loc == "video" and _ssd_mounted():
         dp = os.path.join(USB_MNT, USB_SUBDIR, rel)
         if os.path.exists(dp):
@@ -785,6 +793,7 @@ FILES_PAGE = """<!doctype html>
  table { width:100%; border-collapse:collapse; font-size:.92rem; }
  th,td { padding:6px 8px; border-bottom:1px solid #222; text-align:left; }
  td.sz { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+ td.dt, th.dt { white-space:nowrap; color:#bbb; font-variant-numeric:tabular-nums; }
  .ok{color:#4caf50}.warn{color:#ffb300}.muted{color:#888;}
  .bar { height:14px; background:#333; border-radius:7px; overflow:hidden; }
  .bar > div { height:100%; width:0; background:#1f8a3b; transition:width .3s; }
@@ -803,13 +812,6 @@ FILES_PAGE = """<!doctype html>
    <div id="ssdbtn" style="margin-top:8px"></div>
  </div>
 
- <div class="card">
-   <input type="text" id="search" placeholder="Search this drive (recursive)…" oninput="onSearch()">
-   <label class="muted" style="display:block; margin-top:10px">
-     <input type="checkbox" id="hidden" onchange="load()"> Show hidden / system files
-     (<span class="muted">$RECYCLE.BIN, .Spotlight-V100, …</span>)</label>
- </div>
-
  <div class="card" id="xfercard" style="display:none">
    <div>Transferring… <span id="xferpct">0%</span></div>
    <div class="bar"><div id="xferbar"></div></div>
@@ -824,11 +826,14 @@ FILES_PAGE = """<!doctype html>
  </div>
 
  <div class="card">
+   <input type="text" id="search" placeholder="Search this drive (recursive)…" oninput="onSearch()">
+   <label class="muted" style="display:block; margin:10px 0">
+     <input type="checkbox" id="hidden" onchange="load()"> Show hidden / system files</label>
    <div id="crumbs"></div>
    <table>
      <thead><tr>
        <th><input type="checkbox" id="all" onchange="toggleAll()"></th>
-       <th>Name</th><th class="sz">Size</th><th id="hssd">On SSD</th>
+       <th>Name</th><th class="sz">Size</th><th class="dt">Date</th><th id="hssd">On SSD</th>
      </tr></thead>
      <tbody id="rows"></tbody>
    </table>
@@ -896,21 +901,22 @@ async function load(){
 
   // rows
   if(s.error){
-    $('rows').innerHTML = '<tr><td colspan="4" class="muted">'+esc(s.error)+'</td></tr>';
+    $('rows').innerHTML = '<tr><td colspan="5" class="muted">'+esc(s.error)+'</td></tr>';
   } else if(!s.entries.length){
-    $('rows').innerHTML = '<tr><td colspan="4" class="muted">'
+    $('rows').innerHTML = '<tr><td colspan="5" class="muted">'
       + (s.search?'No matches.':'Empty folder.')+'</td></tr>';
   } else {
     const up = (!s.search && state.parent!==null)
       ? '<tr class="dir" data-goto="'+esc(state.parent)+'"><td></td>'
-        +'<td class="name">&#128193; ..</td><td></td><td></td></tr>' : '';
+        +'<td class="name">&#128193; ..</td><td></td><td></td><td></td></tr>' : '';
     $('rows').innerHTML = up + s.entries.map(f => {
       if(f.is_dir) return '<tr class="dir" data-goto="'+esc(f.path)+'"><td></td>'
-        + '<td class="name">&#128193; '+esc(f.name)+'</td><td></td><td></td></tr>';
+        + '<td class="name">&#128193; '+esc(f.name)+'</td><td></td>'
+        + '<td class="dt">'+esc(f.date||'')+'</td><td></td></tr>';
       const label = s.search ? f.path : f.name;
       return '<tr><td><input type="checkbox" class="sel" data-path="'+esc(f.path)+'"></td>'
         + '<td class="name">'+esc(label)+'</td><td class="sz">'+f.size_h+'</td>'
-        + '<td>'+ssdCell(f)+'</td></tr>';
+        + '<td class="dt">'+esc(f.date||'')+'</td><td>'+ssdCell(f)+'</td></tr>';
     }).join('');
   }
   $('note').textContent = s.truncated ? 'Showing first 1000 matches — narrow your search.' : '';
