@@ -794,6 +794,7 @@ FILES_PAGE = """<!doctype html>
  th,td { padding:6px 8px; border-bottom:1px solid #222; text-align:left; }
  td.sz { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
  td.dt, th.dt { white-space:nowrap; color:#bbb; font-variant-numeric:tabular-nums; }
+ th.sort { cursor:pointer; user-select:none; } th.sort:hover { color:#fff; }
  .ok{color:#4caf50}.warn{color:#ffb300}.muted{color:#888;}
  .bar { height:14px; background:#333; border-radius:7px; overflow:hidden; }
  .bar > div { height:100%; width:0; background:#1f8a3b; transition:width .3s; }
@@ -833,7 +834,10 @@ FILES_PAGE = """<!doctype html>
    <table>
      <thead><tr>
        <th><input type="checkbox" id="all" onchange="toggleAll()"></th>
-       <th>Name</th><th class="sz">Size</th><th class="dt">Date</th><th id="hssd">On SSD</th>
+       <th class="sort" data-sort="name">Name</th>
+       <th class="sort sz" data-sort="size">Size</th>
+       <th class="sort dt" data-sort="date">Date</th>
+       <th class="sort" id="hssd" data-sort="ssd">On SSD</th>
      </tr></thead>
      <tbody id="rows"></tbody>
    </table>
@@ -848,6 +852,7 @@ const esc = s => (''+s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,
 
 let state = {loc:'video', path:'', q:'', parent:null};
 let mounted=false, recording=false, xferActive=false;
+let lastData = null, sort = {key:'name', asc:true};
 
 function selected(){ return [...document.querySelectorAll('.sel:checked')].map(c=>c.dataset.path); }
 function toggleAll(){ document.querySelectorAll('.sel').forEach(c=>c.checked=$('all').checked); updateSel(); }
@@ -884,7 +889,6 @@ async function load(){
   $('recbanner').style.display = recording ? 'block' : 'none';
   $('tab-video').className = 'tab' + (state.loc==='video'?' active':'');
   $('tab-ssd').className   = 'tab' + (state.loc==='ssd'?' active':'');
-  $('hssd').textContent = state.loc==='video' ? 'On SSD' : '';
 
   // SSD status + mount/unmount
   let html, btn='';
@@ -899,27 +903,50 @@ async function load(){
   // breadcrumb (hidden while searching)
   $('crumbs').innerHTML = (s.search || s.error) ? '' : crumbs();
 
-  // rows
-  if(s.error){
-    $('rows').innerHTML = '<tr><td colspan="5" class="muted">'+esc(s.error)+'</td></tr>';
-  } else if(!s.entries.length){
-    $('rows').innerHTML = '<tr><td colspan="5" class="muted">'
-      + (s.search?'No matches.':'Empty folder.')+'</td></tr>';
-  } else {
-    const up = (!s.search && state.parent!==null)
-      ? '<tr class="dir" data-goto="'+esc(state.parent)+'"><td></td>'
-        +'<td class="name">&#128193; ..</td><td></td><td></td><td></td></tr>' : '';
-    $('rows').innerHTML = up + s.entries.map(f => {
-      if(f.is_dir) return '<tr class="dir" data-goto="'+esc(f.path)+'"><td></td>'
-        + '<td class="name">&#128193; '+esc(f.name)+'</td><td></td>'
-        + '<td class="dt">'+esc(f.date||'')+'</td><td></td></tr>';
-      const label = s.search ? f.path : f.name;
-      return '<tr><td><input type="checkbox" class="sel" data-path="'+esc(f.path)+'"></td>'
-        + '<td class="name">'+esc(label)+'</td><td class="sz">'+f.size_h+'</td>'
-        + '<td class="dt">'+esc(f.date||'')+'</td><td>'+ssdCell(f)+'</td></tr>';
-    }).join('');
-  }
+  lastData = s;
   $('note').textContent = s.truncated ? 'Showing first 1000 matches — narrow your search.' : '';
+  renderRows();
+}
+
+// --- rows + client-side sorting ------------------------------------------
+function ssdRank(f){ return f.match ? 3 : f.on_ssd ? 2 : (f.on_ssd===false ? 1 : 0); }
+function cmp(a,b){
+  let av, bv;
+  if(sort.key==='size'){ av=a.size||0; bv=b.size||0; }
+  else if(sort.key==='date'){ av=a.mtime||0; bv=b.mtime||0; }
+  else if(sort.key==='ssd'){ av=ssdRank(a); bv=ssdRank(b); }
+  else { av=(a.path||a.name||'').toLowerCase(); bv=(b.path||b.name||'').toLowerCase(); }
+  const d = av<bv ? -1 : av>bv ? 1 : 0;
+  return sort.asc ? d : -d;
+}
+function rowHtml(f, search){
+  if(f.is_dir) return '<tr class="dir" data-goto="'+esc(f.path)+'"><td></td>'
+    + '<td class="name">&#128193; '+esc(f.name)+'</td><td></td>'
+    + '<td class="dt">'+esc(f.date||'')+'</td><td></td></tr>';
+  const label = search ? f.path : f.name;
+  return '<tr><td><input type="checkbox" class="sel" data-path="'+esc(f.path)+'"></td>'
+    + '<td class="name">'+esc(label)+'</td><td class="sz">'+f.size_h+'</td>'
+    + '<td class="dt">'+esc(f.date||'')+'</td><td>'+ssdCell(f)+'</td></tr>';
+}
+function renderRows(){
+  const s = lastData; if(!s) return;
+  // header labels + sort arrow (On SSD is blank on the SSD tab)
+  const labels = {name:'Name', size:'Size', date:'Date', ssd:(s.loc==='video'?'On SSD':'')};
+  document.querySelectorAll('th[data-sort]').forEach(th => {
+    const k = th.dataset.sort;
+    th.textContent = labels[k] + (sort.key===k && labels[k] ? (sort.asc?' \\u25B2':' \\u25BC') : '');
+  });
+  if(s.error){ $('rows').innerHTML='<tr><td colspan="5" class="muted">'+esc(s.error)+'</td></tr>';
+    $('all').checked=false; updateSel(); return; }
+  const dirs = s.entries.filter(e=>e.is_dir).sort((a,b)=>a.name.toLowerCase()<b.name.toLowerCase()?-1:1);
+  const files = s.entries.filter(e=>!e.is_dir).slice().sort(cmp);
+  const list = s.search ? files : dirs.concat(files);   // folders always first when browsing
+  if(!list.length){ $('rows').innerHTML='<tr><td colspan="5" class="muted">'
+      + (s.search?'No matches.':'Empty folder.')+'</td></tr>'; $('all').checked=false; updateSel(); return; }
+  const up = (!s.search && state.parent!==null)
+    ? '<tr class="dir" data-goto="'+esc(state.parent)+'"><td></td>'
+      +'<td class="name">&#128193; ..</td><td></td><td></td><td></td></tr>' : '';
+  $('rows').innerHTML = up + list.map(f => rowHtml(f, s.search)).join('');
   $('all').checked=false;
   updateSel();
 }
@@ -933,6 +960,13 @@ $('rows').addEventListener('change', e => { if(e.target.classList.contains('sel'
 $('crumbs').addEventListener('click', e => {
   const a = e.target.closest('a[data-crumb]'); if(!a) return;
   e.preventDefault(); state.path = a.dataset.crumb; state.q=''; $('search').value=''; load();
+});
+// click a column header to sort (client-side; toggles asc/desc). No refetch.
+document.querySelector('thead').addEventListener('click', e => {
+  const th = e.target.closest('th[data-sort]'); if(!th) return;
+  const k = th.dataset.sort;
+  if(sort.key===k) sort.asc = !sort.asc; else { sort.key=k; sort.asc=true; }
+  renderRows();
 });
 
 function switchLoc(loc){ state.loc=loc; state.path=''; state.q=''; $('search').value=''; load(); }
