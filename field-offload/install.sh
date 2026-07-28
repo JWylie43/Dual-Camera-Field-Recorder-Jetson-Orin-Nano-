@@ -15,6 +15,14 @@ fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
+echo "==> Removing any older auto-COPY install (orin-offload.*), if present..."
+# The first version auto-copied on plug-in; the current one only mounts. Clean it
+# out so a reinstall migrates cleanly and nothing auto-transfers behind your back.
+systemctl disable --now orin-offload.service >/dev/null 2>&1 || true
+rm -f /usr/local/bin/orin-offload.sh \
+      /etc/systemd/system/orin-offload.service \
+      /etc/udev/rules.d/99-orin-offload.rules
+
 echo "==> Installing mount script   -> /usr/local/bin/orin-automount.sh"
 install -m 0755 "$HERE/orin-automount.sh" /usr/local/bin/orin-automount.sh
 
