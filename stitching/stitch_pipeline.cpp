@@ -508,7 +508,10 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
     int e = endFrame >= 0 ? endFrame : (totalFrames > 0 ? totalFrames - 1 : BIG);
     bool bounded = (e < BIG);
     string out = !outFile.empty() ? outFile : (outDir + "/stitched_video.mp4");
-    VideoWriter writer(out, VideoWriter::fourcc('m', 'p', '4', 'v'), fps, Size(m.OW, m.OH));
+    // H.264 (avc1) for browser/YouTube compatibility. On macOS OpenCV routes this
+    // through AVFoundation/VideoToolbox (the Apple-Silicon media engine); elsewhere
+    // it falls back to a software H.264 encoder. Was 'mp4v' (legacy MPEG-4 Part 2).
+    VideoWriter writer(out, VideoWriter::fourcc('a', 'v', 'c', '1'), fps, Size(m.OW, m.OH));
     if (!writer.isOpened()) return "ERROR: cannot open output video";
     seekFrame(cap, s);
     Mat frame, pano;
@@ -1319,7 +1322,7 @@ static int runShell(string cmd)
 }
 
 // Attach the recording's audio (from its .sync.json sidecar) to a stitched video,
-// writing "<stem>.withaudio.mkv" next to it. Non-destructive - the video-only
+// writing "<stem>.withaudio.mp4" (H.264 video copied + AAC audio). Non-destructive - the video-only
 // stitch is left intact. Needs ffmpeg (already required for --jobs concat).
 // Mirrors recorder/merge_av.py: each audio segment is shifted onto the video
 // timeline by (segment.anchor_ns - video.anchor_ns). Returns the new file path,
@@ -1398,11 +1401,15 @@ static string attachAudioToStitch(const string &stitchedOut, const string &sourc
     string fg = filt.str();
     if (!fg.empty() && fg.back() == ';') fg.pop_back();
 
+    // MP4 + AAC: YouTube's recommended combo and browser-playable. The video is
+    // stream-copied (already H.264 from the stitch, no second re-encode), so the
+    // only work here is AAC-encoding the audio. AAC (not PCM) is what lets this be
+    // an .mp4 at all - MP4 can't carry PCM, which is why the old output was .mkv.
     fs::path outPath = fs::path(stitchedOut).parent_path() /
-                       (fs::path(stitchedOut).stem().string() + ".withaudio.mkv");
+                       (fs::path(stitchedOut).stem().string() + ".withaudio.mp4");
     string cmd = "ffmpeg -y" + inputs.str() + " -filter_complex " + q(fg) +
                  " -map 0:v -map " + q("[" + aout + "]") +
-                 " -c:v copy -c:a pcm_s16le " + q(outPath.string());
+                 " -c:v copy -c:a aac -b:a 192k -movflags +faststart " + q(outPath.string());
     cout << "[audio] attaching " << n << " segment(s) -> " << outPath.string() << "\n";
     if (runShell(cmd) != 0) { cerr << "[audio] ffmpeg failed; keeping the video-only output.\n"; return ""; }
     cout << "[audio] done -> " << outPath.string() << "\n";
