@@ -64,7 +64,7 @@ PREVIEW_W, PREVIEW_H = 1280, 400
 SETTLE = 0.6                  # seconds to let the camera/port free during a swap
 CALIB_DIR = os.path.join(OUTPUT_DIR, "calib")  # calibration snapshots land here
 
-# External SSD for field offload (keep UUID in sync with field-offload/).
+# External SSD for field offload (this server mounts/unmounts it directly).
 SSD_UUID = "5E64-018F"        # this drive's exFAT UUID (lsblk -f)
 USB_MNT = "/mnt/usb"          # where we mount it
 USB_SUBDIR = "orin-video"     # folder recordings are copied into on the SSD

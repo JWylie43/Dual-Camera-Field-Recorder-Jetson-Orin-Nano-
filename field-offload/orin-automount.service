@@ -1,7 +1,0 @@
-[Unit]
-Description=Mount the field SSD at /mnt/usb when it is plugged in
-# Started by udev (99-orin-automount.rules) via SYSTEMD_WANTS - not enabled at boot.
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/orin-automount.sh
