@@ -55,6 +55,7 @@
 #include <atomic>
 #include <mutex>
 #include <chrono>
+#include <csignal>
 #include "json.hpp"
 
 #ifdef _WIN32
@@ -80,12 +81,25 @@
 #ifdef _WIN32
   #define popen _popen
   #define pclose _pclose
+  #define PIPE_WMODE "wb"        // binary: Windows text mode would mangle raw frames with CRLF
+#else
+  #define PIPE_WMODE "w"         // POSIX popen only takes "r"/"w"; no 'b' flag
 #endif
 
 using json = nlohmann::json;
 using namespace std;
 using namespace cv;
 namespace fs = std::filesystem;
+
+static int runShell(string cmd);   // forward decl (defined near main); the encoder helpers below use it
+
+// ---- video-encoder selection (set from CLI in main) ---------------------
+// The stitch always re-encodes, so we hand raw frames to ffmpeg and let it use a
+// hardware H.264 encoder when one is available - detected generically, not tied to
+// any specific GPU. See chooseVideoEncoder().
+static string g_vencExplicit;      // --venc NAME: force a specific encoder (also parent->child in --jobs)
+static bool   g_forceCpu = false;  // --cpu / --no-hwenc: force software libx264
+static string g_vbitrate  = "15M"; // --bitrate: target video bitrate passed to -b:v
 
 struct StitchMaps
 {
@@ -494,6 +508,65 @@ static string stitchImageFile(const string &source, StitchMaps &m, double degree
     return out;
 }
 
+// Quiet, side-effect-free test that ffmpeg exists and that a given encoder actually
+// initializes on THIS machine (a hardware encoder can be listed yet fail to open).
+static string devNull() {
+#ifdef _WIN32
+    return "> NUL 2>&1";
+#else
+    return "> /dev/null 2>&1";
+#endif
+}
+static bool ffmpegAvailable() { return runShell("ffmpeg -version " + devNull()) == 0; }
+static bool encoderInitializes(const string &name)
+{
+    // one-frame null encode; nonzero exit => encoder missing or can't init here
+    return runShell("ffmpeg -hide_banner -loglevel error -f lavfi "
+                    "-i color=c=black:s=64x64:r=30 -frames:v 1 -an -c:v " + name +
+                    " -f null - " + devNull()) == 0;
+}
+
+// Pick the H.264 encoder for the ffmpeg output pipe. Precedence:
+//   1. an explicit --venc NAME (also how the parent hands its choice to --jobs children)
+//   2. unless --cpu: the first hardware encoder that initializes on this machine
+//        macOS  -> VideoToolbox;  else NVIDIA NVENC, then AMD AMF, then Intel QuickSync
+//   3. software libx264
+// Nothing is hardcoded to a particular GPU - candidates are probed at runtime, so this
+// works on any machine and quietly degrades to CPU when no hardware encoder is usable.
+static string chooseVideoEncoder()
+{
+    if (!g_vencExplicit.empty()) return g_vencExplicit;
+    if (g_forceCpu) return "libx264";
+    vector<string> cands =
+#ifdef __APPLE__
+        {"h264_videotoolbox"};
+#else
+        {"h264_nvenc", "h264_amf", "h264_qsv"};
+#endif
+    for (const auto &c : cands) if (encoderInitializes(c)) return c;
+    return "libx264";
+}
+
+// The exact ffmpeg command that reads raw BGR frames on stdin and writes an H.264 MP4.
+static string buildEncodeCmd(const string &venc, int W, int H, double fps, const string &out)
+{
+    auto q = [](const string &s) { return "\"" + s + "\""; };
+    ostringstream c;
+    c << "ffmpeg -y -hide_banner -loglevel error"
+      << " -f rawvideo -pixel_format bgr24 -video_size " << W << "x" << H
+      << " -framerate " << fps << " -i - -an"
+      // Panorama W/H aren't guaranteed even, but H.264 4:2:0 needs even dims - pad up
+      // to the next even size (adds at most a 1px black edge; a no-op when already even).
+      << " -vf \"pad=ceil(iw/2)*2:ceil(ih/2)*2\""
+      << " -c:v " << venc << " -b:v " << g_vbitrate;
+    if (venc == "libx264") c << " -preset medium";
+    // Pin output format so every encoder tags color the same way (avoids the AMF
+    // bt470bg->bt709 drift) and stays broadly playable; faststart for progressive play.
+    c << " -pix_fmt yuv420p -colorspace bt709 -color_primaries bt709 -color_trc bt709"
+      << " -movflags +faststart " << q(out);
+    return c.str();
+}
+
 static string stitchVideoFile(const string &source, StitchMaps &m, double degrees,
                               const Align &a, int startFrame, int endFrame, int totalFrames,
                               const string &outDir, const string &outFile = "",
@@ -508,11 +581,28 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
     int e = endFrame >= 0 ? endFrame : (totalFrames > 0 ? totalFrames - 1 : BIG);
     bool bounded = (e < BIG);
     string out = !outFile.empty() ? outFile : (outDir + "/stitched_video.mp4");
-    // H.264 (avc1) for browser/YouTube compatibility. On macOS OpenCV routes this
-    // through AVFoundation/VideoToolbox (the Apple-Silicon media engine); elsewhere
-    // it falls back to a software H.264 encoder. Was 'mp4v' (legacy MPEG-4 Part 2).
-    VideoWriter writer(out, VideoWriter::fourcc('a', 'v', 'c', '1'), fps, Size(m.OW, m.OH));
-    if (!writer.isOpened()) return "ERROR: cannot open output video";
+
+    // Encode via an ffmpeg pipe (hardware H.264 when available, else libx264). ffmpeg
+    // is already required for the default --jobs concat and audio-attach. If it isn't
+    // on PATH we fall back to OpenCV's own H.264 writer (avc1) so a bare install still
+    // stitches - on macOS that path is itself VideoToolbox-backed.
+    string venc = chooseVideoEncoder();
+    bool useFfmpeg = ffmpegAvailable();
+    FILE *pipe = nullptr;
+    VideoWriter writer;
+    if (useFfmpeg)
+    {
+        cout << "encoder: " << venc << " (ffmpeg pipe, " << g_vbitrate << ")\n";
+        pipe = popen(buildEncodeCmd(venc, m.OW, m.OH, fps, out).c_str(), PIPE_WMODE);
+        if (!pipe) useFfmpeg = false;   // couldn't spawn - fall back below
+    }
+    if (!useFfmpeg)
+    {
+        cout << "encoder: OpenCV avc1 (ffmpeg unavailable - using built-in writer)\n";
+        writer.open(out, VideoWriter::fourcc('a', 'v', 'c', '1'), fps, Size(m.OW, m.OH));
+        if (!writer.isOpened()) return "ERROR: cannot open output video";
+    }
+
     seekFrame(cap, s);
     Mat frame, pano;
     UMat uFrame, wL, wR;
@@ -524,7 +614,15 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
         frame.copyTo(uFrame);
         warpHalves(uFrame, m, wL, wR);
         composite(wL, wR, m, degrees, a, &prevSeam).copyTo(pano);
-        writer.write(pano);
+        if (pipe)
+        {
+            if (pano.type() != CV_8UC3) pano.convertTo(pano, CV_8UC3);
+            if (!pano.isContinuous()) pano = pano.clone();
+            size_t bytes = (size_t)pano.total() * pano.elemSize();
+            if (fwrite(pano.data, 1, bytes, pipe) != bytes)
+            { cerr << "encoder pipe closed early (frame " << i << ") - see ffmpeg output above\n"; break; }
+        }
+        else writer.write(pano);
         ++written;
         if (bounded)
         {
@@ -541,7 +639,12 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
         else if (written % 30 == 0) cout << "  frame " << i << "\n";
     }
     cap.release();
-    writer.release();
+    if (pipe)
+    {
+        int rc = pclose(pipe);
+        if (rc != 0) return "ERROR: ffmpeg encoder exited " + to_string(rc) + " (encoder=" + venc + ")";
+    }
+    else writer.release();
     return out + "  (" + to_string(written) + " frames)";
 }
 
@@ -1436,6 +1539,11 @@ static int runParallelJobs(const string &source, const string &calibDir,
     if (jobs > total) jobs = total;                 // never more jobs than frames
     int per = (total + jobs - 1) / jobs;            // ceil, so chunks tile the range
 
+    // Resolve the encoder ONCE in the parent and pin it for every child via --venc, so
+    // all parts share identical codec params (required for the lossless -c copy concat).
+    string resolvedEnc = chooseVideoEncoder();
+    cout << "jobs: encoder " << resolvedEnc << " @ " << g_vbitrate << " for all parts\n";
+
     fs::path op(outFile);
     string stem = op.stem().string();
     string ext = op.extension().empty() ? ".mp4" : op.extension().string();
@@ -1464,6 +1572,7 @@ static int runParallelJobs(const string &source, const string &calibDir,
             + (a.exposure ? "" : " --no-exposure") + (a.smartSeam ? "" : " --no-smart-seam")
             + (cropArg.empty() ? "" : " --crop " + q(cropArg))
             + " --jobs 1 --start " + to_string(s) + " --end " + to_string(e)
+            + " --venc " + q(resolvedEnc) + " --bitrate " + q(g_vbitrate)
             + " --progress-file " + q(prg)
             + " --out-file " + q(part) + " > " + q(log) + " 2>&1");
     }
@@ -1552,6 +1661,11 @@ static int runParallelJobs(const string &source, const string &calibDir,
 
 int main(int argc, char **argv)
 {
+#ifndef _WIN32
+    // If the ffmpeg encoder pipe dies, we want fwrite to fail (handled) rather than a
+    // SIGPIPE killing us silently. (Windows has no SIGPIPE.)
+    signal(SIGPIPE, SIG_IGN);
+#endif
     string source = argVal(argc, argv, "--source", argVal(argc, argv, "--image", ""));
     string calibDir = resolveCalibDir(argVal(argc, argv, "--calib-dir", "../calibration"));
     string outDir = argVal(argc, argv, "--out", "pipeline_out");
@@ -1574,6 +1688,13 @@ int main(int argc, char **argv)
     if (hasArg(argc, argv, "--no-jobs")) jobs = 1;         // force everything into this one process
     string cropArg = argVal(argc, argv, "--crop", "");     // read early; child processes need it too
     string progFile = argVal(argc, argv, "--progress-file", "");  // a child writes its progress here (parallel)
+
+    // Video-encoder selection (globals consumed by chooseVideoEncoder / stitchVideoFile).
+    // --cpu / --no-hwenc force libx264; --venc names a specific encoder (also how the
+    // parent hands its resolved pick to --jobs children); --bitrate sets -b:v.
+    g_forceCpu   = hasArg(argc, argv, "--cpu") || hasArg(argc, argv, "--no-hwenc");
+    g_vencExplicit = argVal(argc, argv, "--venc", "");
+    g_vbitrate   = argVal(argc, argv, "--bitrate", "15M");
     // Attach the recording's audio after the stitch (mux from the .sync.json sidecar).
     // --audio auto-finds the sidecar next to --source; --audio-file names it. Never
     // passed to --jobs children, so only the top-level render attaches.
