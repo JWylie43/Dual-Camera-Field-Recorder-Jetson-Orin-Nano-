@@ -608,6 +608,7 @@ static string tunerHtml()
   <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
   <div class="grp"><label><input type="checkbox" id="crop"> crop to box</label> <span class="hint" id="cropdim"></span></div>
+  <div class="grp"><label><input type="checkbox" id="withaudio" checked> attach audio after stitch</label> <span class="hint">if a .sync.json sidecar is found</span></div>
   <button id="stitch" disabled>Stitch all frames</button>
   <button id="quit">Quit</button>
   <span class="hint">&#8592;/&#8594; shift both</span>
@@ -770,6 +771,7 @@ const pb=document.getElementById('pb'), pct=document.getElementById('pct');
 const params=()=>{
   let p='shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty=0&seam='+SEAM0+'&bands=6&exposure=1&smartseam=1';
   if(cropOn && cropW>0) p+='&cropx='+Math.round(cropX)+'&cropy='+Math.round(cropY)+'&cropw='+Math.round(cropW)+'&croph='+Math.round(cropH);
+  var wa=document.getElementById('withaudio'); if(wa&&wa.checked) p+='&audio=1';
   return p;
 };
 stitchBtn.onclick=async()=>{
@@ -933,6 +935,9 @@ static int runParallelJobs(const string &source, const string &calibDir,
                            double degrees, int seamArg, const Align &a,
                            const string &cropArg, int startFrame, int endFrame,
                            const string &outFile, int jobs, std::atomic<int> *prog = nullptr);
+// Forward decl: after a video stitch, optionally mux the recording's audio in.
+static string attachAudioToStitch(const string &stitchedOut, const string &source,
+                                  const string &explicitSidecar);
 
 static void runTuneServer(const Mat &KL, const vector<double> &DL,
                           const Mat &KR, const vector<double> &DR, const Mat &R,
@@ -1097,6 +1102,7 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                      << " y=" << a.shiftY << " seam=" << mm.seam << " -> " << outFile << " ...\n";
                 int tf = totalFrames;
                 string src = source, of = outFile; bool vid = video;
+                bool wantAudio = qparam(query, "audio") == "1";
                 int seamVal = ss.empty() ? -1 : stoi(ss);
                 int endRes = endFrame >= 0 ? endFrame : (tf > 0 ? tf - 1 : -1);
                 string calib = calibDir;
@@ -1109,7 +1115,7 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                     cout << "[stitch] equivalent CLI command:\n  " << cmd << "\n";
                 }
                 std::thread([mm, a, src, vid, degrees, startFrame, endFrame, endRes, tf,
-                             outDir, of, seamVal, cropStr, calib, jobs]() mutable {
+                             outDir, of, seamVal, cropStr, calib, jobs, wantAudio]() mutable {
                     string res;
                     if (vid && jobs > 1 && endRes >= startFrame)   // parallel video render
                     {
@@ -1122,6 +1128,12 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                         res = vid
                             ? stitchVideoFile(src, mm, degrees, a, startFrame, endFrame, tf, outDir, of, &g_percent)
                             : stitchImageFile(src, mm, degrees, a, outDir, of);
+                    // Attach the recording's audio to the finished stitch, if asked and available.
+                    if (wantAudio && vid && res.rfind("ERROR", 0) != 0)
+                    {
+                        string wa = attachAudioToStitch(res, src, "");
+                        if (!wa.empty()) res = wa;
+                    }
                     { lock_guard<mutex> lk(g_mu); g_result = res; }
                     g_percent = 100; g_done = true; g_busy = false;
                     cout << "[stitch] done -> " << res << "\n";
@@ -1306,6 +1318,97 @@ static int runShell(string cmd)
     return std::system(cmd.c_str());
 }
 
+// Attach the recording's audio (from its .sync.json sidecar) to a stitched video,
+// writing "<stem>.withaudio.mkv" next to it. Non-destructive - the video-only
+// stitch is left intact. Needs ffmpeg (already required for --jobs concat).
+// Mirrors recorder/merge_av.py: each audio segment is shifted onto the video
+// timeline by (segment.anchor_ns - video.anchor_ns). Returns the new file path,
+// or "" if there was nothing to attach.
+static string attachAudioToStitch(const string &stitchedOut, const string &source,
+                                  const string &explicitSidecar)
+{
+    auto q = [](const string &s) { return "\"" + s + "\""; };
+    std::error_code ec;
+
+    // 1. locate the sidecar (explicit, else derived from the source name)
+    fs::path sidecar;
+    if (!explicitSidecar.empty()) sidecar = explicitSidecar;
+    else
+    {
+        fs::path s(source);
+        string stem = s.stem().string();
+        const string suf = "_seekable";   // a remuxed source drops back to the base name
+        if (stem.size() > suf.size() &&
+            stem.compare(stem.size() - suf.size(), suf.size(), suf) == 0)
+            stem = stem.substr(0, stem.size() - suf.size());
+        sidecar = s.parent_path() / (stem + ".sync.json");
+    }
+    if (!fs::exists(sidecar, ec))
+    {
+        cout << "[audio] no sidecar at " << sidecar.string() << " - leaving the stitch video-only.\n";
+        return "";
+    }
+
+    // 2. parse it
+    json j;
+    {
+        ifstream f(sidecar.string());
+        if (!f.is_open()) { cout << "[audio] cannot open " << sidecar.string() << "\n"; return ""; }
+        try { f >> j; }
+        catch (...) { cout << "[audio] sidecar is not valid JSON; skipping.\n"; return ""; }
+    }
+    if (!j.contains("video") || j["video"]["anchor_ns"].is_null())
+    {
+        cout << "[audio] sidecar has no video anchor; skipping.\n";
+        return "";
+    }
+    long long v0 = j["video"]["anchor_ns"].get<long long>();
+    if (!j.contains("audio_segments") || j["audio_segments"].empty())
+    {
+        cout << "[audio] no audio segments in the sidecar; nothing to attach.\n";
+        return "";
+    }
+    fs::path base = sidecar.parent_path();
+
+    // 3. build the ffmpeg command (one delayed audio input per segment; amix if >1)
+    ostringstream inputs, filt, amixIns;
+    inputs << " -i " << q(stitchedOut);
+    int n = 0;
+    for (auto &s : j["audio_segments"])
+    {
+        string fn = s.value("file", string());
+        if (fn.empty() || s["anchor_ns"].is_null()) continue;
+        fs::path wav = base / fn;
+        if (!fs::exists(wav, ec)) { cout << "[audio] missing segment " << wav.string() << " - skipping.\n"; continue; }
+        double delay = (double)(s["anchor_ns"].get<long long>() - v0) / 1e9;
+        ++n;
+        string lab = "a" + to_string(n);
+        inputs << " -f wav -ignore_length 1 -i " << q(wav.string());
+        if (delay >= 0)
+            filt << "[" << n << ":a]adelay=" << (long long)llround(delay * 1000.0) << ":all=1[" << lab << "];";
+        else
+            filt << "[" << n << ":a]atrim=start=" << to_string(-delay) << ",asetpts=PTS-STARTPTS[" << lab << "];";
+        amixIns << "[" << lab << "]";
+    }
+    if (n == 0) { cout << "[audio] no usable audio segment files; nothing to attach.\n"; return ""; }
+
+    string aout;
+    if (n == 1) aout = "a1";
+    else { aout = "aout"; filt << amixIns.str() << "amix=inputs=" << n << ":normalize=0[aout];"; }
+    string fg = filt.str();
+    if (!fg.empty() && fg.back() == ';') fg.pop_back();
+
+    fs::path outPath = fs::path(stitchedOut).parent_path() /
+                       (fs::path(stitchedOut).stem().string() + ".withaudio.mkv");
+    string cmd = "ffmpeg -y" + inputs.str() + " -filter_complex " + q(fg) +
+                 " -map 0:v -map " + q("[" + aout + "]") +
+                 " -c:v copy -c:a pcm_s16le " + q(outPath.string());
+    cout << "[audio] attaching " << n << " segment(s) -> " << outPath.string() << "\n";
+    if (runShell(cmd) != 0) { cerr << "[audio] ffmpeg failed; keeping the video-only output.\n"; return ""; }
+    cout << "[audio] done -> " << outPath.string() << "\n";
+    return outPath.string();
+}
+
 // Parallel stitch: split [startFrame..endFrame] across `jobs` child processes (each
 // this same exe with --jobs 1 over its sub-range -> its own temp part), run them
 // concurrently, then ffmpeg-concat the parts (in order) into `outFile`. Child
@@ -1464,6 +1567,11 @@ int main(int argc, char **argv)
     if (hasArg(argc, argv, "--no-jobs")) jobs = 1;         // force everything into this one process
     string cropArg = argVal(argc, argv, "--crop", "");     // read early; child processes need it too
     string progFile = argVal(argc, argv, "--progress-file", "");  // a child writes its progress here (parallel)
+    // Attach the recording's audio after the stitch (mux from the .sync.json sidecar).
+    // --audio auto-finds the sidecar next to --source; --audio-file names it. Never
+    // passed to --jobs children, so only the top-level render attaches.
+    string audioFile = argVal(argc, argv, "--audio-file", "");
+    bool wantAudio = hasArg(argc, argv, "--audio") || !audioFile.empty();
 
     // Ensure the output destination exists (batch, or a preset --out-file).
     if (!outFile.empty()) { fs::path p(outFile); if (p.has_parent_path()) fs::create_directories(p.parent_path()); }
@@ -1520,8 +1628,12 @@ int main(int argc, char **argv)
         string finalOut = !outFile.empty() ? outFile : (outDir + "/stitched_video.mp4");
         int endResolved = endFrame >= 0 ? endFrame : (totalFrames > 0 ? totalFrames - 1 : -1);
         if (endResolved >= startFrame)
-            return runParallelJobs(source, calibDir, degrees, seamArg, a, cropArg,
-                                   startFrame, endResolved, finalOut, jobs);
+        {
+            int rc = runParallelJobs(source, calibDir, degrees, seamArg, a, cropArg,
+                                     startFrame, endResolved, finalOut, jobs);
+            if (rc == 0 && wantAudio) attachAudioToStitch(finalOut, source, audioFile);
+            return rc;
+        }
         cerr << "jobs: couldn't determine frame count; running single-process.\n";
     }
 
@@ -1541,5 +1653,6 @@ int main(int argc, char **argv)
     string result = video ? stitchVideoFile(source, m, degrees, a, startFrame, endFrame, totalFrames, outDir, outFile, nullptr, progFile)
                           : stitchImageFile(source, m, degrees, a, outDir, outFile);
     cout << (video ? "video -> " : "image -> ") << result << "\n";
+    if (video && wantAudio) attachAudioToStitch(result, source, audioFile);
     return 0;
 }
