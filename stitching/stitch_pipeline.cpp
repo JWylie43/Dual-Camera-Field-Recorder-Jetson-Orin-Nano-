@@ -69,9 +69,12 @@
   #include <netinet/in.h>
   #include <arpa/inet.h>
   #include <unistd.h>
+  #include <spawn.h>            // posix_spawn: launch parallel children concurrently
+  #include <sys/wait.h>        // waitpid
   using socket_t = int;
   #define CLOSESOCK close
   #define INVALID_SOCKET (-1)
+  extern char **environ;       // for posix_spawn (child inherits our environment)
 #endif
 
 #ifdef __APPLE__
@@ -99,6 +102,7 @@ static int runShell(string cmd);   // forward decl (defined near main); the enco
 // any specific GPU. See chooseVideoEncoder().
 static string g_vencExplicit;      // --venc NAME: force a specific encoder (also parent->child in --jobs)
 static bool   g_forceCpu = false;  // --cpu / --no-hwenc: force software libx264
+static bool   g_noOpenCL = false;  // --no-opencl: run the warp/blend on CPU, not the GPU (also parent->child in --jobs)
 static string g_vbitrate  = "15M"; // --bitrate: target video bitrate passed to -b:v
 
 struct StitchMaps
@@ -1424,6 +1428,57 @@ static int runShell(string cmd)
     return std::system(cmd.c_str());
 }
 
+// Launch every command concurrently and wait for them all; rc[i] gets each exit
+// code. This is the parallel-jobs workhorse and must NOT use std::system(): on
+// macOS the C library serializes concurrent system() calls (it holds a global
+// lock across the child's whole run for its SIGINT/SIGQUIT/SIGCHLD handling), so
+// system()-on-threads made `--jobs` run one child AT A TIME. We spawn real
+// processes instead - posix_spawn on POSIX, CreateProcess on Windows - so the N
+// children genuinely run in parallel. (Windows' system() didn't have the lock,
+// which is why --jobs already parallelized there; this keeps that behavior.)
+static void runShellsConcurrent(const vector<string> &cmds, vector<int> &rc)
+{
+    int n = (int)cmds.size();
+#ifdef _WIN32
+    vector<HANDLE> procs(n, nullptr);
+    for (int i = 0; i < n; i++)
+    {
+        string full = "cmd /c \"" + cmds[i] + "\"";
+        vector<char> buf(full.begin(), full.end()); buf.push_back('\0');
+        STARTUPINFOA si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+        PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
+        if (CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE, 0,
+                           nullptr, nullptr, &si, &pi))
+        { procs[i] = pi.hProcess; CloseHandle(pi.hThread); }
+        else { rc[i] = -1; }
+    }
+    for (int i = 0; i < n; i++)
+    {
+        if (!procs[i]) continue;
+        WaitForSingleObject(procs[i], INFINITE);
+        DWORD code = 1; GetExitCodeProcess(procs[i], &code);
+        rc[i] = (int)code; CloseHandle(procs[i]);
+    }
+#else
+    vector<pid_t> pids(n, -1);
+    for (int i = 0; i < n; i++)
+    {
+        const char *argv[] = { "/bin/sh", "-c", cmds[i].c_str(), nullptr };
+        pid_t pid = -1;
+        int r = posix_spawn(&pid, "/bin/sh", nullptr, nullptr,
+                            const_cast<char *const *>(argv), environ);
+        if (r == 0) pids[i] = pid; else rc[i] = -1;
+    }
+    for (int i = 0; i < n; i++)
+    {
+        if (pids[i] <= 0) continue;
+        int status = 0;
+        if (waitpid(pids[i], &status, 0) < 0) { rc[i] = -1; continue; }
+        rc[i] = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+#endif
+}
+
 // Attach the recording's audio (from its .sync.json sidecar) to a stitched video,
 // writing "<stem>.withaudio.mp4" (H.264 video copied + AAC audio). Non-destructive - the video-only
 // stitch is left intact. Needs ffmpeg (already required for --jobs concat).
@@ -1573,6 +1628,7 @@ static int runParallelJobs(const string &source, const string &calibDir,
             + (cropArg.empty() ? "" : " --crop " + q(cropArg))
             + " --jobs 1 --start " + to_string(s) + " --end " + to_string(e)
             + " --venc " + q(resolvedEnc) + " --bitrate " + q(g_vbitrate)
+            + (g_noOpenCL ? " --no-opencl" : "")
             + " --progress-file " + q(prg)
             + " --out-file " + q(part) + " > " + q(log) + " 2>&1");
     }
@@ -1621,11 +1677,8 @@ static int runParallelJobs(const string &source, const string &calibDir,
         }
     });
 
-    vector<std::thread> ts;
     vector<int> rc(n, -1);
-    for (int i = 0; i < n; i++)
-        ts.emplace_back([&cmds, &rc, i]() { rc[i] = runShell(cmds[i]); });
-    for (auto &t : ts) t.join();
+    runShellsConcurrent(cmds, rc);          // real parallel processes (see the note there)
     running = false; mon.join();
     { lock_guard<mutex> lk(g_partMu); for (int i = 0; i < n; i++) g_partPct[i] = 100; }
     cout << "\n";
@@ -1693,6 +1746,7 @@ int main(int argc, char **argv)
     // --cpu / --no-hwenc force libx264; --venc names a specific encoder (also how the
     // parent hands its resolved pick to --jobs children); --bitrate sets -b:v.
     g_forceCpu   = hasArg(argc, argv, "--cpu") || hasArg(argc, argv, "--no-hwenc");
+    g_noOpenCL   = hasArg(argc, argv, "--no-opencl");   // warp/blend on CPU instead of the GPU
     g_vencExplicit = argVal(argc, argv, "--venc", "");
     g_vbitrate   = argVal(argc, argv, "--bitrate", "15M");
     // Attach the recording's audio after the stitch (mux from the .sync.json sidecar).
@@ -1705,7 +1759,7 @@ int main(int argc, char **argv)
     if (!outFile.empty()) { fs::path p(outFile); if (p.has_parent_path()) fs::create_directories(p.parent_path()); }
     else fs::create_directories(outDir);
 
-    ocl::setUseOpenCL(true);
+    ocl::setUseOpenCL(!g_noOpenCL);   // --no-opencl -> run the warp/blend on the CPU
     cout << "OpenCL available: " << ocl::haveOpenCL() << ", using GPU: " << ocl::useOpenCL() << "\n";
 
     cout << "Calibration: " << calibDir << "\n";
