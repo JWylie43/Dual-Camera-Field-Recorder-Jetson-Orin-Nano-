@@ -113,6 +113,7 @@ def _start_idle_preview():
         _state["preview"] = subprocess.Popen(
             _idle_preview_cmd(), stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _schedule_reapply(1.0)                   # restore the user's exposure/gain tune
     except Exception:                            # noqa: BLE001
         _state["preview"] = None
 
@@ -282,11 +283,19 @@ def start():
     # written as a separate WAV + sync sidecar). The checkbox only DISABLES it.
     if data.get("audio") is False:
         cmd.append("--no-audio")
+    # Carry the live exposure/gain tune into the take: record.py applies these as
+    # V4L2 controls before it opens the pipeline. _schedule_reapply below re-sets
+    # them once more after the pipeline is up, in case starting it reset the sensor.
+    with _ctrl_lock:
+        overrides = dict(_ctrl_overrides)
+    for name, value in overrides.items():
+        cmd += ["--set-ctrl", f"{name}={value}"]
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with _lock:
         _state.update(proc=proc, started=time.time(), suspended=False,
                       rec_preview=want_preview)
+    _schedule_reapply(2.5)                        # after record.py's pipeline is up
     return jsonify(ok=True)
 
 
@@ -363,6 +372,149 @@ def snapshot():
         return jsonify(ok=False, error="capture failed (no frame)"), 500
     count = len(glob.glob(os.path.join(CALIB_DIR, "calib_*.jpg")))
     return jsonify(ok=True, file=os.path.basename(saved), count=count)
+
+
+# --------------------------------------------------------------------------
+# Camera controls (V4L2): live exposure / gain / etc. adjustment.
+#
+# The sensor's controls are plain V4L2 controls. `v4l2-ctl --set-ctrl` opens its
+# OWN fd on the device, and control ioctls (VIDIOC_S_CTRL) don't need to own the
+# stream - so a set applies LIVE whether the camera is idle-previewing OR
+# recording, without interrupting either. We DISCOVER the controls dynamically
+# with `--list-ctrls-menus` so this works for whatever sensor is attached instead
+# of hardcoding names, and we re-apply the user's chosen values a moment after
+# each pipeline (re)start so tuning survives the preview<->record swap (a fresh
+# stream can reset the sensor to its power-on defaults).
+# --------------------------------------------------------------------------
+_CTRL_LINE = re.compile(r"^\s*(\w+)\s+0x[0-9a-fA-F]+\s+\((\w+)\)\s*:\s*(.*)$")
+_ctrl_overrides = {}          # name -> value the user set; re-applied on stream start
+_ctrl_lock = threading.Lock()
+
+# Only the image-quality knobs are exposed in the UI - the controls that change
+# how the picture LOOKS. The driver also reports flips/rotation, trigger + frame
+# timing, and a pile of raw sensor-config / read-only entries; we deliberately
+# hide all of those. Listed in the order they should appear in the panel.
+# NOTE on this sensor: `exposure` is a 0/1 auto-exposure ENABLE (not a value);
+# the actual shutter knob is `brightness` (a wide range), paired with `gain`.
+IMAGE_CONTROLS = [
+    "brightness", "contrast", "saturation", "gamma",
+    "exposure", "gain", "white_balance_temperature",
+    "sharpness", "backlight_compensation",
+]
+
+
+def _parse_controls(text):
+    """Parse `v4l2-ctl --list-ctrls-menus` into a list of control dicts.
+
+    Each control line looks like:
+        exposure 0x00980911 (int)  : min=1 max=10000 step=1 default=1000 value=1000
+    A menu control is followed by indented `<n>: <label>` lines we attach to it.
+    """
+    controls = []
+    cur = None
+    for line in text.splitlines():
+        m = _CTRL_LINE.match(line)
+        if m:
+            name, ctype, rest = m.group(1), m.group(2), m.group(3)
+            attrs = {}
+            for tok in rest.split():
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    attrs[k] = v
+
+            def _int(key):
+                try:
+                    return int(attrs[key])
+                except (KeyError, ValueError):
+                    return None
+
+            cur = {
+                "name": name, "type": ctype,
+                "min": _int("min"), "max": _int("max"), "step": _int("step"),
+                "default": _int("default"), "value": _int("value"),
+                "inactive": "inactive" in attrs.get("flags", ""),
+                "menu": [],
+            }
+            controls.append(cur)
+        elif cur is not None and cur["type"] == "menu":
+            mm = re.match(r"\s+(\d+):\s+(.*)$", line)
+            if mm:
+                cur["menu"].append({"value": int(mm.group(1)), "label": mm.group(2).strip()})
+    return controls
+
+
+def _list_controls():
+    """(list_of_controls, None) on success, or (None, error_string) on failure.
+
+    Filtered to IMAGE_CONTROLS (in that order); the driver's non-image entries are
+    hidden. This is the single source of truth for both routes, so /control only
+    ever accepts - and re-apply only ever restores - an image-quality control."""
+    ok, out = _run_ok(["v4l2-ctl", f"--device={DEVICE}", "--list-ctrls-menus"], timeout=10)
+    if not ok:
+        return None, out or "v4l2-ctl failed"
+    by_name = {c["name"]: c for c in _parse_controls(out)}
+    controls = [by_name[n] for n in IMAGE_CONTROLS if n in by_name]
+    return controls, None
+
+
+def _set_control(name, value):
+    return _run_ok(["v4l2-ctl", f"--device={DEVICE}", f"--set-ctrl={name}={value}"], timeout=10)
+
+
+def _reapply_controls():
+    """Re-apply every control value the user has set (after a pipeline restart)."""
+    with _ctrl_lock:
+        items = list(_ctrl_overrides.items())
+    for name, value in items:
+        _set_control(name, value)
+
+
+def _schedule_reapply(delay):
+    """Re-apply overrides `delay` s after a stream (re)start, off the request thread.
+    A fresh pipeline may reset the sensor to defaults; this restores the user's tune."""
+    with _ctrl_lock:
+        pending = bool(_ctrl_overrides)
+    if pending:
+        threading.Timer(delay, _reapply_controls).start()
+
+
+@app.route("/controls")
+def controls_list():
+    """All V4L2 controls the sensor reports, with current values + inactive flags."""
+    controls, err = _list_controls()
+    if controls is None:
+        return jsonify(ok=False, error=err, controls=[])
+    return jsonify(ok=True, controls=controls)
+
+
+@app.route("/control", methods=["POST"])
+def control_set():
+    """Set one control live. Validates the name against the real control list and
+    coerces the value to int, so nothing arbitrary reaches v4l2-ctl (which is also
+    invoked with list args, never a shell). Returns the refreshed control list so
+    the UI can pick up read-back values and inactive-flag changes (e.g. flipping an
+    auto/manual toggle re-enables its manual control)."""
+    data = request.get_json(silent=True) or {}
+    name = data.get("name")
+    value = data.get("value")
+    if not name or value is None:
+        return jsonify(ok=False, error="name and value required"), 400
+    controls, err = _list_controls()
+    if controls is None:
+        return jsonify(ok=False, error=err), 500
+    if not any(c["name"] == name for c in controls):
+        return jsonify(ok=False, error=f"unknown control '{name}'"), 400
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="value must be an integer"), 400
+    ok, out = _set_control(name, ivalue)
+    if not ok:
+        return jsonify(ok=False, error=out or "set failed"), 500
+    with _ctrl_lock:
+        _ctrl_overrides[name] = ivalue
+    controls, _ = _list_controls()               # read back (values + inactive flags)
+    return jsonify(ok=True, controls=controls or [])
 
 
 # --------------------------------------------------------------------------
@@ -707,6 +859,18 @@ PAGE = """<!doctype html>
  .big { font-size:2rem; font-weight:700; }
  .ok{color:#4caf50}.warn{color:#ffb300}.hot{color:#e33}
  .muted{color:#888; font-size:.85rem; word-break:break-all;}
+ .ctl { margin:14px 0; }
+ .ctl .lab { display:flex; justify-content:space-between; align-items:center; font-size:.9rem; margin-bottom:5px; }
+ .ctl .lab .right { display:flex; align-items:center; gap:8px; }
+ .ctl .lab .val { color:#7fb2d9; font-variant-numeric:tabular-nums; font-weight:700; }
+ .ctl .mini { width:auto; margin:0; padding:2px 8px; font-size:.9rem; font-weight:400;
+              background:#333; border-radius:6px; line-height:1.4; }
+ .ctl .mini:disabled { opacity:.3; }
+ .ctl input[type=range] { width:100%; height:28px; }
+ .ctl select { width:100%; background:#222; color:#eee; border:1px solid #444;
+               border-radius:6px; padding:8px; font-size:1rem; }
+ .ctl.inactive { opacity:.4; }
+ #ctlreset { width:100%; background:#333; padding:12px; font-size:1rem; margin-top:6px; }
 </style></head><body><div class="wrap">
  <h1>&#127909; Camera Rig</h1>
  <div class="card" style="padding:6px">
@@ -716,6 +880,14 @@ PAGE = """<!doctype html>
    <span class="dot" id="dot"></span><span id="statetext">&hellip;</span>
    <div id="detail" class="muted"></div>
    <div id="storage" class="muted" style="margin-top:6px"></div>
+ </div>
+ <div class="card">
+   <label style="cursor:pointer"><input type="checkbox" id="showctl"> &#9881;&#65039; Camera controls (image quality)</label>
+   <div class="muted">Adjust live while the preview is up &mdash; works during recording too. For a blown-out bright side under stadium lights: set <b>exposure</b> to <b>0</b> (turns off auto-exposure), then bring <b>brightness</b> (the shutter) and <b>gain</b> down until it stops clipping. Tap &#8635; to reset one control; the button below resets them all.</div>
+   <div id="ctlbody" style="display:none; margin-top:12px">
+     <div id="ctllist"><div class="muted">Loading controls&hellip;</div></div>
+     <button id="ctlreset">Reset all to defaults</button>
+   </div>
  </div>
  <div class="card">
    <label><input type="checkbox" id="pvrec" checked> Live preview while recording</label>
@@ -739,6 +911,8 @@ PAGE = """<!doctype html>
 const $ = id => document.getElementById(id);
 const post = (u,b) => fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},
                               body:JSON.stringify(b||{})}).then(r=>r.json());
+const esc = (s) => { return (''+s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                                  .replace(/>/g,'&gt;').replace(/"/g,'&quot;'); };
 const fmt = s => Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
 const tclass = c => c>=80?'hot':c>=65?'warn':'ok';
 function storageHtml(st){
@@ -798,6 +972,135 @@ async function refreshThermals(){
       z.temp_c.toFixed(1)+'°C</td></tr>').join('');
   }catch(e){}
 }
+// ---- camera controls (live exposure / gain tuning) ----------------------
+// A generic panel driven by whatever /controls reports: int -> slider,
+// menu -> dropdown, bool -> checkbox. We POST /control on change (and throttled
+// while dragging a slider), then re-render from the server's read-back so an
+// auto/manual toggle instantly re-enables the manual sliders it controls. While
+// the panel is open we also poll so auto-driven values (e.g. AE) are visible.
+let lastControls = [];
+let ctlDragging = null;                 // control the user is holding (don't clobber it)
+let ctlLastPost = 0;                    // last live-drag POST time (ms), for throttling
+let ctlPoll = null;
+
+const setControl = (name, value) => {
+  return post('/control', {name, value}).then((r) => {
+    if(r && r.ok && r.controls){ renderControls(r.controls); }
+    return r;
+  });
+};
+
+const resetBtn = (c) => {
+  if(c.default === null){ return ''; }           // no default reported -> nothing to reset to
+  const dis = c.inactive ? ' disabled' : '';
+  return '<button class="mini" data-reset="'+esc(c.name)+'" title="Reset to '
+    + esc(c.default)+'"'+dis+'>&#8635;</button>';
+};
+
+const controlRow = (c) => {
+  const dis = c.inactive ? ' disabled' : '';
+  const cls = 'ctl' + (c.inactive ? ' inactive' : '');
+  const head = '<div class="'+cls+'" data-name="'+esc(c.name)+'">';
+  if(c.type === 'menu'){
+    const opts = (c.menu||[]).map((m) => {
+      const sel = m.value===c.value ? ' selected' : '';
+      return '<option value="'+m.value+'"'+sel+'>'+esc(m.label)+'</option>';
+    }).join('');
+    return head + '<div class="lab"><span>'+esc(c.name)+'</span>'
+      + '<span class="right">'+resetBtn(c)+'</span></div>'
+      + '<select data-ctl="'+esc(c.name)+'"'+dis+'>'+opts+'</select></div>';
+  }
+  if(c.type === 'bool'){
+    const chk = c.value ? ' checked' : '';
+    return head + '<div class="lab"><span>'+esc(c.name)+'</span><span class="right">'
+      + '<input type="checkbox" data-ctl="'+esc(c.name)+'"'+chk+dis+'>'
+      + resetBtn(c)+'</span></div></div>';
+  }
+  // int / int64 -> slider
+  return head
+    + '<div class="lab"><span>'+esc(c.name)+'</span><span class="right">'
+    + '<span class="val" data-val="'+esc(c.name)+'">'+c.value+'</span>'
+    + resetBtn(c)+'</span></div>'
+    + '<input type="range" data-ctl="'+esc(c.name)+'" min="'+c.min+'" max="'+c.max
+    + '" step="'+(c.step||1)+'" value="'+c.value+'"'+dis+'></div>';
+};
+
+const renderControls = (controls) => {
+  lastControls = controls;
+  const list = $('ctllist');
+  const drawable = controls.filter((c) => { return ['int','int64','bool','menu'].includes(c.type); });
+  // Full rebuild only when the set of controls changes; otherwise update values
+  // in place so we never yank the slider out from under a drag.
+  const sig = drawable.map((c) => { return c.name; }).join(',');
+  if(list.dataset.sig !== sig){
+    list.innerHTML = drawable.length
+      ? drawable.map(controlRow).join('')
+      : '<div class="muted">No adjustable controls reported by this camera.</div>';
+    list.dataset.sig = sig;
+    return;
+  }
+  drawable.forEach((c) => {
+    const row = list.querySelector('.ctl[data-name="'+c.name+'"]');
+    if(!row){ return; }
+    row.classList.toggle('inactive', !!c.inactive);
+    const inp = row.querySelector('[data-ctl]');
+    if(inp){ inp.disabled = !!c.inactive; }
+    const rb = row.querySelector('[data-reset]');
+    if(rb){ rb.disabled = !!c.inactive; }
+    if(c.name === ctlDragging){ return; }        // user is holding this one
+    if(inp){
+      if(c.type === 'bool'){ inp.checked = !!c.value; }
+      else { inp.value = c.value; }
+    }
+    const v = row.querySelector('[data-val]');
+    if(v){ v.textContent = c.value; }
+  });
+};
+
+const loadControls = async () => {
+  try{
+    const r = await (await fetch('/controls')).json();
+    if(r && r.ok){ renderControls(r.controls || []); }
+    else { $('ctllist').innerHTML = '<div class="muted">'+esc((r&&r.error)||'controls unavailable')+'</div>'; }
+  }catch(e){ $('ctllist').innerHTML = '<div class="muted">controls unavailable</div>'; }
+};
+
+$('ctllist').addEventListener('input', (e) => {
+  const el = e.target.closest('[data-ctl]');
+  if(!el || el.type !== 'range'){ return; }
+  ctlDragging = el.dataset.ctl;
+  const disp = el.closest('.ctl').querySelector('[data-val]');
+  if(disp){ disp.textContent = el.value; }
+  const now = Date.now();
+  if(now - ctlLastPost > 150){ ctlLastPost = now; setControl(el.dataset.ctl, el.value); }
+});
+$('ctllist').addEventListener('change', (e) => {
+  const el = e.target.closest('[data-ctl]');
+  if(!el){ return; }
+  ctlDragging = null;
+  const value = el.type === 'checkbox' ? (el.checked ? 1 : 0) : el.value;
+  setControl(el.dataset.ctl, value);
+});
+$('ctllist').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-reset]');
+  if(!b){ return; }
+  const c = lastControls.find((x) => { return x.name === b.dataset.reset; });
+  if(c && c.default !== null){ setControl(c.name, c.default); }
+});
+$('ctlreset').onclick = async () => {
+  for(const c of lastControls){
+    if(c.type === 'button' || c.inactive || c.default === null){ continue; }
+    await setControl(c.name, c.default);         // sequential: auto toggles unlock first
+  }
+  loadControls();
+};
+$('showctl').onchange = () => {
+  const on = $('showctl').checked;
+  $('ctlbody').style.display = on ? 'block' : 'none';
+  if(on){ loadControls(); ctlPoll = setInterval(loadControls, 3000); }
+  else if(ctlPoll){ clearInterval(ctlPoll); ctlPoll = null; }
+};
+
 setInterval(refreshStatus, 1500);
 setInterval(refreshThermals, 2000);
 refreshStatus();

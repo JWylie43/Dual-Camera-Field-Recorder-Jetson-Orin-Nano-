@@ -808,6 +808,10 @@ def main():
                         help=f"Where to write files (default: {Config.output_dir})")
     parser.add_argument("--quality", type=int, default=Config.jpeg_quality,
                         help=f"MJPEG quality 0-100 (default: {Config.jpeg_quality})")
+    parser.add_argument("--set-ctrl", action="append", default=None, metavar="NAME=VALUE",
+                        help="Extra V4L2 control to apply before recording (repeatable), "
+                             "e.g. --set-ctrl exposure=800 --set-ctrl gain=20. Used by "
+                             "server.py to carry a live exposure/gain tune into the take.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the controls and pipelines without running.")
     args = parser.parse_args()
@@ -818,6 +822,20 @@ def main():
     cfg.jpeg_quality = args.quality
     cfg.thermal_interval_ms = args.thermal_interval
     cfg.preview_port = args.preview_port
+
+    # Merge any --set-ctrl overrides on top of the built-in controls. Use an
+    # instance-level copy so we never mutate the shared Config class dict.
+    cfg.controls = dict(Config.controls)
+    for item in (args.set_ctrl or []):
+        if "=" not in item:
+            print(f"  warning: ignoring malformed --set-ctrl '{item}' (need NAME=VALUE)")
+            continue
+        key, val = item.split("=", 1)
+        key, val = key.strip(), val.strip()
+        try:
+            cfg.controls[key] = int(val)
+        except ValueError:
+            cfg.controls[key] = val
 
     # Audio: on by default; never in --measure (no file is written).
     cfg.audio_enabled = (not args.no_audio) and (not args.measure)
