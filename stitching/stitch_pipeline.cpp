@@ -31,8 +31,9 @@
 //   --no-jobs  (or --jobs 1) run everything in this one process - no parallelism.
 //   Requires ffmpeg on PATH for the concat. Images and --tune always run single-process.
 //
-// GPU: per-frame work runs on cv::UMat (OpenCL when available, CPU fallback).
-// Uses core/imgproc/imgcodecs/videoio; builds on OpenCV 4.x and 5.x.
+// Warp device: the stitching/warp always runs on the CPU (the OpenCL/GPU warp was
+// measured slower - see the note in main). The video ENCODER still uses the GPU
+// (hardware H.264, chooseVideoEncoder). Uses core/imgproc/imgcodecs/videoio; OpenCV 4.x/5.x.
 //
 // Build:  cmake -S . -B build && cmake --build build
 
@@ -102,7 +103,6 @@ static int runShell(string cmd);   // forward decl (defined near main); the enco
 // any specific GPU. See chooseVideoEncoder().
 static string g_vencExplicit;      // --venc NAME: force a specific encoder (also parent->child in --jobs)
 static bool   g_forceCpu = false;  // --cpu / --no-hwenc: force software libx264
-static bool   g_noOpenCL = false;  // --no-opencl: run the warp/blend on CPU, not the GPU (also parent->child in --jobs)
 static string g_vbitrate  = "15M"; // --bitrate: target video bitrate passed to -b:v
 
 struct StitchMaps
@@ -1628,7 +1628,6 @@ static int runParallelJobs(const string &source, const string &calibDir,
             + (cropArg.empty() ? "" : " --crop " + q(cropArg))
             + " --jobs 1 --start " + to_string(s) + " --end " + to_string(e)
             + " --venc " + q(resolvedEnc) + " --bitrate " + q(g_vbitrate)
-            + (g_noOpenCL ? " --no-opencl" : "")
             + " --progress-file " + q(prg)
             + " --out-file " + q(part) + " > " + q(log) + " 2>&1");
     }
@@ -1746,7 +1745,6 @@ int main(int argc, char **argv)
     // --cpu / --no-hwenc force libx264; --venc names a specific encoder (also how the
     // parent hands its resolved pick to --jobs children); --bitrate sets -b:v.
     g_forceCpu   = hasArg(argc, argv, "--cpu") || hasArg(argc, argv, "--no-hwenc");
-    g_noOpenCL   = hasArg(argc, argv, "--no-opencl");   // warp/blend on CPU instead of the GPU
     g_vencExplicit = argVal(argc, argv, "--venc", "");
     g_vbitrate   = argVal(argc, argv, "--bitrate", "15M");
     // Attach the recording's audio after the stitch (mux from the .sync.json sidecar).
@@ -1759,8 +1757,12 @@ int main(int argc, char **argv)
     if (!outFile.empty()) { fs::path p(outFile); if (p.has_parent_path()) fs::create_directories(p.parent_path()); }
     else fs::create_directories(outDir);
 
-    ocl::setUseOpenCL(!g_noOpenCL);   // --no-opencl -> run the warp/blend on the CPU
-    cout << "OpenCL available: " << ocl::haveOpenCL() << ", using GPU: " << ocl::useOpenCL() << "\n";
+    // Stitching/warp ALWAYS runs on the CPU: the OpenCL/GPU warp was measured slower
+    // (a memory-bound remap sandwiched between CPU decode and CPU encode pays a
+    // per-frame CPU<->GPU copy that outweighs the GPU speedup). The video ENCODER
+    // still uses the GPU (hardware H.264, with a libx264 fallback - chooseVideoEncoder).
+    ocl::setUseOpenCL(false);
+    cout << "OpenCL available: " << ocl::haveOpenCL() << ", using GPU (warp): " << ocl::useOpenCL() << "\n";
 
     cout << "Calibration: " << calibDir << "\n";
     Mat KL, KR, R;
