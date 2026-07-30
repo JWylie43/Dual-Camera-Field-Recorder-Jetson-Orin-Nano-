@@ -31,8 +31,9 @@
 //   --no-jobs  (or --jobs 1) run everything in this one process - no parallelism.
 //   Requires ffmpeg on PATH for the concat. Images and --tune always run single-process.
 //
-// GPU: per-frame work runs on cv::UMat (OpenCL when available, CPU fallback).
-// Uses core/imgproc/imgcodecs/videoio; builds on OpenCV 4.x and 5.x.
+// Warp device: the stitching/warp always runs on the CPU (the OpenCL/GPU warp was
+// measured slower - see the note in main). The video ENCODER still uses the GPU
+// (hardware H.264, chooseVideoEncoder). Uses core/imgproc/imgcodecs/videoio; OpenCV 4.x/5.x.
 //
 // Build:  cmake -S . -B build && cmake --build build
 
@@ -69,9 +70,12 @@
   #include <netinet/in.h>
   #include <arpa/inet.h>
   #include <unistd.h>
+  #include <spawn.h>            // posix_spawn: launch parallel children concurrently
+  #include <sys/wait.h>        // waitpid
   using socket_t = int;
   #define CLOSESOCK close
   #define INVALID_SOCKET (-1)
+  extern char **environ;       // for posix_spawn (child inherits our environment)
 #endif
 
 #ifdef __APPLE__
@@ -1424,6 +1428,116 @@ static int runShell(string cmd)
     return std::system(cmd.c_str());
 }
 
+// Clean teardown of parallel children when the PARENT is stopped. Without this,
+// killing the parent orphaned the workers (re-parented to init) and they kept
+// rendering and writing part files. POSIX: each child is spawned into its OWN
+// process group and a SIGINT/SIGTERM handler kills each group (-pgid), taking that
+// child's sh + StitchPipeline + ffmpeg with it. Windows: children are assigned to a
+// Job Object with KILL_ON_JOB_CLOSE, so they die automatically when the parent's
+// handle closes (i.e. when the parent exits or is killed).
+// Caveat: nothing can catch SIGKILL / `kill -9` on the parent - that still orphans.
+#ifndef _WIN32
+static pid_t g_childPgids[256];
+static volatile sig_atomic_t g_nChildPgids = 0;
+static struct sigaction g_prevSigint, g_prevSigterm;
+static void parentTeardownHandler(int sig)
+{
+    for (int i = 0; i < g_nChildPgids; i++)
+        if (g_childPgids[i] > 0) kill(-g_childPgids[i], SIGKILL);   // kill each child's whole group
+    struct sigaction dfl = {}; dfl.sa_handler = SIG_DFL;
+    sigaction(sig, &dfl, nullptr);
+    raise(sig);                                                     // die with the original signal
+}
+#endif
+
+// Launch every command concurrently and wait for them all; rc[i] gets each exit
+// code. This is the parallel-jobs workhorse and must NOT use std::system(): on
+// macOS the C library serializes concurrent system() calls (it holds a global
+// lock across the child's whole run for its SIGINT/SIGQUIT/SIGCHLD handling), so
+// system()-on-threads made `--jobs` run one child AT A TIME. We spawn real
+// processes instead - posix_spawn on POSIX, CreateProcess on Windows - so the N
+// children genuinely run in parallel. (Windows' system() didn't have the lock,
+// which is why --jobs already parallelized there; this keeps that behavior.)
+static void runShellsConcurrent(const vector<string> &cmds, vector<int> &rc)
+{
+    int n = (int)cmds.size();
+#ifdef _WIN32
+    // Kill-on-close job: if the parent dies for any reason, the children die too.
+    HANDLE job = CreateJobObjectA(nullptr, nullptr);
+    if (job)
+    {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+    }
+    vector<HANDLE> procs(n, nullptr);
+    for (int i = 0; i < n; i++)
+    {
+        string full = "cmd /c \"" + cmds[i] + "\"";
+        vector<char> buf(full.begin(), full.end()); buf.push_back('\0');
+        STARTUPINFOA si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+        PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
+        // CREATE_SUSPENDED so we can put the child in the job BEFORE it spawns its
+        // own children (StitchPipeline + ffmpeg), so they inherit the job too.
+        if (CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE,
+                           CREATE_SUSPENDED, nullptr, nullptr, &si, &pi))
+        {
+            if (job) AssignProcessToJobObject(job, pi.hProcess);
+            ResumeThread(pi.hThread);
+            procs[i] = pi.hProcess; CloseHandle(pi.hThread);
+        }
+        else { rc[i] = -1; }
+    }
+    for (int i = 0; i < n; i++)
+    {
+        if (!procs[i]) continue;
+        WaitForSingleObject(procs[i], INFINITE);
+        DWORD code = 1; GetExitCodeProcess(procs[i], &code);
+        rc[i] = (int)code; CloseHandle(procs[i]);
+    }
+    if (job) CloseHandle(job);          // children have exited; releasing the job is safe
+#else
+    // Install the teardown handler and spawn each child into its own process group.
+    int tracked = (n <= 256) ? n : 256;
+    g_nChildPgids = 0;
+    struct sigaction sa = {};
+    sa.sa_handler = parentTeardownHandler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, &g_prevSigint);
+    sigaction(SIGTERM, &sa, &g_prevSigterm);
+
+    vector<pid_t> pids(n, -1);
+    for (int i = 0; i < n; i++)
+    {
+        const char *argv[] = { "/bin/sh", "-c", cmds[i].c_str(), nullptr };
+        posix_spawnattr_t attr;
+        posix_spawnattr_init(&attr);
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+        posix_spawnattr_setpgroup(&attr, 0);        // child leads its own group (pgid == pid)
+        pid_t pid = -1;
+        int r = posix_spawn(&pid, "/bin/sh", nullptr, &attr,
+                            const_cast<char *const *>(argv), environ);
+        posix_spawnattr_destroy(&attr);
+        if (r == 0)
+        {
+            pids[i] = pid;
+            if (i < tracked) { g_childPgids[g_nChildPgids] = pid; g_nChildPgids = g_nChildPgids + 1; }
+        }
+        else rc[i] = -1;
+    }
+    for (int i = 0; i < n; i++)
+    {
+        if (pids[i] <= 0) continue;
+        int status = 0;
+        if (waitpid(pids[i], &status, 0) < 0) { rc[i] = -1; continue; }
+        rc[i] = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    g_nChildPgids = 0;                              // all reaped; restore prior handlers
+    sigaction(SIGINT,  &g_prevSigint,  nullptr);
+    sigaction(SIGTERM, &g_prevSigterm, nullptr);
+#endif
+}
+
 // Attach the recording's audio (from its .sync.json sidecar) to a stitched video,
 // writing "<stem>.withaudio.mp4" (H.264 video copied + AAC audio). Non-destructive - the video-only
 // stitch is left intact. Needs ffmpeg (already required for --jobs concat).
@@ -1621,11 +1735,8 @@ static int runParallelJobs(const string &source, const string &calibDir,
         }
     });
 
-    vector<std::thread> ts;
     vector<int> rc(n, -1);
-    for (int i = 0; i < n; i++)
-        ts.emplace_back([&cmds, &rc, i]() { rc[i] = runShell(cmds[i]); });
-    for (auto &t : ts) t.join();
+    runShellsConcurrent(cmds, rc);          // real parallel processes (see the note there)
     running = false; mon.join();
     { lock_guard<mutex> lk(g_partMu); for (int i = 0; i < n; i++) g_partPct[i] = 100; }
     cout << "\n";
@@ -1705,8 +1816,12 @@ int main(int argc, char **argv)
     if (!outFile.empty()) { fs::path p(outFile); if (p.has_parent_path()) fs::create_directories(p.parent_path()); }
     else fs::create_directories(outDir);
 
-    ocl::setUseOpenCL(true);
-    cout << "OpenCL available: " << ocl::haveOpenCL() << ", using GPU: " << ocl::useOpenCL() << "\n";
+    // Stitching/warp ALWAYS runs on the CPU: the OpenCL/GPU warp was measured slower
+    // (a memory-bound remap sandwiched between CPU decode and CPU encode pays a
+    // per-frame CPU<->GPU copy that outweighs the GPU speedup). The video ENCODER
+    // still uses the GPU (hardware H.264, with a libx264 fallback - chooseVideoEncoder).
+    ocl::setUseOpenCL(false);
+    cout << "OpenCL available: " << ocl::haveOpenCL() << ", using GPU (warp): " << ocl::useOpenCL() << "\n";
 
     cout << "Calibration: " << calibDir << "\n";
     Mat KL, KR, R;
