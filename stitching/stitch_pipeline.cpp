@@ -1428,6 +1428,28 @@ static int runShell(string cmd)
     return std::system(cmd.c_str());
 }
 
+// Clean teardown of parallel children when the PARENT is stopped. Without this,
+// killing the parent orphaned the workers (re-parented to init) and they kept
+// rendering and writing part files. POSIX: each child is spawned into its OWN
+// process group and a SIGINT/SIGTERM handler kills each group (-pgid), taking that
+// child's sh + StitchPipeline + ffmpeg with it. Windows: children are assigned to a
+// Job Object with KILL_ON_JOB_CLOSE, so they die automatically when the parent's
+// handle closes (i.e. when the parent exits or is killed).
+// Caveat: nothing can catch SIGKILL / `kill -9` on the parent - that still orphans.
+#ifndef _WIN32
+static pid_t g_childPgids[256];
+static volatile sig_atomic_t g_nChildPgids = 0;
+static struct sigaction g_prevSigint, g_prevSigterm;
+static void parentTeardownHandler(int sig)
+{
+    for (int i = 0; i < g_nChildPgids; i++)
+        if (g_childPgids[i] > 0) kill(-g_childPgids[i], SIGKILL);   // kill each child's whole group
+    struct sigaction dfl = {}; dfl.sa_handler = SIG_DFL;
+    sigaction(sig, &dfl, nullptr);
+    raise(sig);                                                     // die with the original signal
+}
+#endif
+
 // Launch every command concurrently and wait for them all; rc[i] gets each exit
 // code. This is the parallel-jobs workhorse and must NOT use std::system(): on
 // macOS the C library serializes concurrent system() calls (it holds a global
@@ -1440,6 +1462,14 @@ static void runShellsConcurrent(const vector<string> &cmds, vector<int> &rc)
 {
     int n = (int)cmds.size();
 #ifdef _WIN32
+    // Kill-on-close job: if the parent dies for any reason, the children die too.
+    HANDLE job = CreateJobObjectA(nullptr, nullptr);
+    if (job)
+    {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+    }
     vector<HANDLE> procs(n, nullptr);
     for (int i = 0; i < n; i++)
     {
@@ -1447,9 +1477,15 @@ static void runShellsConcurrent(const vector<string> &cmds, vector<int> &rc)
         vector<char> buf(full.begin(), full.end()); buf.push_back('\0');
         STARTUPINFOA si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
         PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
-        if (CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE, 0,
-                           nullptr, nullptr, &si, &pi))
-        { procs[i] = pi.hProcess; CloseHandle(pi.hThread); }
+        // CREATE_SUSPENDED so we can put the child in the job BEFORE it spawns its
+        // own children (StitchPipeline + ffmpeg), so they inherit the job too.
+        if (CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE,
+                           CREATE_SUSPENDED, nullptr, nullptr, &si, &pi))
+        {
+            if (job) AssignProcessToJobObject(job, pi.hProcess);
+            ResumeThread(pi.hThread);
+            procs[i] = pi.hProcess; CloseHandle(pi.hThread);
+        }
         else { rc[i] = -1; }
     }
     for (int i = 0; i < n; i++)
@@ -1459,15 +1495,35 @@ static void runShellsConcurrent(const vector<string> &cmds, vector<int> &rc)
         DWORD code = 1; GetExitCodeProcess(procs[i], &code);
         rc[i] = (int)code; CloseHandle(procs[i]);
     }
+    if (job) CloseHandle(job);          // children have exited; releasing the job is safe
 #else
+    // Install the teardown handler and spawn each child into its own process group.
+    int tracked = (n <= 256) ? n : 256;
+    g_nChildPgids = 0;
+    struct sigaction sa = {};
+    sa.sa_handler = parentTeardownHandler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, &g_prevSigint);
+    sigaction(SIGTERM, &sa, &g_prevSigterm);
+
     vector<pid_t> pids(n, -1);
     for (int i = 0; i < n; i++)
     {
         const char *argv[] = { "/bin/sh", "-c", cmds[i].c_str(), nullptr };
+        posix_spawnattr_t attr;
+        posix_spawnattr_init(&attr);
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+        posix_spawnattr_setpgroup(&attr, 0);        // child leads its own group (pgid == pid)
         pid_t pid = -1;
-        int r = posix_spawn(&pid, "/bin/sh", nullptr, nullptr,
+        int r = posix_spawn(&pid, "/bin/sh", nullptr, &attr,
                             const_cast<char *const *>(argv), environ);
-        if (r == 0) pids[i] = pid; else rc[i] = -1;
+        posix_spawnattr_destroy(&attr);
+        if (r == 0)
+        {
+            pids[i] = pid;
+            if (i < tracked) { g_childPgids[g_nChildPgids] = pid; g_nChildPgids = g_nChildPgids + 1; }
+        }
+        else rc[i] = -1;
     }
     for (int i = 0; i < n; i++)
     {
@@ -1476,6 +1532,9 @@ static void runShellsConcurrent(const vector<string> &cmds, vector<int> &rc)
         if (waitpid(pids[i], &status, 0) < 0) { rc[i] = -1; continue; }
         rc[i] = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     }
+    g_nChildPgids = 0;                              // all reaped; restore prior handlers
+    sigaction(SIGINT,  &g_prevSigint,  nullptr);
+    sigaction(SIGTERM, &g_prevSigterm, nullptr);
 #endif
 }
 
