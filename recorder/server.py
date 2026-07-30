@@ -390,6 +390,18 @@ _CTRL_LINE = re.compile(r"^\s*(\w+)\s+0x[0-9a-fA-F]+\s+\((\w+)\)\s*:\s*(.*)$")
 _ctrl_overrides = {}          # name -> value the user set; re-applied on stream start
 _ctrl_lock = threading.Lock()
 
+# Only the image-quality knobs are exposed in the UI - the controls that change
+# how the picture LOOKS. The driver also reports flips/rotation, trigger + frame
+# timing, and a pile of raw sensor-config / read-only entries; we deliberately
+# hide all of those. Listed in the order they should appear in the panel.
+# NOTE on this sensor: `exposure` is a 0/1 auto-exposure ENABLE (not a value);
+# the actual shutter knob is `brightness` (a wide range), paired with `gain`.
+IMAGE_CONTROLS = [
+    "brightness", "contrast", "saturation", "gamma",
+    "exposure", "gain", "white_balance_temperature",
+    "sharpness", "backlight_compensation",
+]
+
 
 def _parse_controls(text):
     """Parse `v4l2-ctl --list-ctrls-menus` into a list of control dicts.
@@ -432,11 +444,17 @@ def _parse_controls(text):
 
 
 def _list_controls():
-    """(list_of_controls, None) on success, or (None, error_string) on failure."""
+    """(list_of_controls, None) on success, or (None, error_string) on failure.
+
+    Filtered to IMAGE_CONTROLS (in that order); the driver's non-image entries are
+    hidden. This is the single source of truth for both routes, so /control only
+    ever accepts - and re-apply only ever restores - an image-quality control."""
     ok, out = _run_ok(["v4l2-ctl", f"--device={DEVICE}", "--list-ctrls-menus"], timeout=10)
     if not ok:
         return None, out or "v4l2-ctl failed"
-    return _parse_controls(out), None
+    by_name = {c["name"]: c for c in _parse_controls(out)}
+    controls = [by_name[n] for n in IMAGE_CONTROLS if n in by_name]
+    return controls, None
 
 
 def _set_control(name, value):
@@ -843,7 +861,11 @@ PAGE = """<!doctype html>
  .muted{color:#888; font-size:.85rem; word-break:break-all;}
  .ctl { margin:14px 0; }
  .ctl .lab { display:flex; justify-content:space-between; align-items:center; font-size:.9rem; margin-bottom:5px; }
+ .ctl .lab .right { display:flex; align-items:center; gap:8px; }
  .ctl .lab .val { color:#7fb2d9; font-variant-numeric:tabular-nums; font-weight:700; }
+ .ctl .mini { width:auto; margin:0; padding:2px 8px; font-size:.9rem; font-weight:400;
+              background:#333; border-radius:6px; line-height:1.4; }
+ .ctl .mini:disabled { opacity:.3; }
  .ctl input[type=range] { width:100%; height:28px; }
  .ctl select { width:100%; background:#222; color:#eee; border:1px solid #444;
                border-radius:6px; padding:8px; font-size:1rem; }
@@ -860,8 +882,8 @@ PAGE = """<!doctype html>
    <div id="storage" class="muted" style="margin-top:6px"></div>
  </div>
  <div class="card">
-   <label style="cursor:pointer"><input type="checkbox" id="showctl"> &#9881;&#65039; Camera controls (exposure / gain)</label>
-   <div class="muted">Adjust live while the preview is up &mdash; works during recording too. For uneven stadium lighting: set the auto/manual toggle to <b>Manual</b>, then lower exposure/gain so the bright side stops blowing out. Greyed-out sliders are locked by an auto mode &mdash; switch that mode to Manual to unlock them.</div>
+   <label style="cursor:pointer"><input type="checkbox" id="showctl"> &#9881;&#65039; Camera controls (image quality)</label>
+   <div class="muted">Adjust live while the preview is up &mdash; works during recording too. For a blown-out bright side under stadium lights: set <b>exposure</b> to <b>0</b> (turns off auto-exposure), then bring <b>brightness</b> (the shutter) and <b>gain</b> down until it stops clipping. Tap &#8635; to reset one control; the button below resets them all.</div>
    <div id="ctlbody" style="display:none; margin-top:12px">
      <div id="ctllist"><div class="muted">Loading controls&hellip;</div></div>
      <button id="ctlreset">Reset all to defaults</button>
@@ -968,6 +990,13 @@ const setControl = (name, value) => {
   });
 };
 
+const resetBtn = (c) => {
+  if(c.default === null){ return ''; }           // no default reported -> nothing to reset to
+  const dis = c.inactive ? ' disabled' : '';
+  return '<button class="mini" data-reset="'+esc(c.name)+'" title="Reset to '
+    + esc(c.default)+'"'+dis+'>&#8635;</button>';
+};
+
 const controlRow = (c) => {
   const dis = c.inactive ? ' disabled' : '';
   const cls = 'ctl' + (c.inactive ? ' inactive' : '');
@@ -977,18 +1006,21 @@ const controlRow = (c) => {
       const sel = m.value===c.value ? ' selected' : '';
       return '<option value="'+m.value+'"'+sel+'>'+esc(m.label)+'</option>';
     }).join('');
-    return head + '<div class="lab"><span>'+esc(c.name)+'</span></div>'
+    return head + '<div class="lab"><span>'+esc(c.name)+'</span>'
+      + '<span class="right">'+resetBtn(c)+'</span></div>'
       + '<select data-ctl="'+esc(c.name)+'"'+dis+'>'+opts+'</select></div>';
   }
   if(c.type === 'bool'){
     const chk = c.value ? ' checked' : '';
-    return head + '<label class="lab" style="cursor:pointer"><span>'+esc(c.name)+'</span>'
-      + '<input type="checkbox" data-ctl="'+esc(c.name)+'"'+chk+dis+'></label></div>';
+    return head + '<div class="lab"><span>'+esc(c.name)+'</span><span class="right">'
+      + '<input type="checkbox" data-ctl="'+esc(c.name)+'"'+chk+dis+'>'
+      + resetBtn(c)+'</span></div></div>';
   }
   // int / int64 -> slider
   return head
-    + '<div class="lab"><span>'+esc(c.name)+'</span>'
-    + '<span class="val" data-val="'+esc(c.name)+'">'+c.value+'</span></div>'
+    + '<div class="lab"><span>'+esc(c.name)+'</span><span class="right">'
+    + '<span class="val" data-val="'+esc(c.name)+'">'+c.value+'</span>'
+    + resetBtn(c)+'</span></div>'
     + '<input type="range" data-ctl="'+esc(c.name)+'" min="'+c.min+'" max="'+c.max
     + '" step="'+(c.step||1)+'" value="'+c.value+'"'+dis+'></div>';
 };
@@ -1013,6 +1045,8 @@ const renderControls = (controls) => {
     row.classList.toggle('inactive', !!c.inactive);
     const inp = row.querySelector('[data-ctl]');
     if(inp){ inp.disabled = !!c.inactive; }
+    const rb = row.querySelector('[data-reset]');
+    if(rb){ rb.disabled = !!c.inactive; }
     if(c.name === ctlDragging){ return; }        // user is holding this one
     if(inp){
       if(c.type === 'bool'){ inp.checked = !!c.value; }
@@ -1046,6 +1080,12 @@ $('ctllist').addEventListener('change', (e) => {
   ctlDragging = null;
   const value = el.type === 'checkbox' ? (el.checked ? 1 : 0) : el.value;
   setControl(el.dataset.ctl, value);
+});
+$('ctllist').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-reset]');
+  if(!b){ return; }
+  const c = lastControls.find((x) => { return x.name === b.dataset.reset; });
+  if(c && c.default !== null){ setControl(c.name, c.default); }
 });
 $('ctlreset').onclick = async () => {
   for(const c of lastControls){
