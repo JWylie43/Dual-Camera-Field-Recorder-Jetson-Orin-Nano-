@@ -103,7 +103,7 @@ static int runShell(string cmd);   // forward decl (defined near main); the enco
 // any specific GPU. See chooseVideoEncoder().
 static string g_vencExplicit;      // --venc NAME: force a specific encoder (also parent->child in --jobs)
 static bool   g_forceCpu = false;  // --cpu / --no-hwenc: force software libx264
-static string g_vbitrate  = "15M"; // --bitrate: target video bitrate passed to -b:v
+static string g_vbitrate  = "25M"; // --bitrate: target video bitrate passed to -b:v
 
 struct StitchMaps
 {
@@ -311,16 +311,22 @@ static UMat straightMask(int seam, int OW, int OH)
 }
 
 // Dynamic seam: min-cost vertical path through the KNOWN overlap [ox0,ox1) so the cut
-// weaves AROUND moving objects. Cost = image difference + a center bias (stay near the
-// overlap centre) + a temporal term (stick to the previous frame's seam) so wind/noise
-// doesn't make the seam jitter frame-to-frame - it only moves when a player forces it.
+// weaves AROUND moving objects. Cost = image difference + an anchor bias (stay near the
+// chosen "home" column - the tuner's draggable bar, else the overlap centre) + a temporal
+// term (stick to the previous frame's seam) so wind/noise doesn't make the seam jitter
+// frame-to-frame - it only moves when a player forces it.
 static UMat computeSeamMask(const UMat &warpL, const UMat &right, int ox0, int ox1,
-                            int OW, int OH, vector<int> &prevSeam)
+                            int OW, int OH, vector<int> &prevSeam, int anchor = -1)
 {
     int x0 = max(0, ox0), x1 = min(OW, ox1), bw = x1 - x0;
     if (bw < 4) { prevSeam.assign(OH, (x0 + x1) / 2); return straightMask((x0 + x1) / 2, OW, OH); }
-    const double center = (x0 + x1) / 2.0;
-    const float CB = 0.08f;   // center bias
+    // The seam's preferred column: the tuner sets this by dragging the red bar (passed
+    // through as m.seam); with no choice it falls back to the geometric overlap centre.
+    // This only sets where the seam sits through flat regions - it still weaves around
+    // players wherever the image-difference cost outweighs this gentle pull.
+    const double center = (anchor >= 0)
+        ? max((double)x0, min((double)(x1 - 1), (double)anchor)) : (x0 + x1) / 2.0;
+    const float CB = 0.08f;   // pull toward the anchor/centre
     const float TW = 0.8f;    // temporal stickiness
     bool temporal = ((int)prevSeam.size() == OH);
 
@@ -452,7 +458,7 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
     {
         vector<int> local;
         vector<int> &ps = prevSeam ? *prevSeam : local;   // temporal only within a video loop
-        mask = computeSeamMask(warpL, right, m.ox0, m.ox1, m.OW, m.OH, ps);
+        mask = computeSeamMask(warpL, right, m.ox0, m.ox1, m.OW, m.OH, ps, m.seam);
     }
     else
         mask = straightMask(m.seam, m.OW, m.OH);
@@ -708,6 +714,9 @@ static string tunerHtml()
   <div class="grp">Output <input class="path" id="outpath" type="text" readonly placeholder="chosen when you click Stitch"></div>
   <div class="grp">Shift far (top) <button id="tl">&#9664;</button><input class="val" id="tv" type="number" value="0"><button id="tr">&#9654;</button></div>
   <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
+  <div class="grp">Seam <input class="val" id="mv" type="number" value="0"><button id="mc">reset</button> <span class="hint">or drag the red line</span></div>
+  <div class="grp">Rotate&deg; <button id="rl">&#9664;</button><input class="val" id="rot" type="number" value="0" step="0.5"><button id="rr">&#9654;</button></div>
+  <div class="grp"><label><input type="checkbox" id="showseam" checked> show seam line</label></div>
   <!-- Hidden for now (smart seam, multi-band blend, and exposure match are on by default):
   <div class="grp">Shift-y <button id="yl">&#9664;</button><input class="val" id="yv" type="number" value="0"><button id="yr">&#9654;</button></div>
   <div class="grp">Seam <button id="ml">&#9664;</button><input class="val" id="mv" type="number" value="0"><button id="mr">&#9654;</button></div>
@@ -737,14 +746,16 @@ static string tunerHtml()
 <div id="wrap"><canvas id="c"></canvas></div>
 <script>
 // Dynamic state — filled in by /state (on load) or /import (button).
-let OW=0, OH=0, SEAM0=0, TOTAL=1, VIDEO=false, loaded=false;
+let OW=0, OH=0, SEAM0=0, OX0=0, OX1=0, TOTAL=1, VIDEO=false, loaded=false;
 const cv=document.getElementById('c'), ctx=cv.getContext('2d');
-const clampSeam=v=>{ return Math.max(0,Math.min(OW,v)); };
+// Clamp the seam into the valid overlap band [OX0,OX1) (both cameras present there).
+const clampSeam=v=>{ const lo=OX0||0, hi=OX1||OW; return Math.max(lo,Math.min(hi,Math.round(v))); };
 const stepv=()=>{ return 1; };   // arrows nudge by 1
 const st=t=>{ document.getElementById('status').textContent=t; };
 const tv=document.getElementById('tv'), bv=document.getElementById('bv');
 const stitchBtn=document.getElementById('stitch');
-let sTop=0, sBot=0, sY=0, seam=0, pending=0;   // sY/seam fixed (controls hidden)
+let sTop=0, sBot=0, sY=0, seam=0, pending=0;   // sY fixed; seam set by the draggable bar
+let rot=0, showSeam=true;   // rot = whole-panorama rotation (deg); showSeam toggles the red line
 const clmp=(v,lo,hi)=>{ return Math.max(lo,Math.min(hi,v)); };
 // Crop box (in OW/OH panorama coords). cropOn toggles it; drag body to move,
 // drag the top-left / bottom-right handles to resize.
@@ -758,16 +769,25 @@ function drawRight(){
 }
 function render(){
   if(!loaded) return;
-  sTop=+tv.value||0; sBot=+bv.value||0;   // sY and seam stay fixed (controls hidden)
+  sTop=+tv.value||0; sBot=+bv.value||0;   // sY stays fixed; seam comes from the drag/number box
   ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=1; ctx.clearRect(0,0,OW,OH);
+  // Preview the whole-panorama rotation the same way the engine does: rotate about the
+  // canvas centre. The crop box stays axis-aligned (drawn after we restore).
+  ctx.save();
+  if(rot){ ctx.translate(OW/2,OH/2); ctx.rotate(rot*Math.PI/180); ctx.translate(-OW/2,-OH/2); }
   if(document.getElementById('blend').checked){
     ctx.globalAlpha=0.5; ctx.drawImage(imgL,0,0); drawRight(); ctx.globalAlpha=1;
   } else {
     ctx.drawImage(imgL,0,0);
     ctx.save(); ctx.beginPath(); ctx.rect(seam,0,OW-seam,OH); ctx.clip(); drawRight(); ctx.restore();
   }
-  ctx.strokeStyle='#f33'; ctx.lineWidth=2;
-  ctx.beginPath(); ctx.moveTo(seam,0); ctx.lineTo(seam,OH); ctx.stroke();
+  if(showSeam){
+    ctx.strokeStyle='#f33'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(seam,0); ctx.lineTo(seam,OH); ctx.stroke();
+    // Grab handle at mid-height so the seam line reads as draggable (hidden while cropping).
+    if(!cropOn){ const hh=Math.max(16,OH*0.03); ctx.fillStyle='#f33'; ctx.fillRect(seam-hh/2,OH/2-hh,hh,2*hh); }
+  }
+  ctx.restore();
   if(cropOn) drawCrop();
 }
 function drawCrop(){
@@ -791,12 +811,31 @@ const nudge=(el,d)=>{ el.value=(+el.value||0)+d; render(); };
 tl.onclick=()=>{ nudge(tv,-stepv()); }; tr.onclick=()=>{ nudge(tv,stepv()); };
 bl.onclick=()=>{ nudge(bv,-stepv()); }; br.onclick=()=>{ nudge(bv,stepv()); };
 [tv,bv].forEach(el=>{ el.oninput=render; });
+// Seam number box + reset (mirror the draggable red bar).
+const mv=document.getElementById('mv');
+if(mv){ mv.oninput=()=>{ seam=clampSeam(+mv.value||0); render(); }; }
+const mc=document.getElementById('mc');
+if(mc){ mc.onclick=()=>{ seam=SEAM0; if(mv) mv.value=seam; render(); }; }
+// Whole-panorama rotation (levels a tilted field) + show/hide the red seam line.
+const rotEl=document.getElementById('rot');
+const setRot=v=>{ rot=Math.round(v*10)/10; if(rotEl) rotEl.value=rot; render(); };
+if(rotEl){ rotEl.oninput=()=>{ rot=+rotEl.value||0; render(); }; }
+const rlb=document.getElementById('rl'), rrb=document.getElementById('rr');
+if(rlb){ rlb.onclick=()=>{ setRot((+rotEl.value||0)-0.5); }; }
+if(rrb){ rrb.onclick=()=>{ setRot((+rotEl.value||0)+0.5); }; }
+const ssEl=document.getElementById('showseam');
+if(ssEl){ ssEl.onchange=()=>{ showSeam=ssEl.checked; render(); }; }
 document.getElementById('blend').onchange=render;
 // Crop box: drag body to move, drag the yellow corner handles to resize.
 const toCanvas=(e)=>{ return { x: e.offsetX * OW / cv.clientWidth, y: e.offsetY * OH / cv.clientHeight }; };
 cv.onmousedown=(e)=>{
-  if(!cropOn||!loaded) return;
-  const p=toCanvas(e), hs=Math.max(14, OW*0.016);
+  if(!loaded) return;
+  const p=toCanvas(e);
+  if(!cropOn){   // not cropping -> grab the red seam line if we're near it
+    if(Math.abs(p.x-seam)<Math.max(14, OW*0.012)){ dragMode='seam'; dragStart=p; e.preventDefault(); }
+    return;
+  }
+  const hs=Math.max(14, OW*0.016);
   const nBR=Math.abs(p.x-(cropX+cropW))<hs && Math.abs(p.y-(cropY+cropH))<hs;
   const nTL=Math.abs(p.x-cropX)<hs && Math.abs(p.y-cropY)<hs;
   if(nBR) dragMode='br'; else if(nTL) dragMode='tl';
@@ -805,9 +844,14 @@ cv.onmousedown=(e)=>{
   if(dragMode){ dragStart=p; cropStart={x:cropX,y:cropY,w:cropW,h:cropH}; e.preventDefault(); }
 };
 cv.onmousemove=(e)=>{
-  if(!dragMode) return;
-  const p=toCanvas(e), dx=p.x-dragStart.x, dy=p.y-dragStart.y;
-  if(dragMode==='move'){ cropX=clmp(cropStart.x+dx,0,OW-cropW); cropY=clmp(cropStart.y+dy,0,OH-cropH); }
+  const p=toCanvas(e);
+  if(!dragMode){   // hover feedback: show a resize cursor when over the draggable seam line
+    if(loaded && !cropOn){ cv.style.cursor=(Math.abs(p.x-seam)<Math.max(14,OW*0.012))?'ew-resize':'default'; }
+    return;
+  }
+  const dx=p.x-dragStart.x, dy=p.y-dragStart.y;
+  if(dragMode==='seam'){ seam=clampSeam(p.x); const mv=document.getElementById('mv'); if(mv) mv.value=seam; }
+  else if(dragMode==='move'){ cropX=clmp(cropStart.x+dx,0,OW-cropW); cropY=clmp(cropStart.y+dy,0,OH-cropH); }
   else if(dragMode==='br'){ cropW=clmp(cropStart.w+dx,20,OW-cropX); cropH=clmp(cropStart.h+dy,20,OH-cropY); }
   else if(dragMode==='tl'){
     const nx=clmp(cropStart.x+dx,0,cropStart.x+cropStart.w-20), ny=clmp(cropStart.y+dy,0,cropStart.y+cropStart.h-20);
@@ -849,6 +893,9 @@ fval.onchange=()=>{ loadFrame(fval.value); };
 // frame slider, show the first frame, and enable stitching.
 function applyLoad(d){
   loaded=true; OW=d.ow; OH=d.oh; SEAM0=d.seam; TOTAL=d.total; VIDEO=d.video; seam=SEAM0;
+  OX0=(d.ox0!=null?d.ox0:0); OX1=(d.ox1!=null?d.ox1:OW);   // valid overlap band for the seam drag
+  { const mv=document.getElementById('mv'); if(mv){ mv.value=seam; mv.min=OX0; mv.max=OX1; } }
+  rot=0; { const r=document.getElementById('rot'); if(r) r.value=0; }   // reset rotation for a new source
   cropW=0;   // re-initialise the crop box to the new frame size on next draw
   cv.width=OW; cv.height=OH;
   document.getElementById('srcpath').value=d.source||'';
@@ -879,7 +926,7 @@ let polling=null;
 const pb=document.getElementById('pb'), pct=document.getElementById('pct');
 // hidden controls fixed to defaults: shift-y 0, smart seam on, 6-band blend, exposure match on
 const params=()=>{
-  let p='shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty=0&seam='+SEAM0+'&bands=6&exposure=1&smartseam=1';
+  let p='shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty=0&seam='+Math.round(seam)+'&degrees='+rot+'&bands=6&exposure=1&smartseam=1';
   if(cropOn && cropW>0) p+='&cropx='+Math.round(cropX)+'&cropy='+Math.round(cropY)+'&cropw='+Math.round(cropW)+'&croph='+Math.round(cropH);
   var wa=document.getElementById('withaudio'); if(wa&&wa.checked) p+='&audio=1';
   return p;
@@ -1102,6 +1149,7 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
         if (!loaded) return "{\"loaded\":false}";
         ostringstream j;
         j << "{\"loaded\":true,\"ow\":" << m.OW << ",\"oh\":" << m.OH << ",\"seam\":" << m.seam
+          << ",\"ox0\":" << m.ox0 << ",\"ox1\":" << m.ox1
           << ",\"total\":" << totalFrames << ",\"video\":" << (video ? "true" : "false")
           << ",\"source\":\"" << jsonEscape(source) << "\",\"output\":\"" << jsonEscape(outFile) << "\""
           << ",\"left\":\"" << curLeft << "\",\"right\":\"" << curRight << "\"}";
@@ -1216,28 +1264,31 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                 int seamVal = ss.empty() ? -1 : stoi(ss);
                 int endRes = endFrame >= 0 ? endFrame : (tf > 0 ? tf - 1 : -1);
                 string calib = calibDir;
+                // Global rotation of the finished panorama (tuner's Rotate control -> --degrees);
+                // falls back to whatever was passed on the command line when the param is absent.
+                double dg = query.find("degrees=") != string::npos ? stod(qparam(query, "degrees")) : degrees;
                 // Build + record the exact equivalent CLI command (shown in UI + console).
                 {
                     string fo = of.empty() ? (outDir + "/stitched_video.mp4") : of;
-                    string cmd = buildCliCommand(src, calib, degrees, seamVal, a, cropStr,
+                    string cmd = buildCliCommand(src, calib, dg, seamVal, a, cropStr,
                                                  startFrame, (vid ? endRes : -1), (vid ? jobs : 1), fo);
                     { lock_guard<mutex> lk(g_mu); g_cmd = cmd; }
                     cout << "[stitch] equivalent CLI command:\n  " << cmd << "\n";
                 }
-                std::thread([mm, a, src, vid, degrees, startFrame, endFrame, endRes, tf,
+                std::thread([mm, a, src, vid, dg, startFrame, endFrame, endRes, tf,
                              outDir, of, seamVal, cropStr, calib, jobs, wantAudio]() mutable {
                     string res;
                     if (vid && jobs > 1 && endRes >= startFrame)   // parallel video render
                     {
                         string fo = of.empty() ? (outDir + "/stitched_video.mp4") : of;
-                        int rc = runParallelJobs(src, calib, degrees, seamVal, a, cropStr,
+                        int rc = runParallelJobs(src, calib, dg, seamVal, a, cropStr,
                                                  startFrame, endRes, fo, jobs, &g_percent);
                         res = rc == 0 ? fo : string("ERROR: parallel stitch failed (see console)");
                     }
                     else                                           // single-process (image, or --no-jobs)
                         res = vid
-                            ? stitchVideoFile(src, mm, degrees, a, startFrame, endFrame, tf, outDir, of, &g_percent)
-                            : stitchImageFile(src, mm, degrees, a, outDir, of);
+                            ? stitchVideoFile(src, mm, dg, a, startFrame, endFrame, tf, outDir, of, &g_percent)
+                            : stitchImageFile(src, mm, dg, a, outDir, of);
                     // Attach the recording's audio to the finished stitch, if asked and available.
                     if (wantAudio && vid && res.rfind("ERROR", 0) != 0)
                     {
@@ -1805,7 +1856,7 @@ int main(int argc, char **argv)
     // parent hands its resolved pick to --jobs children); --bitrate sets -b:v.
     g_forceCpu   = hasArg(argc, argv, "--cpu") || hasArg(argc, argv, "--no-hwenc");
     g_vencExplicit = argVal(argc, argv, "--venc", "");
-    g_vbitrate   = argVal(argc, argv, "--bitrate", "15M");
+    g_vbitrate   = argVal(argc, argv, "--bitrate", "25M");
     // Attach the recording's audio after the stitch (mux from the .sync.json sidecar).
     // --audio auto-finds the sidecar next to --source; --audio-file names it. Never
     // passed to --jobs children, so only the top-level render attaches.
