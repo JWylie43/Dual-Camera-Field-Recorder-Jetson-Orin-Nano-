@@ -726,7 +726,7 @@ static string tunerHtml()
   -->
   <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
-  <div class="grp"><label><input type="checkbox" id="crop"> crop to box</label> <span class="hint" id="cropdim"></span></div>
+  <div class="grp"><label><input type="checkbox" id="crop" checked> crop to box</label> <span class="hint" id="cropdim"></span></div>
   <div class="grp"><label><input type="checkbox" id="withaudio" checked> attach audio after stitch</label> <span class="hint">if a .sync.json sidecar is found</span></div>
   <button id="stitch" disabled>Stitch all frames</button>
   <button id="quit">Quit</button>
@@ -759,7 +759,7 @@ let rot=0, showSeam=true;   // rot = whole-panorama rotation (deg); showSeam tog
 const clmp=(v,lo,hi)=>{ return Math.max(lo,Math.min(hi,v)); };
 // Crop box (in OW/OH panorama coords). cropOn toggles it; drag body to move,
 // drag the top-left / bottom-right handles to resize.
-let cropOn=false, cropX=0, cropY=0, cropW=0, cropH=0, dragMode=null, dragStart=null, cropStart=null;
+let cropOn=true, cropX=0, cropY=0, cropW=0, cropH=0, dragMode=null, dragStart=null, cropStart=null;
 const imgL=new Image(), imgR=new Image();
 function both(){ if(--pending<=0){ pending=0; render(); } }
 imgL.onload=imgR.onload=both;
