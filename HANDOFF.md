@@ -86,6 +86,20 @@ The rename persists across reboots (module auto-loads via udev).
 `/dev/video1`. No R8 resistor mod needed — the genuine RPi HQ boards work as-is on
 this Orin. The only fix required was un-hiding the driver above.
 
+## Recorder integration status
+
+✅ **Phase 1 (recording) done.** `record.py --source imx477` records both Pi HQ
+cameras as one combined 3840×1080@30 MJPEG MKV (two `nvarguscamerasrc` ISP streams
+→ `nvcompositor` side-by-side → the existing record branch), stitcher-ready.
+`capture.py` gained `--eos-to pipeline` for the two-source finalize. Confirmed
+recording + playing in VLC. Runs ISP auto-exposure (no manual controls yet).
+Remaining: Phase 2 web panel (Argus-property controls + preview), then genlock.
+
+Note on frame rate vs exposure: fps is set by the sensor frame duration (blanking),
+NOT by dropping frames; it only caps exposure. Motion blur is governed by exposure
+time (13 µs–frame duration), chosen independently by AE — cap `exposuretimerange`
+to reduce blur for fast action, not the frame rate.
+
 ## Goals / next steps (roughly in order)
 
 1. **Pin down record modes** — `v4l2-ctl -d /dev/video0 --list-formats-ext`; choose
