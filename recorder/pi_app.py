@@ -239,8 +239,11 @@ def main():
         print("ERROR: pipeline failed to start. Are both Pi HQ cameras enumerated "
               "(`sudo camswitch pi`), and is nothing else holding the cameras?", flush=True)
         return
-    apply_controls()
-    print(f"Pi HQ app: http://0.0.0.0:{PORT}  (live preview + matched exposure/gain)", flush=True)
+    # NOTE: we deliberately do NOT set exposure/gain here. Setting Argus properties
+    # on a live nvarguscamerasrc re-creates the capture stream, which on two cameras
+    # can crash the compositor. Startup runs pure ISP auto-exposure; manual controls
+    # are being reworked to a safe (restart-based) path.
+    print(f"Pi HQ app: http://0.0.0.0:{PORT}  (live preview, auto-exposure)", flush=True)
     try:
         app.run(host="0.0.0.0", port=PORT, threaded=True)
     finally:
