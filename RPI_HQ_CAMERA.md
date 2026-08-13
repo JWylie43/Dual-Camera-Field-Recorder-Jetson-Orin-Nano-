@@ -71,6 +71,9 @@ sudo ./camswitch arducam   # back to the Arducam B0577 dual kit
 
 Also: `pi-a` / `pi-c` for a single Pi HQ on one port.
 
+`camswitch pi` also re-enables the stock IMX477 driver (see the gotcha below) —
+that's automatic, no manual step needed.
+
 Revert to the pre-`camswitch` config at any time:
 
 ```bash
@@ -78,6 +81,27 @@ sudo cp /boot/extlinux/extlinux.conf.camswitch.bak /boot/extlinux/extlinux.conf 
 ```
 
 ---
+
+## Gotcha: the Arducam kernel ships the IMX477 driver *disabled*
+
+The Arducam kernel install renames the stock driver
+`nv_imx477.ko` → `nv_imx477.ko.bak` so it can't load (it would otherwise clash
+with Arducam's own camera drivers). With it disabled, the symptom is confusing:
+the overlay is correct and the sensors appear in the device tree
+(`/sys/bus/i2c/devices/9-001a`, `10-001a` exist), but **no driver binds**, there's
+**no probe attempt in dmesg**, and `i2cdetect` shows `--` (not `UU`) at `0x1a`. It
+looks like a dead camera when nothing is actually wrong with the hardware.
+
+Fix (now done automatically by `camswitch pi`):
+
+```bash
+sudo mv /lib/modules/$(uname -r)/updates/drivers/media/i2c/nv_imx477.ko.bak \
+        /lib/modules/$(uname -r)/updates/drivers/media/i2c/nv_imx477.ko
+sudo depmod -a && sudo modprobe nv_imx477
+```
+
+After this, `i2cdetect` shows `UU` at `0x1a` (driver claiming the sensor) and
+`/dev/video0` + `/dev/video1` appear.
 
 ## Verify after switching + rebooting
 

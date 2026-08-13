@@ -39,6 +39,21 @@ need_root() {
 
 current_line() { grep -E '^[[:space:]]*OVERLAYS' "$CONF" | head -1; }
 
+ensure_imx477_driver() {
+  # The Arducam kernel ships with the stock IMX477 driver DISABLED - it renames
+  # nv_imx477.ko -> nv_imx477.ko.bak so it can't load, to avoid clashing with
+  # Arducam's own camera drivers. With it disabled, the Pi HQ sensors show up in
+  # the device tree (i2c 9-001a / 10-001a) but never get a driver bound, so they
+  # never enumerate. Re-enable it whenever we select a Pi HQ / IMX477 config.
+  local bak
+  bak="$(find /lib/modules/"$(uname -r)" -name 'nv_imx477.ko.bak' 2>/dev/null | head -1)"
+  if [ -n "$bak" ]; then
+    mv "$bak" "${bak%.bak}"
+    depmod -a
+    echo "Re-enabled stock IMX477 driver: ${bak%.bak}"
+  fi
+}
+
 overlay_dir() {
   # Derive the directory the active overlays live in (e.g. /boot/arducam/dts),
   # so a switch drops the new .dtbo right next to the old one.
@@ -68,6 +83,8 @@ do_list() {
 do_switch() {
   local target="$1" dir file
   need_root "$@"
+  # Pi HQ configs need the stock IMX477 driver, which the Arducam kernel hides.
+  case "$target" in imx477*) ensure_imx477_driver ;; esac
   dir="$(overlay_dir)"
   file="$dir/${PREFIX}-${target}.dtbo"
 
