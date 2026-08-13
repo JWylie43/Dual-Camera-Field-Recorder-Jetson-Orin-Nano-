@@ -27,6 +27,13 @@ cameras** (Sony **IMX477**, Adafruit #4561) on the same Orin, aimed at a
 - **Pi HQ cameras use the Tegra ISP path** (`nvarguscamerasrc` / Argus → NV12), not
   the MJPEG path the Arducam recorder currently uses (`nvv4l2camerasrc`). This is the
   main integration difference.
+- **IMX477 modes exposed by the stock driver:** only two — `3840x2160@30` and
+  `1920x1080@60`, both raw 10-bit Bayer (`RG10`). Full-sensor 4056×3040 is NOT
+  exposed; adding modes = device-tree mode tables + driver register sequences.
+- **The Orin Nano has NO hardware video encoder (no NVENC)** — `nvv4l2h264enc`/`265`
+  do not exist. It DOES have hardware JPEG (`nvjpegenc`). So on-Orin recording is
+  MJPEG (light, CPU idle); H.264/H.265 encode happens off-box (Mac VideoToolbox /
+  Windows AMF). The IMX477 recorder path should be `nvarguscamerasrc → nvjpegenc`.
 
 ## Access
 
