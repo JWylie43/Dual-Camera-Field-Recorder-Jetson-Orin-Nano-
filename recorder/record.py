@@ -63,6 +63,7 @@ Pipeline (audio segment):
 
 Usage:
     python3 record.py                 # record video + audio (if a mic is present)
+    python3 record.py --source imx477 # two Raspberry Pi HQ (IMX477) cams, composited
     python3 record.py --no-audio      # video only
     python3 record.py --seconds 30    # fixed 30 seconds
     python3 record.py --audio-device plughw:2,0   # force a specific mic
@@ -90,11 +91,25 @@ CAPTURE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captu
 
 
 class Config:
-    device = "/dev/video0"          # the camera (confirmed via v4l2-ctl --list-devices)
+    # Camera source model:
+    #   "arducam" - B0577 dual kit: BOTH eyes arrive as ONE combined frame on a
+    #               single /dev/video0 (nvv4l2camerasrc, ready UYVY - no ISP step).
+    #   "imx477"  - two Raspberry Pi HQ sensors (raw Bayer): each goes through the
+    #               Tegra ISP via nvarguscamerasrc, then nvcompositor glues them
+    #               side-by-side into the SAME combined-frame layout, so everything
+    #               downstream (record branch, capture.py, the stitcher) is unchanged.
+    source = "arducam"
+
+    device = "/dev/video0"          # arducam: the combined-stream camera
     width = 3840                    # combined frame width  (2 x 1920)
     height = 1200                   # combined frame height (1 x 1200)
     fps = 30                        # frames per second
-    pixel_format = "UYVY"           # camera output (UYVY 4:2:2, from the onboard ISP)
+    pixel_format = "UYVY"           # arducam output (UYVY 4:2:2, from the onboard ISP)
+
+    # imx477 dual-Argus source: composited to (2 x eye_width) x eye_height.
+    imx477_sensor_ids = (0, 1)      # nvarguscamerasrc sensor-id for (left, right)
+    eye_width = 1920                # per-camera width  (mode 1 is 1920x1080@60 max)
+    eye_height = 1080               # per-camera height
 
     jpeg_quality = 85               # MJPEG quality 0-100 (85 ~ visually lossless)
 
@@ -166,14 +181,24 @@ def check_prerequisites(cfg, measure=False):
         problems.append("gst-launch-1.0 not found (GStreamer not installed?).")
     if shutil.which("v4l2-ctl") is None:
         problems.append("v4l2-ctl not found (install with: sudo apt install v4l-utils).")
-    if shutil.which("gst-inspect-1.0") and \
-            _run(["gst-inspect-1.0", "nvv4l2camerasrc"], check=False).returncode != 0:
-        problems.append("nvv4l2camerasrc not found - this is the zero-copy capture "
-                        "element the recorder needs to hit 30fps. Check the L4T install.")
-
-    if not os.path.exists(cfg.device):
-        problems.append(f"Camera device {cfg.device} does not exist. "
-                        f"Check `ls /dev/video*` and the ribbon connection.")
+    if cfg.source == "imx477":
+        for el in ("nvarguscamerasrc", "nvcompositor"):
+            if shutil.which("gst-inspect-1.0") and \
+                    _run(["gst-inspect-1.0", el], check=False).returncode != 0:
+                problems.append(f"{el} not found - the imx477 source needs it (ISP "
+                                f"capture + side-by-side compositing). Check the L4T install.")
+        for node in ("/dev/video0", "/dev/video1"):
+            if not os.path.exists(node):
+                problems.append(f"Camera device {node} does not exist - are both Pi HQ "
+                                f"cameras enumerated? Try `sudo ./camswitch pi`.")
+    else:
+        if shutil.which("gst-inspect-1.0") and \
+                _run(["gst-inspect-1.0", "nvv4l2camerasrc"], check=False).returncode != 0:
+            problems.append("nvv4l2camerasrc not found - this is the zero-copy capture "
+                            "element the recorder needs to hit 30fps. Check the L4T install.")
+        if not os.path.exists(cfg.device):
+            problems.append(f"Camera device {cfg.device} does not exist. "
+                            f"Check `ls /dev/video*` and the ribbon connection.")
 
     if not measure:
         # The real recorder drives the pipeline from capture.py (python-gi), so
@@ -316,23 +341,53 @@ def _preview_branch(cfg):
     ]
 
 
+def _source_chain(cfg):
+    """Elements that produce ONE combined NVMM frame on an element named 'vsrc'.
+
+    'vsrc' is what capture.py probes for the first-frame anchor. Whatever the
+    source, everything DOWNSTREAM of here is byte-for-byte the proven pipeline.
+
+    arducam: the B0577 already delivers both eyes as one frame - just the source.
+    imx477 : two ISP streams (nvarguscamerasrc) composited side-by-side into the
+             same (2 x eye_width) x eye_height layout. NOTE: without genlock the two
+             sensors free-run, so left/right can be up to ~1 frame apart until the
+             hardware sync (XVS master/slave) work lands.
+    """
+    if cfg.source == "imx477":
+        ew, eh, fps = cfg.eye_width, cfg.eye_height, cfg.fps
+        eye_caps = f"video/x-raw(memory:NVMM),width={ew},height={eh},framerate={fps}/1"
+        combined_caps = f"video/x-raw(memory:NVMM),width={2 * ew},height={eh},framerate={fps}/1"
+        left_id, right_id = cfg.imx477_sensor_ids
+        # Cameras link into the compositor's request pads (forward-referencing
+        # 'vsrc' is fine - parse_launch builds all elements before linking).
+        return [
+            "nvarguscamerasrc", f"sensor-id={left_id}", "!", eye_caps, "!", "vsrc.sink_0",
+            "nvarguscamerasrc", f"sensor-id={right_id}", "!", eye_caps, "!", "vsrc.sink_1",
+            "nvcompositor", "name=vsrc",
+            "sink_0::xpos=0", "sink_0::ypos=0", f"sink_0::width={ew}", f"sink_0::height={eh}",
+            f"sink_1::xpos={ew}", "sink_1::ypos=0", f"sink_1::width={ew}", f"sink_1::height={eh}",
+            "!", combined_caps,
+        ]
+    nvmm_caps = (f"video/x-raw(memory:NVMM),format={cfg.pixel_format},"
+                 f"width={cfg.width},height={cfg.height},framerate={cfg.fps}/1")
+    return ["nvv4l2camerasrc", f"device={cfg.device}", "name=vsrc", "!", nvmm_caps]
+
+
 def _video_chain(cfg, output_path):
     """The real-recording video element chain (no preview, or tee'd preview).
 
-    The source is named 'vsrc' so capture.py can attach the first-frame anchor
-    probe. Everything downstream is byte-for-byte the proven 30fps pipeline.
+    The combined-frame source ('vsrc') + the proven record branch, optionally
+    tee'd to a downscaled preview. Everything after 'vsrc' is source-agnostic.
     """
-    nvmm_caps = (f"video/x-raw(memory:NVMM),format={cfg.pixel_format},"
-                 f"width={cfg.width},height={cfg.height},framerate={cfg.fps}/1")
-    src = ["nvv4l2camerasrc", f"device={cfg.device}", "name=vsrc", "!", nvmm_caps]
+    head = _source_chain(cfg)
     if cfg.preview_port:
-        return src + [
+        return head + [
             "!", "tee", "name=t",
             "t.", "!", "queue", "max-size-buffers=8", "leaky=downstream", "!",
         ] + _record_branch(cfg, output_path) + [
             "t.", "!", "queue", "max-size-buffers=4", "leaky=downstream", "!",
         ] + _preview_branch(cfg)
-    return src + [
+    return head + [
         "!", "nvvidconv", "!", "video/x-raw,format=I420",
         "!", "queue", "max-size-buffers=8", "leaky=downstream",
         "!", "nvjpegenc", f"quality={cfg.jpeg_quality}", "!", "jpegparse",
@@ -366,12 +421,9 @@ def audio_pipeline_desc(cfg, device, wav_path):
 
 def build_pipeline(cfg, output_path, measure=False):
     """gst-launch argument list. Used only for --measure (and --dry-run display)."""
-    nvmm_caps = (f"video/x-raw(memory:NVMM),format={cfg.pixel_format},"
-                 f"width={cfg.width},height={cfg.height},framerate={cfg.fps}/1")
     flags = ["-e", "-v"] if measure else ["-e"]
-    src = ["nvv4l2camerasrc", f"device={cfg.device}", "!", nvmm_caps]
     if measure:
-        chain = src + [
+        chain = _source_chain(cfg) + [
             "!", "nvvidconv", "!", "video/x-raw,format=I420",
             "!", "queue", "max-size-buffers=8", "leaky=downstream",
             "!", "nvjpegenc", f"quality={cfg.jpeg_quality}", "!", "jpegparse",
@@ -448,14 +500,18 @@ class Sidecar:
 # --------------------------------------------------------------------------
 # Capture process management
 # --------------------------------------------------------------------------
-def spawn_capture(desc, probe_name, on_anchor):
+def spawn_capture(desc, probe_name, on_anchor, eos_to="source"):
     """Launch capture.py for one stream; call on_anchor(ns, utc) on its first buffer.
 
     start_new_session so a SIGINT to record.py doesn't hit the capture directly -
     the supervisor decides when each capture stops (and how, cleanly).
+
+    eos_to: how capture.py finalizes on stop - "source" (single-source pipelines)
+    or "pipeline" (multi-source, e.g. two cameras -> compositor).
     """
     proc = subprocess.Popen(
-        ["python3", CAPTURE_SCRIPT, "--pipeline", desc, "--probe", probe_name],
+        ["python3", CAPTURE_SCRIPT, "--pipeline", desc, "--probe", probe_name,
+         "--eos-to", eos_to],
         stdout=subprocess.PIPE, stderr=None, text=True, start_new_session=True)
 
     def reader():
@@ -567,8 +623,14 @@ _device_was_forced = False
 
 
 def _print_header(cfg, output_path, sidecar_path, audio_on, measure):
-    print(f"Device      : {cfg.device}")
-    print(f"Resolution  : {cfg.width}x{cfg.height} @ {cfg.fps}fps ({cfg.pixel_format})")
+    if cfg.source == "imx477":
+        lid, rid = cfg.imx477_sensor_ids
+        print(f"Source      : imx477 dual (Argus sensor-id {lid}+{rid} -> nvcompositor)")
+        print(f"Resolution  : {cfg.width}x{cfg.height} @ {cfg.fps}fps "
+              f"(2 x {cfg.eye_width}x{cfg.eye_height}, ISP NV12)")
+    else:
+        print(f"Source      : arducam ({cfg.device})")
+        print(f"Resolution  : {cfg.width}x{cfg.height} @ {cfg.fps}fps ({cfg.pixel_format})")
     print(f"Encoder     : MJPEG (hardware NVJPG), quality={cfg.jpeg_quality}")
     print(f"Storage est : ~40 GB/hr @ q85 (varies; ~12 hr on 500 GB)")
     if measure:
@@ -695,8 +757,12 @@ def record(cfg, seconds=None, dry_run=False, measure=False, log_thermals=False):
 
     sidecar = Sidecar(sidecar_path, output_path, cfg)
 
+    # imx477 has TWO sources behind the compositor, so a source-level EOS would
+    # end only one input and never finalize the file; EOS the whole pipeline.
+    video_eos_to = "pipeline" if cfg.source == "imx477" else "source"
     video_proc = spawn_capture(
-        video_pipeline_desc(cfg, output_path), "vsrc", sidecar.set_video_anchor)
+        video_pipeline_desc(cfg, output_path), "vsrc", sidecar.set_video_anchor,
+        eos_to=video_eos_to)
 
     stop_event = threading.Event()
     audio_thread = None
@@ -802,8 +868,13 @@ def main():
     parser.add_argument("--audio-device", default=None,
                         help="Force a specific ALSA capture device, e.g. plughw:2,0 "
                              "(default: auto-detect the first USB mic, re-detected per segment).")
+    parser.add_argument("--source", choices=["arducam", "imx477"], default=Config.source,
+                        help="Camera source: 'arducam' (B0577 combined stream) or 'imx477' "
+                             "(two Raspberry Pi HQ sensors composited). Default: arducam.")
+    parser.add_argument("--fps", type=int, default=None,
+                        help="Frames per second (default: 30; imx477 mode allows up to 60).")
     parser.add_argument("--device", default=Config.device,
-                        help=f"V4L2 device (default: {Config.device})")
+                        help=f"V4L2 device, arducam only (default: {Config.device})")
     parser.add_argument("--output-dir", default=Config.output_dir,
                         help=f"Where to write files (default: {Config.output_dir})")
     parser.add_argument("--quality", type=int, default=Config.jpeg_quality,
@@ -817,25 +888,41 @@ def main():
     args = parser.parse_args()
 
     cfg = Config()
+    cfg.source = args.source
     cfg.device = args.device
     cfg.output_dir = args.output_dir
     cfg.jpeg_quality = args.quality
     cfg.thermal_interval_ms = args.thermal_interval
     cfg.preview_port = args.preview_port
+    if args.fps:
+        cfg.fps = args.fps
+    if cfg.source == "imx477":
+        # Combined frame is the two eyes side by side.
+        cfg.width = cfg.eye_width * 2
+        cfg.height = cfg.eye_height
 
-    # Merge any --set-ctrl overrides on top of the built-in controls. Use an
-    # instance-level copy so we never mutate the shared Config class dict.
-    cfg.controls = dict(Config.controls)
-    for item in (args.set_ctrl or []):
-        if "=" not in item:
-            print(f"  warning: ignoring malformed --set-ctrl '{item}' (need NAME=VALUE)")
-            continue
-        key, val = item.split("=", 1)
-        key, val = key.strip(), val.strip()
-        try:
-            cfg.controls[key] = int(val)
-        except ValueError:
-            cfg.controls[key] = val
+    # Camera controls. imx477 is driven by Argus (not V4L2), so the arducam
+    # v4l2 controls (frame_rate/trigger_mode) and --set-ctrl don't apply - it
+    # records with ISP auto-exposure for now (Argus-property controls come with
+    # the web-panel phase). arducam keeps the built-in controls + any overrides.
+    if cfg.source == "imx477":
+        cfg.controls = {}
+        if args.set_ctrl:
+            print("  note: --set-ctrl is ignored for --source imx477 (Argus controls "
+                  "not wired yet); recording with ISP auto-exposure.")
+    else:
+        # Instance-level copy so we never mutate the shared Config class dict.
+        cfg.controls = dict(Config.controls)
+        for item in (args.set_ctrl or []):
+            if "=" not in item:
+                print(f"  warning: ignoring malformed --set-ctrl '{item}' (need NAME=VALUE)")
+                continue
+            key, val = item.split("=", 1)
+            key, val = key.strip(), val.strip()
+            try:
+                cfg.controls[key] = int(val)
+            except ValueError:
+                cfg.controls[key] = val
 
     # Audio: on by default; never in --measure (no file is written).
     cfg.audio_enabled = (not args.no_audio) and (not args.measure)

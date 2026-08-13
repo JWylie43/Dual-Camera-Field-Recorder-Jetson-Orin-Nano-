@@ -56,7 +56,11 @@ def main():
     ap.add_argument("--pipeline", required=True,
                     help="gst-launch-style pipeline description to run.")
     ap.add_argument("--probe", required=True,
-                    help="name= of the source element to read the first-buffer anchor from.")
+                    help="name= of the element to read the first-buffer anchor from.")
+    ap.add_argument("--eos-to", choices=["source", "pipeline"], default="source",
+                    help="Where to inject EOS on stop: 'source' (default; single-source "
+                         "pipelines) or 'pipeline' (multi-source, e.g. two cameras -> "
+                         "nvcompositor, where a source-level EOS ends only one input).")
     args = ap.parse_args()
 
     Gst.init(None)
@@ -102,9 +106,15 @@ def main():
     def send_eos_once():
         if not state["eos_sent"]:
             state["eos_sent"] = True
-            # Inject EOS AT THE SOURCE so it flows downstream through the
-            # encoder/muxer/filesink and finalizes the file (header, seek index).
-            src.send_event(Gst.Event.new_eos())
+            # Inject EOS so it flows downstream through the encoder/muxer/filesink
+            # and finalizes the file (header, seek index). Single-source: EOS the
+            # source element directly. Multi-source (two cameras -> nvcompositor):
+            # EOS the whole pipeline - GstBin dispatches it to ALL sources, whereas
+            # EOSing just one compositor input would never finalize the file.
+            if args.eos_to == "pipeline":
+                pipeline.send_event(Gst.Event.new_eos())
+            else:
+                src.send_event(Gst.Event.new_eos())
 
     # --- bus handling ---------------------------------------------------------
     bus = pipeline.get_bus()
