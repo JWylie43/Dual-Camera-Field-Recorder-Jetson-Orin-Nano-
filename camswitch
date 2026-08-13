@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+#
+# camswitch - flip the active CSI camera device-tree overlay on the Jetson
+#             Orin Nano, then (optionally) reboot to apply it.
+#
+# Why this exists:
+#   MIPI/CSI cameras are NOT self-describing - there is no bus enumeration like
+#   USB. The bootloader (UEFI) reads /boot/extlinux/extlinux.conf, merges the
+#   base device tree (FDT) with the overlay(s) on the OVERLAYS line, and hands
+#   the finished tree to the kernel. That selection is locked in at boot, so
+#   switching which camera the board looks for means editing that line and
+#   rebooting. This script does exactly that, reversibly.
+#
+#   Both overlays already ship on disk (installed with the Arducam kernel):
+#     tegra234-p3767-camera-p3768-imx477-dual.dtbo   <- Raspberry Pi HQ (IMX477), 2-lane, both ports
+#     tegra234-p3767-camera-p3768-arducam-dual.dtbo  <- Arducam dual kit (B0577)
+#
+# Usage:
+#   sudo ./camswitch pi        # both ports = Raspberry Pi HQ (IMX477), 2-lane
+#   sudo ./camswitch pi-a      # single Pi HQ on port A (CAM0) only
+#   sudo ./camswitch pi-c      # single Pi HQ on port C (CAM1) only
+#   sudo ./camswitch arducam   # back to the Arducam B0577 dual kit
+#   ./camswitch status         # show the currently-active overlay
+#   ./camswitch list           # list every camera overlay available on disk
+#
+# Reverting is just the opposite switch (e.g. `sudo ./camswitch arducam`), or
+# restore the backup this script makes on its first run:
+#   sudo cp /boot/extlinux/extlinux.conf.camswitch.bak /boot/extlinux/extlinux.conf
+#
+set -euo pipefail
+
+CONF=/boot/extlinux/extlinux.conf
+PREFIX=tegra234-p3767-camera-p3768
+
+# Elevate automatically for the write actions.
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi
+}
+
+current_line() { grep -E '^[[:space:]]*OVERLAYS' "$CONF" | head -1; }
+
+overlay_dir() {
+  # Derive the directory the active overlays live in (e.g. /boot/arducam/dts),
+  # so a switch drops the new .dtbo right next to the old one.
+  local line path
+  line="$(current_line || true)"
+  path="$(echo "$line" | sed -E 's/^[[:space:]]*OVERLAYS[[:space:]]+//' | cut -d, -f1)"
+  if [ -n "$path" ]; then dirname "$path"; else echo /boot; fi
+}
+
+show_status() {
+  local line
+  line="$(current_line || true)"
+  if [ -z "$line" ]; then
+    echo "No OVERLAYS line found in $CONF"
+    return 1
+  fi
+  echo "Active overlay line:"
+  echo "  ${line#"${line%%[![:space:]]*}"}"
+}
+
+do_list() {
+  local dir; dir="$(overlay_dir)"
+  echo "Camera overlays available in $dir:"
+  ls -1 "$dir"/${PREFIX}-*.dtbo 2>/dev/null | sed 's#.*/#  #' || echo "  (none found)"
+}
+
+do_switch() {
+  local target="$1" dir file
+  need_root "$@"
+  dir="$(overlay_dir)"
+  file="$dir/${PREFIX}-${target}.dtbo"
+
+  if [ ! -f "$file" ]; then
+    echo "ERROR: overlay not found: $file" >&2
+    echo "Run './camswitch list' to see what is available." >&2
+    exit 1
+  fi
+
+  # One-time backup of the boot config.
+  if [ ! -f "$CONF.camswitch.bak" ]; then
+    cp "$CONF" "$CONF.camswitch.bak"
+    echo "Backed up boot config -> $CONF.camswitch.bak"
+  fi
+
+  # Replace the whole value on the OVERLAYS line with the chosen overlay.
+  sed -i -E "s#^([[:space:]]*OVERLAYS[[:space:]]+).*#\1$file#" "$CONF"
+  echo "Active overlay set to:"
+  echo "  $file"
+  echo
+  read -r -p "Reboot now to apply? [y/N] " ans
+  case "$ans" in
+    y|Y) echo "Rebooting..."; reboot ;;
+    *)   echo "Not rebooting. The change takes effect on the next boot." ;;
+  esac
+}
+
+case "${1:-}" in
+  pi|imx477|dual) do_switch imx477-dual "$@" ;;
+  pi-a|imx477-a)  do_switch imx477-A "$@" ;;
+  pi-c|imx477-c)  do_switch imx477-C "$@" ;;
+  arducam)        do_switch arducam-dual "$@" ;;
+  status)         show_status ;;
+  list)           do_list ;;
+  *)
+    echo "usage: camswitch {pi|pi-a|pi-c|arducam|status|list}"
+    echo "  pi        Raspberry Pi HQ (IMX477) on both ports, 2-lane"
+    echo "  pi-a      Pi HQ on port A (CAM0) only"
+    echo "  pi-c      Pi HQ on port C (CAM1) only"
+    echo "  arducam   Arducam B0577 dual kit"
+    echo "  status    show the active overlay"
+    echo "  list      list camera overlays on disk"
+    exit 1
+    ;;
+esac
