@@ -154,7 +154,7 @@ def apply_controls():
 # branch (so matroskamux writes its seek index -> seekable file), then tear the
 # branch down off the streaming thread.
 _rec_lock = threading.Lock()
-_rec = {"active": False, "elems": None, "tee_pad": None, "path": None}
+_rec = {"active": False, "elems": None, "tee_pad": None, "path": None, "started": None}
 
 
 def _make_output_path():
@@ -211,7 +211,7 @@ def start_recording():
         for e in elems:
             e.sync_state_with_parent()
 
-        _rec.update(active=True, elems=elems, tee_pad=tee_pad, path=path)
+        _rec.update(active=True, elems=elems, tee_pad=tee_pad, path=path, started=time.time())
         _start_thermal_log(path)
         log(f"recording -> {path}")
         return path, None
@@ -224,7 +224,7 @@ def stop_recording():
         elems = _rec["elems"]
         tee_pad = _rec["tee_pad"]
         path = _rec["path"]
-        _rec.update(active=False, elems=None, tee_pad=None, path=None)
+        _rec.update(active=False, elems=None, tee_pad=None, path=None, started=None)
 
     _stop_thermal_log()
     q, sink = elems[0], elems[-1]
@@ -355,18 +355,29 @@ $('gain').addEventListener('change', () => post('/control',{gain:parseFloat($('g
 syncEnabled();
 
 // --- recording ---
-let recording = false;
+let recording = false, recElapsed = 0, recElapsedAt = 0, recFile = '';
+function fmtDur(s){ const m = Math.floor(s/60), sec = s % 60; return m + ':' + String(sec).padStart(2,'0'); }
+function paintRec(){
+  if(recording){
+    const s = recElapsed + Math.floor((Date.now() - recElapsedAt) / 1000);   // server time + local tick
+    $('recState').textContent = 'Recording ' + fmtDur(s) + (recFile ? ' → ' + recFile : '');
+  } else {
+    $('recState').textContent = '';
+  }
+}
 async function refreshStatus(){
   try {
     const s = await (await fetch('/status')).json();
     recording = s.recording;
+    recElapsed = s.elapsed || 0; recElapsedAt = Date.now(); recFile = s.file || '';  // re-sync to server
     $('recBtn').textContent = recording ? '■ Stop' : '● Record';
     $('recBtn').classList.toggle('recording', recording);
-    $('recState').textContent = recording ? ('Recording → ' + (s.file || '')) : '';
     $('storage').innerHTML = storageHtml(s.storage);
     $('manage').classList.toggle('disabled', recording);
+    paintRec();
   } catch(e){}
 }
+setInterval(paintRec, 1000);
 $('recBtn').addEventListener('click', async () => {
   $('recBtn').disabled = true;
   try { await post(recording ? '/stop' : '/start'); } finally { await refreshStatus(); $('recBtn').disabled = false; }
@@ -458,8 +469,10 @@ def status():
     with _rec_lock:
         active = _rec["active"]
         path = _rec["path"]
+        started = _rec["started"]
+    elapsed = int(time.time() - started) if (active and started) else 0
     return jsonify(recording=active, file=os.path.basename(path) if (active and path) else None,
-                   storage=_storage_info())
+                   elapsed=elapsed, storage=_storage_info())
 
 
 # --------------------------------------------------------------------------
