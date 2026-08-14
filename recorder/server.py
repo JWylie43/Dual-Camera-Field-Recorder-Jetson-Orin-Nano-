@@ -33,8 +33,10 @@ import glob
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
+import time
 
 import gi
 gi.require_version("Gst", "1.0")
@@ -1086,7 +1088,28 @@ setInterval(() => { if(!xferActive && !state.q && !selected().length) load(); },
 </script></body></html>"""
 
 
+def _graceful_stop(signum, _frame):
+    """SIGTERM/SIGINT -> release the Argus camera cleanly, then exit.
+
+    Without this, a signal kill skips cleanup and leaves the Argus session
+    dangling, which can wedge nvargus-daemon so the next start fails. With it,
+    `systemctl restart` (which sends SIGTERM) is all that's ever needed.
+    """
+    log(f"signal {signum}: finalizing + releasing camera")
+    try:
+        if _is_running():
+            stop_recording()
+            time.sleep(2)                # let the record branch EOS-finalize the MKV
+    except Exception:                    # noqa: BLE001
+        pass
+    _stop_thermal_log()
+    pipeline.set_state(Gst.State.NULL)   # releases the Argus session cleanly
+    os._exit(0)
+
+
 def main():
+    signal.signal(signal.SIGTERM, _graceful_stop)
+    signal.signal(signal.SIGINT, _graceful_stop)
     loop = GLib.MainLoop()
     bus = pipeline.get_bus()
     bus.add_signal_watch()
