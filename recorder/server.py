@@ -46,9 +46,10 @@ from flask import Flask, Response, jsonify, request  # noqa: E402
 
 # --- camera / pipeline config ---------------------------------------------
 SENSOR_IDS = (0, 1)                 # nvarguscamerasrc sensor-id for (left, right)
-EYE_W, EYE_H, FPS = 3840, 2160, 30  # per-camera 4K (sensor mode 0); combined 7680x2160.
-                                    # Revert to 1920,1080 (mode 1) for 4x smaller files.
-COMBINED_W = EYE_W * 2              # 7680 wide, side-by-side
+EYE_W, EYE_H, FPS = 1920, 1080, 30  # per-camera 1080p (mode 1) - sustains a true 30fps.
+                                    # 4K/eye (3840,2160) does NOT: the encoder can't process
+                                    # 7680x2160 at 30fps, so it drops frames. Measured.
+COMBINED_W = EYE_W * 2              # 3840 wide, side-by-side
 PREVIEW_W, PREVIEW_H = 1280, 360    # downscaled preview (keeps the 32:9 combined shape)
 PREVIEW_QUALITY = 50
 PREVIEW_FPS = 15                    # preview is for framing - a low rate keeps the
