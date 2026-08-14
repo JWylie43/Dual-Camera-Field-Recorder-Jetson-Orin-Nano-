@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-pi_app.py - single-owner capture + web app for the dual Raspberry Pi HQ (IMX477)
-rig on the Jetson Orin Nano.
+server.py - single-owner capture + web app for the dual Raspberry Pi HQ (IMX477)
+rig on the Jetson Orin Nano. (This branch's server.py IS the Pi app; the Arducam
+server.py lives on main. camera-rig.service runs whichever branch's server.py is
+checked out, so startup is unchanged.)
 
 WHY ONE PROCESS: Argus gives ONE process exclusive ownership of a sensor. Two
 processes can't share a camera, so a single process owns BOTH cameras (sensor-id
@@ -19,8 +21,10 @@ avoids the Argus session-cycling wedge risk). Clicking Record just adds a full-r
 MJPEG->MKV branch to the already-running tee; Stop EOSes and drops just that
 branch, so the preview never blinks and the file finalizes seekable.
 
-Run on the Orin (after `sudo camswitch pi`, with the old service stopped):
-    python3 pi_app.py
+Run on the Orin (after `sudo camswitch pi`): camera-rig.service runs this on boot.
+For dev, stop the service and run it by hand to see logs:
+    sudo systemctl stop camera-rig.service
+    python3 server.py
     # browse from your phone to  http://<orin-ip>:8080   (hostname -I)
 """
 
@@ -40,6 +44,8 @@ EYE_W, EYE_H, FPS = 1920, 1080, 30  # per-camera; mode 1 is 1920x1080@60 max
 COMBINED_W = EYE_W * 2              # 3840 wide, side-by-side
 PREVIEW_W, PREVIEW_H = 1280, 360    # downscaled preview (keeps the 32:9 combined shape)
 PREVIEW_QUALITY = 50
+PREVIEW_FPS = 15                    # preview is for framing - a low rate keeps the
+                                    # Python MJPEG serving (GIL-bound) light and smooth
 REC_QUALITY = 85                    # full-res record JPEG quality (visually ~lossless)
 OUTPUT_DIR = "/mnt/video"           # NVMe mount; recordings land here
 FILENAME_PREFIX = "game"            # game_YYYY-MM-DD_HH-MM-SS.mkv
@@ -72,6 +78,7 @@ def build_pipeline():
         f"! tee name=t "
         f"t. ! queue leaky=downstream max-size-buffers=4 "
         f"! nvvidconv ! video/x-raw,format=I420,width={PREVIEW_W},height={PREVIEW_H} "
+        f"! videorate drop-only=true ! video/x-raw,framerate={PREVIEW_FPS}/1 "
         f"! nvjpegenc quality={PREVIEW_QUALITY} "
         f"! appsink name=preview emit-signals=true max-buffers=1 drop=true"
     )
