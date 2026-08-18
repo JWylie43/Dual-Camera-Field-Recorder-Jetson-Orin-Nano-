@@ -50,10 +50,14 @@ EYE_W, EYE_H, FPS = 1920, 1080, 30  # per-camera 1080p (mode 1) - sustains a tru
                                     # 4K/eye (3840,2160) does NOT: the encoder can't process
                                     # 7680x2160 at 30fps, so it drops frames. Measured.
 COMBINED_W = EYE_W * 2              # 3840 wide, side-by-side
-PREVIEW_W, PREVIEW_H = 1280, 360    # downscaled preview (keeps the 32:9 combined shape)
-PREVIEW_QUALITY = 50
-PREVIEW_FPS = 15                    # preview is for framing - a low rate keeps the
-                                    # Python MJPEG serving (GIL-bound) light and smooth
+# Focus mode (run with env FOCUS=1) serves a FULL-RES, high-quality, low-fps
+# preview for critically focusing the lenses over the network. Normal mode is a
+# light downscaled preview for framing. Low fps in focus mode keeps full-res
+# frames flowing over WiFi without needing smooth motion.
+_FOCUS = os.environ.get("FOCUS") == "1"
+PREVIEW_W, PREVIEW_H = (COMBINED_W, EYE_H) if _FOCUS else (1280, 360)
+PREVIEW_QUALITY = 90 if _FOCUS else 50
+PREVIEW_FPS = 5 if _FOCUS else 15
 REC_QUALITY = 85                    # full-res record JPEG quality (visually ~lossless)
 OUTPUT_DIR = "/mnt/video"           # NVMe mount; recordings land here
 FILENAME_PREFIX = "game"            # game_YYYY-MM-DD_HH-MM-SS.mkv
