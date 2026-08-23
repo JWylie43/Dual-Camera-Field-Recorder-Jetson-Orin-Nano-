@@ -73,6 +73,15 @@ BOUNDARY = "spinframe"
 EXPOSURE_MIN_US, EXPOSURE_MAX_US = 13, 33000     # 13us floor; 33ms = 1/30s ceiling @ 30fps
 GAIN_MIN, GAIN_MAX = 1.0, 22.25
 
+# ISP tuning applied to both sensors (dialed in by eye, outdoors, Aug 2026).
+# AE/AWB stay fully automatic - these only pick the high-quality ISP algorithms
+# and fence how far AE may push gain: past ~8x analog the IMX477 is grain soup,
+# and Argus's default digital gain ceiling (256x) is pure noise amplification.
+# aeantibanding=3 pins flicker correction to 60 Hz (US lighting).
+ARGUS_TUNING = ('tnr-mode=2 tnr-strength=0.5 ee-mode=2 ee-strength=0.3 '
+                'gainrange="1 8" ispdigitalgainrange="1 2" aeantibanding=3')
+AUTO_GAIN_MAX = 8.0                 # auto-mode analog gain fence (matches ARGUS_TUNING)
+
 Gst.init(None)
 
 
@@ -86,8 +95,8 @@ def build_pipeline():
     (the appsink we pull JPEGs from)."""
     eye_caps = f"video/x-raw(memory:NVMM),width={EYE_W},height={EYE_H},framerate={FPS}/1"
     desc = (
-        f"nvarguscamerasrc name=cam0 sensor-id={SENSOR_IDS[0]} ! {eye_caps} ! comp.sink_0 "
-        f"nvarguscamerasrc name=cam1 sensor-id={SENSOR_IDS[1]} ! {eye_caps} ! comp.sink_1 "
+        f"nvarguscamerasrc name=cam0 sensor-id={SENSOR_IDS[0]} {ARGUS_TUNING} ! {eye_caps} ! comp.sink_0 "
+        f"nvarguscamerasrc name=cam1 sensor-id={SENSOR_IDS[1]} {ARGUS_TUNING} ! {eye_caps} ! comp.sink_1 "
         f"nvcompositor name=comp "
         f"sink_0::xpos=0 sink_0::ypos=0 sink_0::width={EYE_W} sink_0::height={EYE_H} "
         f"sink_1::xpos={EYE_W} sink_1::ypos=0 sink_1::width={EYE_W} sink_1::height={EYE_H} "
@@ -146,7 +155,7 @@ def apply_controls():
         if auto:
             cam.set_property("exposuretimerange",
                              f"{EXPOSURE_MIN_US * 1000} {EXPOSURE_MAX_US * 1000}")
-            cam.set_property("gainrange", f"{GAIN_MIN} {GAIN_MAX}")
+            cam.set_property("gainrange", f"{GAIN_MIN} {AUTO_GAIN_MAX}")
             cam.set_property("aelock", False)
         else:
             ns = int(us) * 1000
