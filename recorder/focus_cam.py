@@ -25,8 +25,10 @@ monitor. Restart the rig when done:
 
 Env overrides: CAM (sensor-id, default 1), MONITOR (1 = also draw on the
 attached display), ZOOM (1 = center 1080p crop, 1:1 pixels), SINK (drm
-default, 3d = X11 window), FPS (browser stream fps, default 5), QUALITY
-(JPEG, default 90), PORT (default 8081).
+default, 3d = X11 window), METER (AE region: center default, full, or
+l,t,r,b in 3840x2160 coords), EV (exposure compensation -2..2, default 0),
+FPS (browser stream fps, default 5), QUALITY (JPEG, default 90), PORT
+(default 8081).
 """
 
 import os
@@ -45,6 +47,8 @@ PORT = int(os.environ.get("PORT", "8081"))
 MONITOR = os.environ.get("MONITOR") == "1"
 ZOOM = os.environ.get("ZOOM") == "1"
 SINK = os.environ.get("SINK", "drm")        # drm = direct to display, 3d = X window
+METER = os.environ.get("METER", "center")   # AE region: center | full | "l,t,r,b"
+EV = float(os.environ.get("EV", "0"))       # exposure compensation, -2.0 .. 2.0
 FULL_W, FULL_H, MODE_FPS = 3840, 2160, 30   # nv_imx477 mode 0 (full pixel readout)
 BOUNDARY = "focusframe"
 
@@ -54,6 +58,27 @@ ARGUS_TUNING = ('tnr-mode=2 tnr-strength=0.5 ee-mode=2 ee-strength=0.3 '
                 'gainrange="1 8" ispdigitalgainrange="1 2" aeantibanding=3')
 
 Gst.init(None)
+
+
+def _ae_props():
+    """Auto-exposure metering region + EV compensation for nvarguscamerasrc.
+
+    Default meters only the center 1920x1080 of the frame (the region ZOOM
+    shows) instead of the whole frame - full-frame metering gets fooled by
+    scenes like a bright window in a dark room. METER=full disables the
+    region; METER=l,t,r,b sets a custom rectangle in 3840x2160 coordinates."""
+    props = ""
+    if METER != "full":
+        if METER == "center":
+            l, t = (FULL_W - 1920) // 2, (FULL_H - 1080) // 2
+            r, b = l + 1920, t + 1080
+        else:
+            l, t, r, b = (int(v) for v in METER.split(","))
+        props += f'aeregion="{l} {t} {r} {b} 1" '
+    if EV != 0:
+        props += f"exposurecompensation={EV} "
+    return props
+
 
 def _monitor_branch():
     """Local display branch: full 30fps straight from the capture tee."""
@@ -78,7 +103,7 @@ def _monitor_branch():
 
 
 DESC = (
-    f"nvarguscamerasrc name=cam sensor-id={CAM} {ARGUS_TUNING} "
+    f"nvarguscamerasrc name=cam sensor-id={CAM} {ARGUS_TUNING} {_ae_props()}"
     f"! video/x-raw(memory:NVMM),width={FULL_W},height={FULL_H},framerate={MODE_FPS}/1 "
     f"! tee name=t "
     + (_monitor_branch() if MONITOR else "") +
