@@ -6,17 +6,27 @@ stock nv_imx477 driver exposes no larger readout) and serves it as an MJPEG
 stream displayed 1:1 in the browser (scroll to pan; click the image to toggle
 fit-to-window). Low fps keeps full-res frames flowing over WiFi.
 
+MONITOR=1 additionally renders the live 30fps feed on the display plugged
+into the Orin - launchable from SSH, no desktop session needed (it draws via
+DRM/KMS). Add ZOOM=1 to show the center 1920x1080 of the 4K frame instead of
+scaling it down: on a 1080p monitor that is true 1:1 sensor pixels, the most
+honest focus check. If a desktop IS running it owns the display - either
+`sudo systemctl stop gdm` first, or use SINK=3d to open an X window instead.
+
 The recorder service owns BOTH sensors, so stop it first:
 
     sudo systemctl stop camera-rig
-    CAM=1 python3 ~/orin-recorder/recorder/focus_cam.py
+    MONITOR=1 ZOOM=1 CAM=1 python3 ~/orin-recorder/recorder/focus_cam.py
 
-then open http://<orin>:8081. Restart the rig when done:
+The browser stream at http://<orin>:8081 keeps working alongside the
+monitor. Restart the rig when done:
 
     sudo systemctl start camera-rig
 
-Env overrides: CAM (sensor-id, default 1), FPS (default 5), QUALITY (JPEG,
-default 90), PORT (default 8081).
+Env overrides: CAM (sensor-id, default 1), MONITOR (1 = also draw on the
+attached display), ZOOM (1 = center 1080p crop, 1:1 pixels), SINK (drm
+default, 3d = X11 window), FPS (browser stream fps, default 5), QUALITY
+(JPEG, default 90), PORT (default 8081).
 """
 
 import os
@@ -32,6 +42,9 @@ CAM = int(os.environ.get("CAM", "1"))
 FPS = int(os.environ.get("FPS", "5"))
 QUALITY = int(os.environ.get("QUALITY", "90"))
 PORT = int(os.environ.get("PORT", "8081"))
+MONITOR = os.environ.get("MONITOR") == "1"
+ZOOM = os.environ.get("ZOOM") == "1"
+SINK = os.environ.get("SINK", "drm")        # drm = direct to display, 3d = X window
 FULL_W, FULL_H, MODE_FPS = 3840, 2160, 30   # nv_imx477 mode 0 (full pixel readout)
 BOUNDARY = "focusframe"
 
@@ -42,9 +55,34 @@ ARGUS_TUNING = ('tnr-mode=2 tnr-strength=0.5 ee-mode=2 ee-strength=0.3 '
 
 Gst.init(None)
 
+def _monitor_branch():
+    """Local display branch: full 30fps straight from the capture tee."""
+    if SINK == "3d":
+        # X11/XWayland window - needs a running desktop session.
+        os.environ.setdefault("DISPLAY", ":0")
+        sink = "nv3dsink sync=false"
+    else:
+        # Draws via DRM/KMS - works from SSH with no desktop running.
+        sink = "nvdrmvideosink sync=false"
+    if ZOOM:
+        # Center 1920x1080 cut from the 4K frame: 1:1 sensor pixels on a
+        # 1080p monitor. nvvidconv crop props are rectangle coordinates.
+        left, top = (FULL_W - 1920) // 2, (FULL_H - 1080) // 2
+        conv = (f"nvvidconv left={left} right={left + 1920} "
+                f"top={top} bottom={top + 1080} "
+                f"! video/x-raw(memory:NVMM),width=1920,height=1080")
+    else:
+        conv = "nvvidconv"
+    return (f"t. ! queue leaky=downstream max-size-buffers=4 "
+            f"! {conv} ! {sink} ")
+
+
 DESC = (
     f"nvarguscamerasrc name=cam sensor-id={CAM} {ARGUS_TUNING} "
     f"! video/x-raw(memory:NVMM),width={FULL_W},height={FULL_H},framerate={MODE_FPS}/1 "
+    f"! tee name=t "
+    + (_monitor_branch() if MONITOR else "") +
+    f"t. ! queue leaky=downstream max-size-buffers=4 "
     f"! nvvidconv ! video/x-raw,format=I420 "
     f"! videorate drop-only=true ! video/x-raw,framerate={FPS}/1 "
     f"! nvjpegenc quality={QUALITY} "
@@ -134,7 +172,15 @@ def main():
         print(f"ERROR: pipeline failed to start. Is the recorder stopped "
               f"(`sudo systemctl stop camera-rig`) and sensor {CAM} enumerated?",
               flush=True)
+        if MONITOR and SINK != "3d":
+            print("If the GST error above is about DRM: a desktop session owns "
+                  "the display - `sudo systemctl stop gdm` first, or retry "
+                  "with SINK=3d.", flush=True)
         return
+    if MONITOR:
+        mode = "center 1080p crop, 1:1 pixels" if ZOOM else "scaled to fit"
+        print(f"Monitor out: cam {CAM} on the attached display ({mode})",
+              flush=True)
     print(f"Focus preview (cam {CAM}, {FULL_W}x{FULL_H}): http://0.0.0.0:{PORT}",
           flush=True)
     try:
