@@ -70,9 +70,9 @@ def _monitor_branch():
         left, top = (FULL_W - 1920) // 2, (FULL_H - 1080) // 2
         conv = (f"nvvidconv left={left} right={left + 1920} "
                 f"top={top} bottom={top + 1080} "
-                f"! video/x-raw(memory:NVMM),width=1920,height=1080")
+                f"! video/x-raw(memory:NVMM),format=NV12,width=1920,height=1080")
     else:
-        conv = "nvvidconv"
+        conv = "nvvidconv ! video/x-raw(memory:NVMM),format=NV12"
     return (f"t. ! queue leaky=downstream max-size-buffers=4 "
             f"! {conv} ! {sink} ")
 
@@ -164,6 +164,13 @@ def main():
         if msg.type == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
             print(f"GST ERROR: {err.message} :: {dbg}", flush=True)
+            if MONITOR and SINK != "3d" and "not-negotiated" in (dbg or ""):
+                print("HINT: not-negotiated on the monitor branch usually means "
+                      "something else owns the display (desktop/login screen). "
+                      "Check `systemctl is-active gdm`; if active: "
+                      "`sudo systemctl stop gdm`, then rerun. Or use SINK=3d "
+                      "to open a window on the running desktop instead.",
+                      flush=True)
 
     bus.connect("message", on_msg)
     threading.Thread(target=loop.run, daemon=True).start()
