@@ -12,14 +12,16 @@
 #
 # Usage (stop the recorder first - it owns the sensors):
 #   sudo systemctl stop camera-rig
-#   ./raw_capture.sh              # both cameras, 15 s
+#   ./raw_capture.sh              # both cameras, separate files, 15 s
 #   ./raw_capture.sh 1            # just cam1, 15 s
 #   ./raw_capture.sh both 5       # both cameras, 5 s
+#   ./raw_capture.sh combined     # one 7680x2160 side-by-side file (the
+#                                 # recorder's compositor layout), 15 s
 #
 # View on the Mac after copying:  ffplay game_raw_cam1_*.y4m
 set -euo pipefail
 
-CAM="${1:-both}"          # 0 | 1 | both
+CAM="${1:-both}"          # 0 | 1 | both | combined
 DUR="${2:-15}"            # seconds
 W=3840; H=2160; FPS=30    # nv_imx477 mode 0 - full pixel readout
 FRAMES=$(( DUR * FPS ))
@@ -42,25 +44,49 @@ branch() {
         ! y4menc ! filesink location=$file"
 }
 
+# Combined mode: both sensors -> nvcompositor side-by-side (the recorder's
+# exact layout) -> one raw 7680x2160 stream.
+combined_desc() {
+  local file=$1
+  echo "nvarguscamerasrc sensor-id=0 num-buffers=$FRAMES $TUNING \
+        ! 'video/x-raw(memory:NVMM),width=$W,height=$H,framerate=$FPS/1' ! comp.sink_0 \
+        nvarguscamerasrc sensor-id=1 num-buffers=$FRAMES $TUNING \
+        ! 'video/x-raw(memory:NVMM),width=$W,height=$H,framerate=$FPS/1' ! comp.sink_1 \
+        nvcompositor name=comp \
+        sink_0::xpos=0 sink_0::ypos=0 sink_0::width=$W sink_0::height=$H \
+        sink_1::xpos=$W sink_1::ypos=0 sink_1::width=$W sink_1::height=$H \
+        ! 'video/x-raw(memory:NVMM),width=$((W*2)),height=$H,framerate=$FPS/1' \
+        ! nvvidconv ! 'video/x-raw,format=I420' \
+        ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=536870912 \
+        ! y4menc ! filesink location=$file"
+}
+
 DESC=""
 FILES=()
-if [[ "$CAM" == "both" || "$CAM" == "0" ]]; then
-  f="$OUT/game_raw_cam0_$STAMP.y4m"; FILES+=("$f"); DESC+=" $(branch 0 "$f")"
-fi
-if [[ "$CAM" == "both" || "$CAM" == "1" ]]; then
-  f="$OUT/game_raw_cam1_$STAMP.y4m"; FILES+=("$f"); DESC+=" $(branch 1 "$f")"
-fi
-[[ -n "$DESC" ]] || { echo "usage: $0 [0|1|both] [seconds]"; exit 1; }
+CHECK_W=$W
+case "$CAM" in
+  combined)
+    CHECK_W=$(( W * 2 ))
+    f="$OUT/game_raw_sbs_$STAMP.y4m"; FILES+=("$f"); DESC=" $(combined_desc "$f")" ;;
+  both|0|1)
+    if [[ "$CAM" == "both" || "$CAM" == "0" ]]; then
+      f="$OUT/game_raw_cam0_$STAMP.y4m"; FILES+=("$f"); DESC+=" $(branch 0 "$f")"
+    fi
+    if [[ "$CAM" == "both" || "$CAM" == "1" ]]; then
+      f="$OUT/game_raw_cam1_$STAMP.y4m"; FILES+=("$f"); DESC+=" $(branch 1 "$f")"
+    fi ;;
+  *) echo "usage: $0 [0|1|both|combined] [seconds]"; exit 1 ;;
+esac
 
-echo ">> capturing $FRAMES frames ($DUR s) of raw ${W}x${H}@$FPS I420"
-echo ">> expect ~$(( FRAMES * W * H * 3 / 2 / 1000000 )) MB per camera"
+echo ">> capturing $FRAMES frames ($DUR s) of raw ${CHECK_W}x${H}@$FPS I420"
+echo ">> expect ~$(( FRAMES * CHECK_W * H * 3 / 2 / 1000000 )) MB per file"
 eval gst-launch-1.0 -e "$DESC"
 
 # Honest completion check: frames actually on disk vs requested, computed
 # from the file size (y4m = one header line, then 'FRAME\n' + W*H*1.5 bytes
 # per frame).
 echo
-PER_FRAME=$(( 6 + W * H * 3 / 2 ))
+PER_FRAME=$(( 6 + CHECK_W * H * 3 / 2 ))
 for f in "${FILES[@]}"; do
   size=$(stat -c%s "$f")
   hdr=$(head -c 256 "$f" | head -n 1 | wc -c)
