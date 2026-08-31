@@ -1,0 +1,83 @@
+FABRICATION NOTES - RPi HQ Camera -> Radxa Rock 5B+ CAM0 flex adapter
+rev 0.1 (first pass, generated 2026-08-31)
+======================================================================
+
+CONSTRUCTION
+- 2-layer FLEXIBLE polyimide PCB (no rigid sections other than stiffeners).
+- Finished flex thickness: fab standard (~0.11-0.13mm typ. for 2-layer);
+  see stiffener targets below for the insertion tips.
+- Surface finish: ENIG - MANDATORY (bare gold contact fingers at both ends,
+  no connectors are mounted on this board).
+- Coverlay openings over both finger fields and all component pads.
+
+DESIGN RULES USED (confirm against fab capability before ordering)
+- Min track width:            0.10 mm (one deliberate 0.10mm squeeze:
+                              the GND13 shield trace passing the D0 escape)
+- Min clearance:              0.08 mm (3/3 mil; occurs only in the 31P
+                              escape region at 0.3mm pitch)
+- Vias:                       0.35 mm ring / 0.15 mm drill (annular 0.10)
+- Copper-to-board-edge:       fingers are set back 0.1 mm from the tab tip;
+                              elsewhere >= 0.3 mm
+
+STIFFENERS (zones drawn on User.2)
+1. Under the 31P finger tab, x = 0..3.5 mm, full tab width.
+   FINISHED TIP THICKNESS 0.30 +/- 0.03 mm (FFC-receptacle insertion spec).
+2. Under the 15P finger tab, x = 74..80 mm, full tab width.
+   FINISHED TIP THICKNESS 0.30 +/- 0.03 mm.
+3. Under the ENTIRE component island, x = 22..56 mm, full board width
+   (covers all component pads AND the four MIPI D0 layer-swap vias and
+   both CAM_EN/XVS via hops - no component pads or vias on unreinforced
+   flex, except the D0 escape vias noted below).
+Stiffener material: polyimide (FR4 acceptable for the island), adhesive
+per fab standard. Stiffeners go on the B.Cu side.
+
+BEND ZONES (zones drawn on User.3) - controlled bend regions
+- Bend zone A: x = 9..19 mm.   Bend zone B: x = 57..67 mm.
+- NO components and NO vias inside the bend zones (verified), and no vias
+  within 2 mm of them EXCEPT the four MIPI D0 layer-swap vias at
+  x = 3.6..7.7 mm, which sit between stiffener 1 and bend zone A.
+  These are unavoidable (see README); do not bend between x = 3.5 and 9.
+- Stiffener edges are stress risers: J1-end GND stitch vias at x = 3.0mm
+  sit ~0.5mm outside stiffener 1's edge - review before fab.
+
+GROUND
+- B.Cu is a cross-hatched GND plane: 0.2 mm lines / 0.3 mm gap, 45 deg
+  (~64% copper) - hatched, NOT solid, for flex fatigue.
+- Hatch is continuous beneath all three MIPI pairs on F.Cu.
+- GND stitching: vias at both finger ends + island; additionally the three
+  interstitial GND fingers of the 31P end (pins 13/16/19) run the full
+  ribbon as F.Cu shield traces between the MIPI pairs and join GND at the
+  15P end (no via fits between live 0.3mm-pitch rows).
+
+IMPEDANCE
+- NOT controlled in this first pass. MIPI pairs are 0.15 mm track /
+  0.15 mm gap coupled microstrip over the hatch. If the fab offers a flex
+  impedance service, target 100 ohm differential and let them adjust
+  width/gap; lanes are straight and easy to re-tune.
+
+CONTACT-FACE ORIENTATION -- UNVERIFIED, MUST CONFIRM BEFORE FAB
+- Both finger fields currently have copper on F.Cu, the SAME side as the
+  components ("copper up" at both ends).
+- The 15P footprint additionally bakes in a pin-1 mirroring assumption
+  (pin 1 placed at +y in the footprint so the 180-deg placement puts pin 1
+  at the top edge).
+- The human MUST verify against: (a) which side of the FFC each receptacle
+  contacts (Rock 5B+ CAM0 receptacle and RPi HQ camera receptacle), and
+  (b) the ribbon's bend path in the enclosure, then mirror an end if
+  required (regenerate via tools/generate_fingers.py, "pin1" parameter,
+  and/or flip the footprint side).
+
+PAD DIMENSIONS -- PLACEHOLDERS, MUST CONFIRM BEFORE FAB
+Verify finger pad width / length / tab width / tip thickness against:
+- SHETIME FPC31-T1S1-2023-AC datasheet (LCSC C53403949) or the actual
+  connector fitted at the Rock 5B+ CAM0 position
+- Molex 15031-0431 drawing
+- A 15P 1.0 mm receptacle drawing (RPi HQ camera side) + caliper
+  measurement of a genuine RPi camera ribbon
+Current placeholders: 31P: 0.18 x 2.5 mm pads, 10.0 mm tab;
+15P: 0.60 x 4.0 mm pads, 16.0 mm tab. Regenerate with
+tools/generate_fingers.py after correcting the numbers.
+
+ASSEMBLY
+- Components on F.Cu only, all within the island stiffener footprint.
+- JP1 ships OPEN. R2/R3/R4 populate as 0R.

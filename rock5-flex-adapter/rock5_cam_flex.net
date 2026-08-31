@@ -1,0 +1,2277 @@
+(export
+	(version "E")
+	(design
+		(source "/Users/josephwylie/Desktop/orin-nano-recorder/rock5-flex-adapter/rock5_cam_flex.kicad_sch")
+		(date "2026-08-31T09:10:48")
+		(tool "Eeschema 10.0.6")
+		(sheet
+			(number "1")
+			(name "/")
+			(tstamps "/")
+			(title_block
+				(title "RPi HQ Camera -> Rock 5B+ CAM0 flex adapter")
+				(company)
+				(rev "0.1")
+				(date "2026-08-31")
+				(source "rock5_cam_flex.kicad_sch")
+				(comment
+					(number "1")
+					(value "First pass - generated; pad dims/orientation UNVERIFIED")
+				)
+				(comment
+					(number "2")
+					(value "")
+				)
+				(comment
+					(number "3")
+					(value "")
+				)
+				(comment
+					(number "4")
+					(value "")
+				)
+				(comment
+					(number "5")
+					(value "")
+				)
+				(comment
+					(number "6")
+					(value "")
+				)
+				(comment
+					(number "7")
+					(value "")
+				)
+				(comment
+					(number "8")
+					(value "")
+				)
+				(comment
+					(number "9")
+					(value "")
+				)
+			)
+		)
+	)
+	(components
+		(comp
+			(ref "C1")
+			(value "1uF")
+			(footprint "flexadapter:C_0402_1005Metric")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:C_0402_1005Metric")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "C")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "477b8f27-663b-4625-a145-b7bdff90498b")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "C2")
+			(value "1uF")
+			(footprint "flexadapter:C_0402_1005Metric")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:C_0402_1005Metric")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "C")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "9a3900ba-12a1-471c-9ad8-10039e881769")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "C3")
+			(value "100nF")
+			(footprint "flexadapter:C_0402_1005Metric")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:C_0402_1005Metric")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "C")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "2036bfea-513f-4ed4-9393-861ac8a8cb3b")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "C4")
+			(value "100nF")
+			(footprint "flexadapter:C_0402_1005Metric")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:C_0402_1005Metric")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "C")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "ef8558b8-311f-4676-806a-c1fcf35ae69b")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "C5")
+			(value "100nF")
+			(footprint "flexadapter:C_0402_1005Metric")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:C_0402_1005Metric")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "C")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "fa686552-718f-4f26-a367-781f15a8f0fb")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "C6")
+			(value "4.7uF")
+			(footprint "flexadapter:C_0603_1608Metric")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:C_0603_1608Metric")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "C")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "7bb046f0-4d6d-46bb-b4d2-39184870ca60")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "J1")
+			(value "Rock5B_CAM0_31P")
+			(footprint "flexadapter:Flex_Finger_31P_0.3mm")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:Flex_Finger_31P_0.3mm")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "Conn_Flex_31P")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "0509050c-f56f-496e-9265-f351a02f29e6")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+						(pin
+							(num "3")
+						)
+						(pin
+							(num "4")
+						)
+						(pin
+							(num "5")
+						)
+						(pin
+							(num "6")
+						)
+						(pin
+							(num "7")
+						)
+						(pin
+							(num "8")
+						)
+						(pin
+							(num "9")
+						)
+						(pin
+							(num "10")
+						)
+						(pin
+							(num "11")
+						)
+						(pin
+							(num "12")
+						)
+						(pin
+							(num "13")
+						)
+						(pin
+							(num "14")
+						)
+						(pin
+							(num "15")
+						)
+						(pin
+							(num "16")
+						)
+						(pin
+							(num "17")
+						)
+						(pin
+							(num "18")
+						)
+						(pin
+							(num "19")
+						)
+						(pin
+							(num "20")
+						)
+						(pin
+							(num "21")
+						)
+						(pin
+							(num "22")
+						)
+						(pin
+							(num "23")
+						)
+						(pin
+							(num "24")
+						)
+						(pin
+							(num "25")
+						)
+						(pin
+							(num "26")
+						)
+						(pin
+							(num "27")
+						)
+						(pin
+							(num "28")
+						)
+						(pin
+							(num "29")
+						)
+						(pin
+							(num "30")
+						)
+						(pin
+							(num "31")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "J2")
+			(value "RPi_Cam_15P")
+			(footprint "flexadapter:Flex_Finger_15P_1.0mm")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:Flex_Finger_15P_1.0mm")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "Conn_Flex_15P")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "7c2c470e-430a-4dff-a5d2-27fb034fa81a")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+						(pin
+							(num "3")
+						)
+						(pin
+							(num "4")
+						)
+						(pin
+							(num "5")
+						)
+						(pin
+							(num "6")
+						)
+						(pin
+							(num "7")
+						)
+						(pin
+							(num "8")
+						)
+						(pin
+							(num "9")
+						)
+						(pin
+							(num "10")
+						)
+						(pin
+							(num "11")
+						)
+						(pin
+							(num "12")
+						)
+						(pin
+							(num "13")
+						)
+						(pin
+							(num "14")
+						)
+						(pin
+							(num "15")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "JP1")
+			(value "Open")
+			(footprint "flexadapter:SolderJumper-2_P1.3mm_Open_RoundedPad1.0x1.5mm")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:SolderJumper-2_P1.3mm_Open_RoundedPad1.0x1.5mm")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "SolderJumper_Open")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "16d99d8d-728a-4858-92c7-1a025d71ce66")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R1")
+			(value "10k")
+			(footprint "flexadapter:R_0402_1005Metric")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:R_0402_1005Metric")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "R")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "3b43d66d-f856-4b7e-a105-5b121d057a18")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R2")
+			(value "0R")
+			(footprint "flexadapter:R_0402_1005Metric")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:R_0402_1005Metric")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "R")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "34466551-d472-4980-955d-ce21dcaff048")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R3")
+			(value "0R")
+			(footprint "flexadapter:R_0402_1005Metric")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:R_0402_1005Metric")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "R")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "b0597c3c-670b-4275-a89e-1aee9f58a824")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R4")
+			(value "0R")
+			(footprint "flexadapter:R_0402_1005Metric")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:R_0402_1005Metric")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "R")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "fe10b0a3-9407-4492-b800-055a118e70be")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "TP1")
+			(value "XVS_1V8")
+			(footprint "flexadapter:TestPoint_Pad_1.5x1.5mm")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:TestPoint_Pad_1.5x1.5mm")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "TestPoint")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "7952d7a8-a932-41b4-a1ff-3913e0f8ecbd")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "TP2")
+			(value "XVS_3V3")
+			(footprint "flexadapter:TestPoint_Pad_1.5x1.5mm")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:TestPoint_Pad_1.5x1.5mm")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "TestPoint")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "d40f75b7-feea-4878-b45f-3acbfe81d1ef")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "TP3")
+			(value "RST_TP")
+			(footprint "flexadapter:TestPoint_Pad_1.5x1.5mm")
+			(fields
+				(field
+					(name "Footprint") "flexadapter:TestPoint_Pad_1.5x1.5mm")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "TestPoint")
+				(description "")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "e7c126d8-db48-400d-be6e-f5054376174e")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "U1")
+			(value "TXS0104EPWR")
+			(footprint "flexadapter:TSSOP-14_4.4x5mm_P0.65mm")
+			(fields
+				(field
+					(name "LCSC") "C44955")
+				(field
+					(name "Footprint") "flexadapter:TSSOP-14_4.4x5mm_P0.65mm")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "TXS0104E")
+				(description "")
+			)
+			(property
+				(name "LCSC")
+				(value "C44955")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "3edb7944-1a52-4bb9-ab07-2f75fa3ddc6b")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+						(pin
+							(num "3")
+						)
+						(pin
+							(num "4")
+						)
+						(pin
+							(num "5")
+						)
+						(pin
+							(num "8")
+						)
+						(pin
+							(num "6")
+						)
+						(pin
+							(num "7")
+						)
+						(pin
+							(num "9")
+						)
+						(pin
+							(num "14")
+						)
+						(pin
+							(num "13")
+						)
+						(pin
+							(num "12")
+						)
+						(pin
+							(num "11")
+						)
+						(pin
+							(num "10")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "U2")
+			(value "XC6206P182MR")
+			(footprint "flexadapter:SOT-23-3")
+			(fields
+				(field
+					(name "LCSC") "C347373")
+				(field
+					(name "Footprint") "flexadapter:SOT-23-3")
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "flexadapter")
+				(part "XC6206P182")
+				(description "")
+			)
+			(property
+				(name "LCSC")
+				(value "C347373")
+			)
+			(property
+				(name "Sheetname")
+				(value "rock5_cam_flex")
+			)
+			(property
+				(name "Sheetfile")
+				(value "rock5_cam_flex.kicad_sch")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "a66f3912-40f4-488a-8b26-34d427b54a26")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "3")
+						)
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+	)
+	(groups)
+	(variants)
+	(libparts
+		(libpart
+			(lib "flexadapter")
+			(part "C")
+			(fields
+				(field
+					(name "Reference") "C")
+				(field
+					(name "Value") "C")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "")
+					(type "passive")
+				)
+				(pin
+					(num "2")
+					(name "")
+					(type "passive")
+				)
+			)
+		)
+		(libpart
+			(lib "flexadapter")
+			(part "Conn_Flex_15P")
+			(fields
+				(field
+					(name "Reference") "J")
+				(field
+					(name "Value") "Conn_Flex_15P")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "GND")
+					(type "passive")
+				)
+				(pin
+					(num "2")
+					(name "CAM_D0_N")
+					(type "passive")
+				)
+				(pin
+					(num "3")
+					(name "CAM_D0_P")
+					(type "passive")
+				)
+				(pin
+					(num "4")
+					(name "GND")
+					(type "passive")
+				)
+				(pin
+					(num "5")
+					(name "CAM_D1_N")
+					(type "passive")
+				)
+				(pin
+					(num "6")
+					(name "CAM_D1_P")
+					(type "passive")
+				)
+				(pin
+					(num "7")
+					(name "GND")
+					(type "passive")
+				)
+				(pin
+					(num "8")
+					(name "CAM_CK_N")
+					(type "passive")
+				)
+				(pin
+					(num "9")
+					(name "CAM_CK_P")
+					(type "passive")
+				)
+				(pin
+					(num "10")
+					(name "GND")
+					(type "passive")
+				)
+				(pin
+					(num "11")
+					(name "CAM_GPIO0")
+					(type "passive")
+				)
+				(pin
+					(num "12")
+					(name "CAM_GPIO1")
+					(type "passive")
+				)
+				(pin
+					(num "13")
+					(name "SCL")
+					(type "passive")
+				)
+				(pin
+					(num "14")
+					(name "SDA")
+					(type "passive")
+				)
+				(pin
+					(num "15")
+					(name "3V3")
+					(type "passive")
+				)
+			)
+		)
+		(libpart
+			(lib "flexadapter")
+			(part "Conn_Flex_31P")
+			(fields
+				(field
+					(name "Reference") "J")
+				(field
+					(name "Value") "Conn_Flex_31P")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "GND")
+					(type "passive")
+				)
+				(pin
+					(num "2")
+					(name "CSI0_RX_D3N")
+					(type "passive")
+				)
+				(pin
+					(num "3")
+					(name "CSI0_RX_D3P")
+					(type "passive")
+				)
+				(pin
+					(num "4")
+					(name "GND")
+					(type "passive")
+				)
+				(pin
+					(num "5")
+					(name "CSI0_RX_D2N")
+					(type "passive")
+				)
+				(pin
+					(num "6")
+					(name "CSI0_RX_D2P")
+					(type "passive")
+				)
+				(pin
+					(num "7")
+					(name "GND")
+					(type "passive")
+				)
+				(pin
+					(num "8")
+					(name "CSI0_RX_CLK1N")
+					(type "passive")
+				)
+				(pin
+					(num "9")
+					(name "CSI0_RX_CLK1P")
+					(type "passive")
+				)
+				(pin
+					(num "10")
+					(name "GND")
+					(type "passive")
+				)
+				(pin
+					(num "11")
+					(name "CSI0_RX_D1N")
+					(type "passive")
+				)
+				(pin
+					(num "12")
+					(name "CSI0_RX_D1P")
+					(type "passive")
+				)
+				(pin
+					(num "13")
+					(name "GND")
+					(type "passive")
+				)
+				(pin
+					(num "14")
+					(name "CSI0_RX_D0N")
+					(type "passive")
+				)
+				(pin
+					(num "15")
+					(name "CSI0_RX_D0P")
+					(type "passive")
+				)
+				(pin
+					(num "16")
+					(name "GND")
+					(type "passive")
+				)
+				(pin
+					(num "17")
+					(name "CSI0_RX_CLK0N")
+					(type "passive")
+				)
+				(pin
+					(num "18")
+					(name "CSI0_RX_CLK0P")
+					(type "passive")
+				)
+				(pin
+					(num "19")
+					(name "GND")
+					(type "passive")
+				)
+				(pin
+					(num "20")
+					(name "CAM_CLKOUT0")
+					(type "passive")
+				)
+				(pin
+					(num "21")
+					(name "GND")
+					(type "passive")
+				)
+				(pin
+					(num "22")
+					(name "CAM_CLKOUT1")
+					(type "passive")
+				)
+				(pin
+					(num "23")
+					(name "CSI0_PDN0_H")
+					(type "passive")
+				)
+				(pin
+					(num "24")
+					(name "I2C3_SCL_M0_MIPI")
+					(type "passive")
+				)
+				(pin
+					(num "25")
+					(name "I2C3_SDA_M0_MIPI")
+					(type "passive")
+				)
+				(pin
+					(num "26")
+					(name "CSI0_PDN1")
+					(type "passive")
+				)
+				(pin
+					(num "27")
+					(name "CM_RST_L_1")
+					(type "passive")
+				)
+				(pin
+					(num "28")
+					(name "VCC_3V3")
+					(type "passive")
+				)
+				(pin
+					(num "29")
+					(name "VCC_3V3")
+					(type "passive")
+				)
+				(pin
+					(num "30")
+					(name "VCC_5V")
+					(type "passive")
+				)
+				(pin
+					(num "31")
+					(name "VCC_5V")
+					(type "passive")
+				)
+			)
+		)
+		(libpart
+			(lib "flexadapter")
+			(part "R")
+			(fields
+				(field
+					(name "Reference") "R")
+				(field
+					(name "Value") "R")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "")
+					(type "passive")
+				)
+				(pin
+					(num "2")
+					(name "")
+					(type "passive")
+				)
+			)
+		)
+		(libpart
+			(lib "flexadapter")
+			(part "SolderJumper_Open")
+			(fields
+				(field
+					(name "Reference") "JP")
+				(field
+					(name "Value") "SolderJumper_Open")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "A")
+					(type "passive")
+				)
+				(pin
+					(num "2")
+					(name "B")
+					(type "passive")
+				)
+			)
+		)
+		(libpart
+			(lib "flexadapter")
+			(part "TXS0104E")
+			(fields
+				(field
+					(name "Reference") "U")
+				(field
+					(name "Value") "TXS0104EPWR")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "VCCA")
+					(type "power_in")
+				)
+				(pin
+					(num "2")
+					(name "A1")
+					(type "bidirectional")
+				)
+				(pin
+					(num "3")
+					(name "A2")
+					(type "bidirectional")
+				)
+				(pin
+					(num "4")
+					(name "A3")
+					(type "bidirectional")
+				)
+				(pin
+					(num "5")
+					(name "A4")
+					(type "bidirectional")
+				)
+				(pin
+					(num "6")
+					(name "NC")
+					(type "no_connect")
+				)
+				(pin
+					(num "7")
+					(name "GND")
+					(type "power_in")
+				)
+				(pin
+					(num "8")
+					(name "OE")
+					(type "input")
+				)
+				(pin
+					(num "9")
+					(name "NC")
+					(type "no_connect")
+				)
+				(pin
+					(num "10")
+					(name "B4")
+					(type "bidirectional")
+				)
+				(pin
+					(num "11")
+					(name "B3")
+					(type "bidirectional")
+				)
+				(pin
+					(num "12")
+					(name "B2")
+					(type "bidirectional")
+				)
+				(pin
+					(num "13")
+					(name "B1")
+					(type "bidirectional")
+				)
+				(pin
+					(num "14")
+					(name "VCCB")
+					(type "power_in")
+				)
+			)
+		)
+		(libpart
+			(lib "flexadapter")
+			(part "TestPoint")
+			(fields
+				(field
+					(name "Reference") "TP")
+				(field
+					(name "Value") "TestPoint")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "TP")
+					(type "passive")
+				)
+			)
+		)
+		(libpart
+			(lib "flexadapter")
+			(part "XC6206P182")
+			(fields
+				(field
+					(name "Reference") "U")
+				(field
+					(name "Value") "XC6206P182MR")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "VSS")
+					(type "power_in")
+				)
+				(pin
+					(num "2")
+					(name "VOUT")
+					(type "power_out")
+				)
+				(pin
+					(num "3")
+					(name "VIN")
+					(type "power_in")
+				)
+			)
+		)
+	)
+	(libraries
+		(library
+			(logical "flexadapter")
+			(uri "${KIPRJMOD}/flexadapter.kicad_sym")
+		)
+	)
+	(nets
+		(net
+			(code "1")
+			(name "/CAM_EN")
+			(class "Default")
+			(node
+				(ref "J2")
+				(pin "11")
+				(pinfunction "CAM_GPIO0_11")
+				(pintype "passive")
+			)
+			(node
+				(ref "R4")
+				(pin "2")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "2")
+			(name "/CAM_EN_1V8")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "23")
+				(pinfunction "CSI0_PDN0_H_23")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "4")
+				(pinfunction "A3_4")
+				(pintype "bidirectional")
+			)
+		)
+		(net
+			(code "3")
+			(name "/CAM_EN_LVL")
+			(class "Default")
+			(node
+				(ref "R4")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "11")
+				(pinfunction "B3_11")
+				(pintype "bidirectional")
+			)
+		)
+		(net
+			(code "4")
+			(name "/CM_RST_L")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "27")
+				(pinfunction "CM_RST_L_1_27")
+				(pintype "passive")
+			)
+			(node
+				(ref "JP1")
+				(pin "1")
+				(pinfunction "A_1")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "5")
+			(name "/GND")
+			(class "Default")
+			(node
+				(ref "C1")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "C2")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "C3")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "C4")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "C5")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "C6")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "J1")
+				(pin "1")
+				(pinfunction "GND_1")
+				(pintype "passive")
+			)
+			(node
+				(ref "J1")
+				(pin "10")
+				(pinfunction "GND_10")
+				(pintype "passive")
+			)
+			(node
+				(ref "J1")
+				(pin "13")
+				(pinfunction "GND_13")
+				(pintype "passive")
+			)
+			(node
+				(ref "J1")
+				(pin "16")
+				(pinfunction "GND_16")
+				(pintype "passive")
+			)
+			(node
+				(ref "J1")
+				(pin "19")
+				(pinfunction "GND_19")
+				(pintype "passive")
+			)
+			(node
+				(ref "J1")
+				(pin "21")
+				(pinfunction "GND_21")
+				(pintype "passive")
+			)
+			(node
+				(ref "J1")
+				(pin "4")
+				(pinfunction "GND_4")
+				(pintype "passive")
+			)
+			(node
+				(ref "J1")
+				(pin "7")
+				(pinfunction "GND_7")
+				(pintype "passive")
+			)
+			(node
+				(ref "J2")
+				(pin "1")
+				(pinfunction "GND_1")
+				(pintype "passive")
+			)
+			(node
+				(ref "J2")
+				(pin "10")
+				(pinfunction "GND_10")
+				(pintype "passive")
+			)
+			(node
+				(ref "J2")
+				(pin "4")
+				(pinfunction "GND_4")
+				(pintype "passive")
+			)
+			(node
+				(ref "J2")
+				(pin "7")
+				(pinfunction "GND_7")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "7")
+				(pinfunction "GND_7")
+				(pintype "power_in")
+			)
+			(node
+				(ref "U2")
+				(pin "1")
+				(pinfunction "VSS_1")
+				(pintype "power_in")
+			)
+		)
+		(net
+			(code "6")
+			(name "/MIPI_CLK_N")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "17")
+				(pinfunction "CSI0_RX_CLK0N_17")
+				(pintype "passive")
+			)
+			(node
+				(ref "J2")
+				(pin "8")
+				(pinfunction "CAM_CK_N_8")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "7")
+			(name "/MIPI_CLK_P")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "18")
+				(pinfunction "CSI0_RX_CLK0P_18")
+				(pintype "passive")
+			)
+			(node
+				(ref "J2")
+				(pin "9")
+				(pinfunction "CAM_CK_P_9")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "8")
+			(name "/MIPI_D0_N")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "14")
+				(pinfunction "CSI0_RX_D0N_14")
+				(pintype "passive")
+			)
+			(node
+				(ref "J2")
+				(pin "2")
+				(pinfunction "CAM_D0_N_2")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "9")
+			(name "/MIPI_D0_P")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "15")
+				(pinfunction "CSI0_RX_D0P_15")
+				(pintype "passive")
+			)
+			(node
+				(ref "J2")
+				(pin "3")
+				(pinfunction "CAM_D0_P_3")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "10")
+			(name "/MIPI_D1_N")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "11")
+				(pinfunction "CSI0_RX_D1N_11")
+				(pintype "passive")
+			)
+			(node
+				(ref "J2")
+				(pin "5")
+				(pinfunction "CAM_D1_N_5")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "11")
+			(name "/MIPI_D1_P")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "12")
+				(pinfunction "CSI0_RX_D1P_12")
+				(pintype "passive")
+			)
+			(node
+				(ref "J2")
+				(pin "6")
+				(pinfunction "CAM_D1_P_6")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "12")
+			(name "/RST_TP")
+			(class "Default")
+			(node
+				(ref "JP1")
+				(pin "2")
+				(pinfunction "B_2")
+				(pintype "passive")
+			)
+			(node
+				(ref "TP3")
+				(pin "1")
+				(pinfunction "TP_1")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "13")
+			(name "/SCL")
+			(class "Default")
+			(node
+				(ref "J2")
+				(pin "13")
+				(pinfunction "SCL_13")
+				(pintype "passive")
+			)
+			(node
+				(ref "R2")
+				(pin "2")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "14")
+			(name "/SCL_1V8")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "24")
+				(pinfunction "I2C3_SCL_M0_MIPI_24")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "2")
+				(pinfunction "A1_2")
+				(pintype "bidirectional")
+			)
+		)
+		(net
+			(code "15")
+			(name "/SCL_LVL")
+			(class "Default")
+			(node
+				(ref "R2")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "13")
+				(pinfunction "B1_13")
+				(pintype "bidirectional")
+			)
+		)
+		(net
+			(code "16")
+			(name "/SDA")
+			(class "Default")
+			(node
+				(ref "J2")
+				(pin "14")
+				(pinfunction "SDA_14")
+				(pintype "passive")
+			)
+			(node
+				(ref "R3")
+				(pin "2")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "17")
+			(name "/SDA_1V8")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "25")
+				(pinfunction "I2C3_SDA_M0_MIPI_25")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "3")
+				(pinfunction "A2_3")
+				(pintype "bidirectional")
+			)
+		)
+		(net
+			(code "18")
+			(name "/SDA_LVL")
+			(class "Default")
+			(node
+				(ref "R3")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "12")
+				(pinfunction "B2_12")
+				(pintype "bidirectional")
+			)
+		)
+		(net
+			(code "19")
+			(name "/U1_OE")
+			(class "Default")
+			(node
+				(ref "R1")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "8")
+				(pinfunction "OE_8")
+				(pintype "input")
+			)
+		)
+		(net
+			(code "20")
+			(name "/VCC_1V8")
+			(class "Default")
+			(node
+				(ref "C2")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "C3")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "R1")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "1")
+				(pinfunction "VCCA_1")
+				(pintype "power_in")
+			)
+			(node
+				(ref "U2")
+				(pin "2")
+				(pinfunction "VOUT_2")
+				(pintype "power_out")
+			)
+		)
+		(net
+			(code "21")
+			(name "/VCC_3V3")
+			(class "Default")
+			(node
+				(ref "C1")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "C4")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "C5")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "C6")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "J1")
+				(pin "28")
+				(pinfunction "VCC_3V3_28")
+				(pintype "passive")
+			)
+			(node
+				(ref "J1")
+				(pin "29")
+				(pinfunction "VCC_3V3_29")
+				(pintype "passive")
+			)
+			(node
+				(ref "J2")
+				(pin "15")
+				(pinfunction "3V3_15")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "14")
+				(pinfunction "VCCB_14")
+				(pintype "power_in")
+			)
+			(node
+				(ref "U2")
+				(pin "3")
+				(pinfunction "VIN_3")
+				(pintype "power_in")
+			)
+		)
+		(net
+			(code "22")
+			(name "/XVS_1V8")
+			(class "Default")
+			(node
+				(ref "TP1")
+				(pin "1")
+				(pinfunction "TP_1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "5")
+				(pinfunction "A4_5")
+				(pintype "bidirectional")
+			)
+		)
+		(net
+			(code "23")
+			(name "/XVS_3V3")
+			(class "Default")
+			(node
+				(ref "TP2")
+				(pin "1")
+				(pinfunction "TP_1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "10")
+				(pinfunction "B4_10")
+				(pintype "bidirectional")
+			)
+		)
+		(net
+			(code "24")
+			(name "unconnected-(J1-CAM_CLKOUT0-Pad20)")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "20")
+				(pinfunction "CAM_CLKOUT0_20")
+				(pintype "passive+no_connect")
+			)
+		)
+		(net
+			(code "25")
+			(name "unconnected-(J1-CAM_CLKOUT1-Pad22)")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "22")
+				(pinfunction "CAM_CLKOUT1_22")
+				(pintype "passive+no_connect")
+			)
+		)
+		(net
+			(code "26")
+			(name "unconnected-(J1-CSI0_PDN1-Pad26)")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "26")
+				(pinfunction "CSI0_PDN1_26")
+				(pintype "passive+no_connect")
+			)
+		)
+		(net
+			(code "27")
+			(name "unconnected-(J1-CSI0_RX_CLK1N-Pad8)")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "8")
+				(pinfunction "CSI0_RX_CLK1N_8")
+				(pintype "passive+no_connect")
+			)
+		)
+		(net
+			(code "28")
+			(name "unconnected-(J1-CSI0_RX_CLK1P-Pad9)")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "9")
+				(pinfunction "CSI0_RX_CLK1P_9")
+				(pintype "passive+no_connect")
+			)
+		)
+		(net
+			(code "29")
+			(name "unconnected-(J1-CSI0_RX_D2N-Pad5)")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "5")
+				(pinfunction "CSI0_RX_D2N_5")
+				(pintype "passive+no_connect")
+			)
+		)
+		(net
+			(code "30")
+			(name "unconnected-(J1-CSI0_RX_D2P-Pad6)")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "6")
+				(pinfunction "CSI0_RX_D2P_6")
+				(pintype "passive+no_connect")
+			)
+		)
+		(net
+			(code "31")
+			(name "unconnected-(J1-CSI0_RX_D3N-Pad2)")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "2")
+				(pinfunction "CSI0_RX_D3N_2")
+				(pintype "passive+no_connect")
+			)
+		)
+		(net
+			(code "32")
+			(name "unconnected-(J1-CSI0_RX_D3P-Pad3)")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "3")
+				(pinfunction "CSI0_RX_D3P_3")
+				(pintype "passive+no_connect")
+			)
+		)
+		(net
+			(code "33")
+			(name "unconnected-(J1-VCC_5V-Pad30)")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "30")
+				(pinfunction "VCC_5V_30")
+				(pintype "passive+no_connect")
+			)
+		)
+		(net
+			(code "34")
+			(name "unconnected-(J1-VCC_5V-Pad31)")
+			(class "Default")
+			(node
+				(ref "J1")
+				(pin "31")
+				(pinfunction "VCC_5V_31")
+				(pintype "passive+no_connect")
+			)
+		)
+		(net
+			(code "35")
+			(name "unconnected-(J2-CAM_GPIO1-Pad12)")
+			(class "Default")
+			(node
+				(ref "J2")
+				(pin "12")
+				(pinfunction "CAM_GPIO1_12")
+				(pintype "passive+no_connect")
+			)
+		)
+		(net
+			(code "36")
+			(name "unconnected-(U1-NC-Pad6)")
+			(class "Default")
+			(node
+				(ref "U1")
+				(pin "6")
+				(pinfunction "NC_6")
+				(pintype "no_connect")
+			)
+		)
+		(net
+			(code "37")
+			(name "unconnected-(U1-NC-Pad9)")
+			(class "Default")
+			(node
+				(ref "U1")
+				(pin "9")
+				(pinfunction "NC_9")
+				(pintype "no_connect")
+			)
+		)
+	)
+)

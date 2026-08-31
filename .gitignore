@@ -37,3 +37,13 @@ stitching/pipeline_out/
 .vscode/
 .idea/
 .DS_Store
+
+# KiCad
+*.kicad_prl
+*-backups/
+fp-info-cache
+_autosave-*
+*.rpt
+
+# KiCad lock files
+~*.lck

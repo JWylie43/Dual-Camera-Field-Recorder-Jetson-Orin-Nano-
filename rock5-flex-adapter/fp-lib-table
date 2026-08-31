@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "flexadapter")(type "KiCad")(uri "${KIPRJMOD}/footprints.pretty")(options "")(descr "Project-local footprints incl. generated flex fingers"))
+)

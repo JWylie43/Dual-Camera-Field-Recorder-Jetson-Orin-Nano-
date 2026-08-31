@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "flexadapter")(type "KiCad")(uri "${KIPRJMOD}/flexadapter.kicad_sym")(options "")(descr "Project-local symbols for the flex adapter"))
+)
