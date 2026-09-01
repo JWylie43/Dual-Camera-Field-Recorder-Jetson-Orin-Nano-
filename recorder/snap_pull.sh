@@ -5,15 +5,24 @@
 #
 #   ./recorder/snap_pull.sh EXP_MS=2 GAIN=1
 #   ./recorder/snap_pull.sh EE=0 TNR=0 FLIP=2
+#   ./recorder/snap_pull.sh DUR=4 EXP_MS=2 GAIN=4  # 4s motion CLIP (mkv)
 #   ./recorder/snap_pull.sh                      # all-auto, recorder defaults
 #
-# Dial reference: see the header of recorder/snap.sh.
+# Clips open in ffplay (space = pause, s = step one frame) since QuickTime
+# won't read MKV. Dial reference: see the header of recorder/snap.sh.
 # Prereqs: `ssh orin` works keylessly; camera-rig service stopped on the Orin;
 # repo pulled on the Orin (~/orin-recorder).
 set -euo pipefail
 
-out=~/Desktop/snap_$(date +%H%M%S).jpg
+ext=jpg
+[[ "$*" == *DUR=* ]] && ext=mkv
+out=~/Desktop/snap_$(date +%H%M%S).$ext
 ssh orin "cd ~/orin-recorder/recorder && $* ./snap.sh"
-scp -q orin:/tmp/snap.jpg "$out"
-open "$out"
-echo "$out"
+scp -q "orin:/tmp/snap.$ext" "$out"
+if [[ "$ext" == mkv ]] && command -v ffplay >/dev/null; then
+    echo "$out  (space = pause, s = step frame)"
+    ffplay -loglevel error "$out"
+else
+    open "$out"
+    echo "$out"
+fi

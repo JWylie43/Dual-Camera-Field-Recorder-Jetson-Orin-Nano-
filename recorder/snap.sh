@@ -31,11 +31,16 @@
 #   Q=95         JPEG quality of the saved still
 #   SETTLE=45    frames to run before keeping one (AE/AWB/TNR convergence;
 #                45 = 1.5 s. Manual exposure still wants ~15 for TNR.)
+#   DUR          seconds of VIDEO to record instead of a still. Writes
+#                /tmp/snap.mkv (full 4K30 MJPEG) - the motion test: step
+#                through frames to judge blur, TNR smear, rolling shutter.
+#                Size grows fast (~0.5-1 GB per 5 s at Q=95); keep it short.
 #
 # Examples:
 #   EXP_MS=2 GAIN=1 ./snap.sh                  # manual, sports shutter
 #   EE=0 TNR=0 ./snap.sh                       # unprocessed truth (auto exp)
 #   EXP_MS=8 GAIN=1 EE=0.6 SAT=1.3 FLIP=2 ./snap.sh
+#   DUR=4 EXP_MS=2 GAIN=4 FLIP=2 ./snap.sh     # 4s motion clip, frozen action
 set -euo pipefail
 
 CAM=${CAM:-0}
@@ -72,15 +77,29 @@ fi
 echo ">> cam$CAM  exposure: $desc_exp  gain: $desc_gain"
 echo ">> ee=$EE (mode $EE_MODE)  tnr=$TNR (mode $TNR_MODE)  sat=$SAT  wb=$WB  flip=$FLIP  q=$Q"
 
-TMPD=$(mktemp -d /tmp/snap.XXXXXX)
-trap 'rm -rf "$TMPD"' EXIT
+CAPS='video/x-raw(memory:NVMM),width=3840,height=2160,framerate=30/1'
 
-gst-launch-1.0 -q nvarguscamerasrc "${PROPS[@]}" \
-    ! 'video/x-raw(memory:NVMM),width=3840,height=2160,framerate=30/1' \
-    ! nvvidconv flip-method="$FLIP" ! video/x-raw,format=I420 \
-    ! nvjpegenc quality="$Q" \
-    ! multifilesink location="$TMPD/f_%05d.jpg"
-
-last=$(ls "$TMPD" | tail -1)
-mv "$TMPD/$last" /tmp/snap.jpg
-echo ">> /tmp/snap.jpg ($(du -h /tmp/snap.jpg | cut -f1))"
+if [[ -n "${DUR:-}" ]]; then
+    # Motion clip: settle first (so AE/TNR are converged when it starts),
+    # then DUR seconds of full 4K30 MJPEG into a scrub-friendly MKV.
+    frames=$(( SETTLE + DUR * 30 ))
+    # num-buffers counts from the start, so re-set it to cover settle+clip.
+    PROPS=("${PROPS[@]/num-buffers=$SETTLE/num-buffers=$frames}")
+    gst-launch-1.0 -q nvarguscamerasrc "${PROPS[@]}" \
+        ! "$CAPS" \
+        ! nvvidconv flip-method="$FLIP" ! video/x-raw,format=I420 \
+        ! nvjpegenc quality="$Q" ! jpegparse ! matroskamux \
+        ! filesink location=/tmp/snap.mkv
+    echo ">> /tmp/snap.mkv ($(du -h /tmp/snap.mkv | cut -f1))"
+else
+    TMPD=$(mktemp -d /tmp/snap.XXXXXX)
+    trap 'rm -rf "$TMPD"' EXIT
+    gst-launch-1.0 -q nvarguscamerasrc "${PROPS[@]}" \
+        ! "$CAPS" \
+        ! nvvidconv flip-method="$FLIP" ! video/x-raw,format=I420 \
+        ! nvjpegenc quality="$Q" \
+        ! multifilesink location="$TMPD/f_%05d.jpg"
+    last=$(ls "$TMPD" | tail -1)
+    mv "$TMPD/$last" /tmp/snap.jpg
+    echo ">> /tmp/snap.jpg ($(du -h /tmp/snap.jpg | cut -f1))"
+fi
