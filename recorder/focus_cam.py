@@ -29,6 +29,20 @@ default, 3d = X11 window), METER (AE region: center default, full, or
 l,t,r,b in 3840x2160 coords), EV (exposure compensation -2..2, default 0),
 FPS (browser stream fps, default 5), QUALITY (JPEG, default 90), PORT
 (default 8081).
+
+ISP dials (the runtime levers Argus exposes - the underlying calibration,
+demosaic/CCM/lens-shading/noise profiles, is NVIDIA's baked-in tuning and
+is NOT editable). Defaults match what the recorder bakes in, so no envs =
+what recordings look like. Restart the script between changes:
+    EE       edge-enhance (sharpen) strength -1..1   (default 0.3)
+    EE_MODE  0 off, 1 fast, 2 high quality           (default 2)
+    TNR      temporal noise reduction strength -1..1 (default 0.5)
+    TNR_MODE 0 off, 1 fast, 2 high quality           (default 2)
+    SAT      saturation 0..2                         (default 1)
+    WB       white balance: 1 auto, 0 off, 2-8 presets (default 1)
+    GAIN_MAX AE analog gain ceiling                  (default 8)
+e.g. sharper + less smeary:  EE=0.6 TNR=0.2 MONITOR=1 ZOOM=1 CAM=0 \
+     python3 focus_cam.py
 """
 
 import os
@@ -52,10 +66,20 @@ EV = float(os.environ.get("EV", "0"))       # exposure compensation, -2.0 .. 2.0
 FULL_W, FULL_H, MODE_FPS = 3840, 2160, 30   # nv_imx477 mode 0 (full pixel readout)
 BOUNDARY = "focusframe"
 
-# Same ISP tuning the recorder bakes in (see server.py) so focus judgments
-# match what recordings will look like.
-ARGUS_TUNING = ('tnr-mode=2 tnr-strength=0.5 ee-mode=2 ee-strength=0.3 '
-                'gainrange="1 8" ispdigitalgainrange="1 2" aeantibanding=3')
+# ISP dials, env-overridable for twiddling sessions. Defaults are the same
+# tuning the recorder bakes in (see server.py) so with no envs set, focus
+# judgments match what recordings will look like.
+EE_MODE = int(os.environ.get("EE_MODE", "2"))
+EE = float(os.environ.get("EE", "0.3"))
+TNR_MODE = int(os.environ.get("TNR_MODE", "2"))
+TNR = float(os.environ.get("TNR", "0.5"))
+SAT = float(os.environ.get("SAT", "1"))
+WB = int(os.environ.get("WB", "1"))
+GAIN_MAX = os.environ.get("GAIN_MAX", "8")
+ARGUS_TUNING = (f'tnr-mode={TNR_MODE} tnr-strength={TNR} '
+                f'ee-mode={EE_MODE} ee-strength={EE} '
+                f'saturation={SAT} wbmode={WB} '
+                f'gainrange="1 {GAIN_MAX}" ispdigitalgainrange="1 2" aeantibanding=3')
 
 Gst.init(None)
 
