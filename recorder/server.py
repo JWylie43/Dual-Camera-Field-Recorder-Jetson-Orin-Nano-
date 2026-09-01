@@ -32,7 +32,9 @@ half's resolution (1920x1200, 16:10 center crop + supersampled downscale) as
 MJPEG through the identical preview/record plumbing, for A/B comparison:
     sudo systemctl stop camera-rig.service
     SOLO=0 python3 server.py          # sensor-id 0; SOLO=1 for the other cam
-    # solo preview = the recording itself (1920x1200, record quality) at 10fps
+    SOLO=0 SOLO_REC=4k python3 server.py   # record native 3840x2160 instead
+    # solo preview = the recording itself at record quality, 10fps
+    # (4K solo previews at 1920x1080 - full-4K MJPEG won't fit over WiFi)
 """
 
 import datetime
@@ -71,30 +73,46 @@ _SOLO = os.environ.get("SOLO")
 if _SOLO is not None and _SOLO not in ("0", "1"):
     raise SystemExit(f"SOLO must be 0 or 1, got {_SOLO!r}")
 SOLO_CAP_W, SOLO_CAP_H = 3840, 2160  # IMX477 mode 0 - the only 30fps mode above 1080p
-# Record at ONE ARDUCAM HALF's resolution (1920x1200) for a like-for-like
-# quality comparison. 1920x1200 is 16:10 but the sensor mode is 16:9, so the
-# VIC first center-crops to 3456x2160 (16:10) and then filter-downscales -
-# straight caps alone would squash the image. Crop props are the rectangle's
-# pixel EDGES in the source frame, not amounts trimmed.
-SOLO_REC_W, SOLO_REC_H = 1920, 1200
-SOLO_CROP_W = SOLO_CAP_H * SOLO_REC_W // SOLO_REC_H          # 3456
-SOLO_CROP_L = (SOLO_CAP_W - SOLO_CROP_W) // 2               # 192
-SOLO_CROP_R = SOLO_CROP_L + SOLO_CROP_W                     # 3648
-SOLO_CROP = f"left={SOLO_CROP_L} right={SOLO_CROP_R} top=0 bottom={SOLO_CAP_H}"
+# SOLO_REC picks the solo record geometry:
+#   unset/"half" - 1920x1200, one Arducam half (16:10 center crop) for A/B
+#   "4k"         - native 3840x2160, full mode FOV, no crop. This is where the
+#                  12MP sensor should visibly beat the 2.3MP Arducam - but at
+#                  ~4 GB/min (extrapolated from the measured q85 rate) and an
+#                  unverified encoder load (249 MP/s; dual-4K's 498 MP/s is
+#                  known to drop frames, half that should fit - CHECK a test
+#                  clip's real fps with ffprobe before trusting a long take).
+SOLO_4K = os.environ.get("SOLO_REC", "").lower() == "4k"
+if SOLO_4K:
+    SOLO_REC_W, SOLO_REC_H = SOLO_CAP_W, SOLO_CAP_H
+    SOLO_CROP = ""                                          # record the full frame
+else:
+    # 1920x1200 is 16:10 but the sensor mode is 16:9, so the VIC first
+    # center-crops to 3456x2160 (16:10) and then filter-downscales - straight
+    # caps alone would squash the image. Crop props are the rectangle's pixel
+    # EDGES in the source frame, not amounts trimmed.
+    SOLO_REC_W, SOLO_REC_H = 1920, 1200
+    SOLO_CROP_W = SOLO_CAP_H * SOLO_REC_W // SOLO_REC_H      # 3456
+    SOLO_CROP_L = (SOLO_CAP_W - SOLO_CROP_W) // 2           # 192
+    SOLO_CROP_R = SOLO_CROP_L + SOLO_CROP_W                 # 3648
+    SOLO_CROP = f"left={SOLO_CROP_L} right={SOLO_CROP_R} top=0 bottom={SOLO_CAP_H}"
 # Focus mode (run with env FOCUS=1) serves a FULL-RES, high-quality, low-fps
 # preview for critically focusing the lenses over the network. Normal mode is a
 # light downscaled preview for framing. Low fps in focus mode keeps full-res
 # frames flowing over WiFi without needing smooth motion.
 _FOCUS = os.environ.get("FOCUS") == "1"
 if _SOLO is not None:
-    # Solo preview IS the recording, minus frame rate: same 16:10 center crop,
-    # same 1920x1200, same JPEG quality - so the browser shows exactly what
-    # lands in the file and is honest enough to judge ISP/tuning output. 10fps
-    # keeps it ~1/3 of the record bitrate (~40-50 Mbit/s on busy scenes) which
-    # a decent 5 GHz link carries; if WiFi chokes, the appsink drops frames
-    # (max-buffers=1) so the view degrades to fewer fps, never to lag. FOCUS=1
-    # is redundant in solo - this already is the full-fidelity view.
-    PREVIEW_W, PREVIEW_H = SOLO_REC_W, SOLO_REC_H
+    # Solo preview IS the recording, minus frame rate: same crop, same JPEG
+    # quality - so the browser shows what lands in the file and is honest
+    # enough to judge ISP/tuning output. 10fps keeps it ~1/3 of the record
+    # bitrate (~40-50 Mbit/s on busy scenes) which a decent 5 GHz link
+    # carries; if WiFi chokes, the appsink drops frames (max-buffers=1) so
+    # the view degrades to fewer fps, never to lag. Exception: 4K solo
+    # previews at HALF res (1920x1080) - a full-4K MJPEG preview is ~150
+    # Mbit/s, past what WiFi reliably carries. FOCUS=1 is redundant in solo.
+    if SOLO_4K:
+        PREVIEW_W, PREVIEW_H = 1920, 1080
+    else:
+        PREVIEW_W, PREVIEW_H = SOLO_REC_W, SOLO_REC_H
     PREVIEW_QUALITY = 85
     PREVIEW_FPS = 10
 else:
@@ -236,7 +254,9 @@ _rec = {"active": False, "elems": None, "tee_pad": None, "path": None, "started"
 
 def _make_output_path():
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    prefix = f"{FILENAME_PREFIX}_cam{_SOLO}" if _SOLO is not None else FILENAME_PREFIX
+    prefix = FILENAME_PREFIX
+    if _SOLO is not None:
+        prefix = f"{FILENAME_PREFIX}_cam{_SOLO}" + ("_4k" if SOLO_4K else "")
     return os.path.join(OUTPUT_DIR, f"{prefix}_{stamp}.mkv")
 
 
@@ -263,15 +283,16 @@ def start_recording():
         q.set_property("max-size-buffers", 16)
         conv = Gst.ElementFactory.make("nvvidconv", None)
         capsf = Gst.ElementFactory.make("capsfilter", None)
-        # SOLO mode records one-Arducam-half resolution: the VIC center-crops
-        # the 4K frame to 16:10 and filter-downscales to 1920x1200, so the
-        # encoder sees exactly the Arducam-comparison geometry.
+        # SOLO mode pins the record geometry: Arducam-half mode center-crops
+        # to 16:10 on the VIC and downscales to 1920x1200; 4K mode passes the
+        # full frame through untouched.
         rec_caps = "video/x-raw,format=I420"
         if _SOLO is not None:
-            conv.set_property("left", SOLO_CROP_L)
-            conv.set_property("right", SOLO_CROP_R)
-            conv.set_property("top", 0)
-            conv.set_property("bottom", SOLO_CAP_H)
+            if not SOLO_4K:
+                conv.set_property("left", SOLO_CROP_L)
+                conv.set_property("right", SOLO_CROP_R)
+                conv.set_property("top", 0)
+                conv.set_property("bottom", SOLO_CAP_H)
             rec_caps += f",width={SOLO_REC_W},height={SOLO_REC_H}"
         capsf.set_property("caps", Gst.Caps.from_string(rec_caps))
         enc = Gst.ElementFactory.make("nvjpegenc", None)
