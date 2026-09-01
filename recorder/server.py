@@ -26,6 +26,12 @@ For dev, stop the service and run it by hand to see logs:
     sudo systemctl stop camera-rig.service
     python3 server.py
     # browse from your phone to  http://<orin-ip>:8080   (hostname -I)
+
+SOLO quality-test mode - one camera, 4K30 capture, ~3MP (2304x1296) MJPEG
+recording through the identical preview/record plumbing:
+    sudo systemctl stop camera-rig.service
+    SOLO=0 python3 server.py          # sensor-id 0; SOLO=1 for the other cam
+    # FOCUS=1 SOLO=0 python3 server.py  previews at the record resolution
 """
 
 import datetime
@@ -50,12 +56,32 @@ EYE_W, EYE_H, FPS = 1920, 1080, 30  # per-camera 1080p (mode 1) - sustains a tru
                                     # 4K/eye (3840,2160) does NOT: the encoder can't process
                                     # 7680x2160 at 30fps, so it drops frames. Measured.
 COMBINED_W = EYE_W * 2              # 3840 wide, side-by-side
+# Solo quality-test mode (env SOLO=0 or SOLO=1): ONE camera, full 4K30 sensor
+# mode, recorded through the same MJPEG->MKV path but downscaled to ~3 MP.
+# The driver has no native ~3MP mode (only 3840x2160@30 and 1920x1080@60), so
+# we capture 4K and let nvvidconv scale - supersampled 3MP, and a single 4K30
+# stream is well within what the ISP and encoder sustain (raw_capture.sh does
+# more). Argus binds sensors to the pipeline built at startup, so solo-vs-dual
+# is a restart-time choice, not a live toggle:
+#     sudo systemctl stop camera-rig.service
+#     SOLO=0 python3 server.py
+_SOLO = os.environ.get("SOLO")
+if _SOLO is not None and _SOLO not in ("0", "1"):
+    raise SystemExit(f"SOLO must be 0 or 1, got {_SOLO!r}")
+SOLO_CAP_W, SOLO_CAP_H = 3840, 2160  # IMX477 mode 0 - the only 30fps mode above 1080p
+SOLO_REC_W, SOLO_REC_H = 2304, 1296  # ~3.0 MP, a clean 0.6x downscale from 4K
 # Focus mode (run with env FOCUS=1) serves a FULL-RES, high-quality, low-fps
 # preview for critically focusing the lenses over the network. Normal mode is a
 # light downscaled preview for framing. Low fps in focus mode keeps full-res
 # frames flowing over WiFi without needing smooth motion.
 _FOCUS = os.environ.get("FOCUS") == "1"
-PREVIEW_W, PREVIEW_H = (COMBINED_W, EYE_H) if _FOCUS else (1280, 360)
+if _SOLO is not None:
+    # Solo focus-preview is the RECORD resolution, not the 4K capture: 1:1 with
+    # the pixels that land in the file is the honest "will the recording be
+    # sharp" view, at half the WiFi bytes of a 4K preview.
+    PREVIEW_W, PREVIEW_H = (SOLO_REC_W, SOLO_REC_H) if _FOCUS else (1280, 720)
+else:
+    PREVIEW_W, PREVIEW_H = (COMBINED_W, EYE_H) if _FOCUS else (1280, 360)
 PREVIEW_QUALITY = 90 if _FOCUS else 50
 PREVIEW_FPS = 5 if _FOCUS else 15
 REC_QUALITY = 85                    # full-res record JPEG quality (visually ~lossless)
@@ -92,7 +118,21 @@ def log(msg):
 def build_pipeline():
     """Both cameras -> compositor -> tee -> preview (appsink). Named elements:
     cam0/cam1 (live controls), 't' (the tee we tap for recording), and 'preview'
-    (the appsink we pull JPEGs from)."""
+    (the appsink we pull JPEGs from). In SOLO mode: one camera at 4K30 straight
+    into the same tee (element still named cam0 whichever sensor it is)."""
+    if _SOLO is not None:
+        cap = (f"video/x-raw(memory:NVMM),width={SOLO_CAP_W},height={SOLO_CAP_H},"
+               f"framerate={FPS}/1")
+        desc = (
+            f"nvarguscamerasrc name=cam0 sensor-id={_SOLO} {ARGUS_TUNING} ! {cap} "
+            f"! tee name=t "
+            f"t. ! queue leaky=downstream max-size-buffers=4 "
+            f"! nvvidconv ! video/x-raw,format=I420,width={PREVIEW_W},height={PREVIEW_H} "
+            f"! videorate drop-only=true ! video/x-raw,framerate={PREVIEW_FPS}/1 "
+            f"! nvjpegenc quality={PREVIEW_QUALITY} "
+            f"! appsink name=preview emit-signals=true max-buffers=1 drop=true"
+        )
+        return Gst.parse_launch(desc)
     eye_caps = f"video/x-raw(memory:NVMM),width={EYE_W},height={EYE_H},framerate={FPS}/1"
     desc = (
         f"nvarguscamerasrc name=cam0 sensor-id={SENSOR_IDS[0]} {ARGUS_TUNING} ! {eye_caps} ! comp.sink_0 "
@@ -133,7 +173,8 @@ def _on_new_sample(appsink):
 
 pipeline = build_pipeline()
 cam0 = pipeline.get_by_name("cam0")
-cam1 = pipeline.get_by_name("cam1")
+cam1 = None if _SOLO is not None else pipeline.get_by_name("cam1")
+CAMS = [c for c in (cam0, cam1) if c is not None]
 tee = pipeline.get_by_name("t")
 _appsink = pipeline.get_by_name("preview")
 _appsink.connect("new-sample", _on_new_sample)
@@ -151,7 +192,7 @@ def apply_controls():
     """Push the current control state onto both nvarguscamerasrc elements, live."""
     with _ctrl_lock:
         auto, us, gain = _ctrl["auto"], _ctrl["exposure_us"], _ctrl["gain"]
-    for cam in (cam0, cam1):
+    for cam in CAMS:
         if auto:
             cam.set_property("exposuretimerange",
                              f"{EXPOSURE_MIN_US * 1000} {EXPOSURE_MAX_US * 1000}")
@@ -174,7 +215,8 @@ _rec = {"active": False, "elems": None, "tee_pad": None, "path": None, "started"
 
 def _make_output_path():
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    return os.path.join(OUTPUT_DIR, f"{FILENAME_PREFIX}_{stamp}.mkv")
+    prefix = f"{FILENAME_PREFIX}_cam{_SOLO}" if _SOLO is not None else FILENAME_PREFIX
+    return os.path.join(OUTPUT_DIR, f"{prefix}_{stamp}.mkv")
 
 
 def _tee_request_pad():
@@ -200,7 +242,12 @@ def start_recording():
         q.set_property("max-size-buffers", 16)
         conv = Gst.ElementFactory.make("nvvidconv", None)
         capsf = Gst.ElementFactory.make("capsfilter", None)
-        capsf.set_property("caps", Gst.Caps.from_string("video/x-raw,format=I420"))
+        # SOLO mode records ~3MP: nvvidconv does the 4K->2304x1296 downscale on
+        # the VIC, so the encoder never sees more than the target resolution.
+        rec_caps = "video/x-raw,format=I420"
+        if _SOLO is not None:
+            rec_caps += f",width={SOLO_REC_W},height={SOLO_REC_H}"
+        capsf.set_property("caps", Gst.Caps.from_string(rec_caps))
         enc = Gst.ElementFactory.make("nvjpegenc", None)
         enc.set_property("quality", REC_QUALITY)
         parse = Gst.ElementFactory.make("jpegparse", None)
@@ -486,8 +533,9 @@ def status():
         path = _rec["path"]
         started = _rec["started"]
     elapsed = int(time.time() - started) if (active and started) else 0
+    mode = f"solo cam{_SOLO} 4K30 -> {SOLO_REC_W}x{SOLO_REC_H}" if _SOLO is not None else "dual"
     return jsonify(recording=active, file=os.path.basename(path) if (active and path) else None,
-                   elapsed=elapsed, storage=_storage_info())
+                   elapsed=elapsed, mode=mode, storage=_storage_info())
 
 
 # --------------------------------------------------------------------------
