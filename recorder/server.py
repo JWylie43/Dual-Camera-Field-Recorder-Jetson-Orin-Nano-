@@ -27,8 +27,9 @@ For dev, stop the service and run it by hand to see logs:
     python3 server.py
     # browse from your phone to  http://<orin-ip>:8080   (hostname -I)
 
-SOLO quality-test mode - one camera, 4K30 capture, ~3MP (2304x1296) MJPEG
-recording through the identical preview/record plumbing:
+SOLO quality-test mode - one camera, 4K30 capture, recorded at one Arducam
+half's resolution (1920x1200, 16:10 center crop + supersampled downscale) as
+MJPEG through the identical preview/record plumbing, for A/B comparison:
     sudo systemctl stop camera-rig.service
     SOLO=0 python3 server.py          # sensor-id 0; SOLO=1 for the other cam
     # FOCUS=1 SOLO=0 python3 server.py  previews at the record resolution
@@ -57,29 +58,40 @@ EYE_W, EYE_H, FPS = 1920, 1080, 30  # per-camera 1080p (mode 1) - sustains a tru
                                     # 7680x2160 at 30fps, so it drops frames. Measured.
 COMBINED_W = EYE_W * 2              # 3840 wide, side-by-side
 # Solo quality-test mode (env SOLO=0 or SOLO=1): ONE camera, full 4K30 sensor
-# mode, recorded through the same MJPEG->MKV path but downscaled to ~3 MP.
-# The driver has no native ~3MP mode (only 3840x2160@30 and 1920x1080@60), so
-# we capture 4K and let nvvidconv scale - supersampled 3MP, and a single 4K30
-# stream is well within what the ISP and encoder sustain (raw_capture.sh does
-# more). Argus binds sensors to the pipeline built at startup, so solo-vs-dual
-# is a restart-time choice, not a live toggle:
+# mode, recorded through the same MJPEG->MKV path but cropped + downscaled to
+# one Arducam half (1920x1200) for A/B comparison. The driver has no native
+# mode near that (only 3840x2160@30 and 1920x1080@60), so we capture 4K and
+# let the VIC condense it - supersampled output, and a single 4K30 stream is
+# well within what the ISP and encoder sustain (raw_capture.sh does more).
+# Argus binds sensors to the pipeline built at startup, so solo-vs-dual is a
+# restart-time choice, not a live toggle:
 #     sudo systemctl stop camera-rig.service
 #     SOLO=0 python3 server.py
 _SOLO = os.environ.get("SOLO")
 if _SOLO is not None and _SOLO not in ("0", "1"):
     raise SystemExit(f"SOLO must be 0 or 1, got {_SOLO!r}")
 SOLO_CAP_W, SOLO_CAP_H = 3840, 2160  # IMX477 mode 0 - the only 30fps mode above 1080p
-SOLO_REC_W, SOLO_REC_H = 2304, 1296  # ~3.0 MP, a clean 0.6x downscale from 4K
+# Record at ONE ARDUCAM HALF's resolution (1920x1200) for a like-for-like
+# quality comparison. 1920x1200 is 16:10 but the sensor mode is 16:9, so the
+# VIC first center-crops to 3456x2160 (16:10) and then filter-downscales -
+# straight caps alone would squash the image. Crop props are the rectangle's
+# pixel EDGES in the source frame, not amounts trimmed.
+SOLO_REC_W, SOLO_REC_H = 1920, 1200
+SOLO_CROP_W = SOLO_CAP_H * SOLO_REC_W // SOLO_REC_H          # 3456
+SOLO_CROP_L = (SOLO_CAP_W - SOLO_CROP_W) // 2               # 192
+SOLO_CROP_R = SOLO_CROP_L + SOLO_CROP_W                     # 3648
+SOLO_CROP = f"left={SOLO_CROP_L} right={SOLO_CROP_R} top=0 bottom={SOLO_CAP_H}"
 # Focus mode (run with env FOCUS=1) serves a FULL-RES, high-quality, low-fps
 # preview for critically focusing the lenses over the network. Normal mode is a
 # light downscaled preview for framing. Low fps in focus mode keeps full-res
 # frames flowing over WiFi without needing smooth motion.
 _FOCUS = os.environ.get("FOCUS") == "1"
 if _SOLO is not None:
-    # Solo focus-preview is the RECORD resolution, not the 4K capture: 1:1 with
-    # the pixels that land in the file is the honest "will the recording be
-    # sharp" view, at half the WiFi bytes of a 4K preview.
-    PREVIEW_W, PREVIEW_H = (SOLO_REC_W, SOLO_REC_H) if _FOCUS else (1280, 720)
+    # Solo previews carry the same 16:10 crop as the recording so what you
+    # frame is what you record. Focus-preview is the RECORD resolution: 1:1
+    # with the pixels that land in the file is the honest "will the recording
+    # be sharp" view, at a fraction of the WiFi bytes of a 4K preview.
+    PREVIEW_W, PREVIEW_H = (SOLO_REC_W, SOLO_REC_H) if _FOCUS else (1280, 800)
 else:
     PREVIEW_W, PREVIEW_H = (COMBINED_W, EYE_H) if _FOCUS else (1280, 360)
 PREVIEW_QUALITY = 90 if _FOCUS else 50
@@ -127,7 +139,7 @@ def build_pipeline():
             f"nvarguscamerasrc name=cam0 sensor-id={_SOLO} {ARGUS_TUNING} ! {cap} "
             f"! tee name=t "
             f"t. ! queue leaky=downstream max-size-buffers=4 "
-            f"! nvvidconv ! video/x-raw,format=I420,width={PREVIEW_W},height={PREVIEW_H} "
+            f"! nvvidconv {SOLO_CROP} ! video/x-raw,format=I420,width={PREVIEW_W},height={PREVIEW_H} "
             f"! videorate drop-only=true ! video/x-raw,framerate={PREVIEW_FPS}/1 "
             f"! nvjpegenc quality={PREVIEW_QUALITY} "
             f"! appsink name=preview emit-signals=true max-buffers=1 drop=true"
@@ -242,10 +254,15 @@ def start_recording():
         q.set_property("max-size-buffers", 16)
         conv = Gst.ElementFactory.make("nvvidconv", None)
         capsf = Gst.ElementFactory.make("capsfilter", None)
-        # SOLO mode records ~3MP: nvvidconv does the 4K->2304x1296 downscale on
-        # the VIC, so the encoder never sees more than the target resolution.
+        # SOLO mode records one-Arducam-half resolution: the VIC center-crops
+        # the 4K frame to 16:10 and filter-downscales to 1920x1200, so the
+        # encoder sees exactly the Arducam-comparison geometry.
         rec_caps = "video/x-raw,format=I420"
         if _SOLO is not None:
+            conv.set_property("left", SOLO_CROP_L)
+            conv.set_property("right", SOLO_CROP_R)
+            conv.set_property("top", 0)
+            conv.set_property("bottom", SOLO_CAP_H)
             rec_caps += f",width={SOLO_REC_W},height={SOLO_REC_H}"
         capsf.set_property("caps", Gst.Caps.from_string(rec_caps))
         enc = Gst.ElementFactory.make("nvjpegenc", None)
