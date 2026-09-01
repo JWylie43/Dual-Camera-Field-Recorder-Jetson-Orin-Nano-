@@ -61,10 +61,17 @@ PORT = int(os.environ.get("PORT", "8081"))
 MONITOR = os.environ.get("MONITOR") == "1"
 ZOOM = os.environ.get("ZOOM") == "1"
 FLIP = int(os.environ.get("FLIP", "0"))    # nvvidconv flip-method (2 = 180deg)
-# CROP=1: browser stream = center 1920x1080 of the 4K frame, 1:1 sensor
-# pixels - the focus view for when no monitor is attached. ~10x less WiFi
-# than the full-4K stream, so raise FPS (e.g. FPS=10) for live ring-turning.
-CROP = os.environ.get("CROP") == "1"
+# CROP: browser stream = center crop of the 4K frame at 1:1 sensor pixels -
+# the focus view for when no monitor is attached. CROP=1 is 1920x1080;
+# CROP=WxH (e.g. CROP=960x540) picks the size - smaller = fewer WiFi bytes =
+# higher usable FPS, and 1:1 pixels stay honest for focusing at any size.
+_crop_env = os.environ.get("CROP", "")
+if _crop_env == "1":
+    CROP_W, CROP_H = 1920, 1080
+elif "x" in _crop_env:
+    CROP_W, CROP_H = (int(v) for v in _crop_env.split("x"))
+else:
+    CROP_W = CROP_H = 0     # 0 = no crop, stream the scaled full frame
 SINK = os.environ.get("SINK", "drm")        # drm = direct to display, 3d = X window
 METER = os.environ.get("METER", "center")   # AE region: center | full | "l,t,r,b"
 EV = float(os.environ.get("EV", "0"))       # exposure compensation, -2.0 .. 2.0
@@ -131,11 +138,11 @@ def _monitor_branch():
             f"! {conv} ! {sink} ")
 
 
-if CROP:
-    _cl, _ct = (FULL_W - 1920) // 2, (FULL_H - 1080) // 2
-    _stream_conv = (f"nvvidconv flip-method={FLIP} left={_cl} right={_cl + 1920} "
-                    f"top={_ct} bottom={_ct + 1080} "
-                    f"! video/x-raw,format=I420,width=1920,height=1080 ")
+if CROP_W:
+    _cl, _ct = (FULL_W - CROP_W) // 2, (FULL_H - CROP_H) // 2
+    _stream_conv = (f"nvvidconv flip-method={FLIP} left={_cl} right={_cl + CROP_W} "
+                    f"top={_ct} bottom={_ct + CROP_H} "
+                    f"! video/x-raw,format=I420,width={CROP_W},height={CROP_H} ")
 else:
     _stream_conv = f"nvvidconv flip-method={FLIP} ! video/x-raw,format=I420 "
 
