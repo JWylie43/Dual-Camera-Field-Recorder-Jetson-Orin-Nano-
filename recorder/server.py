@@ -96,7 +96,11 @@ else:
     PREVIEW_W, PREVIEW_H = (COMBINED_W, EYE_H) if _FOCUS else (1280, 360)
 PREVIEW_QUALITY = 90 if _FOCUS else 50
 PREVIEW_FPS = 5 if _FOCUS else 15
-REC_QUALITY = 85                    # full-res record JPEG quality (visually ~lossless)
+# Full-res record JPEG quality. 85 = visually ~lossless (the dial-in on real
+# game footage). MJPEG has no bitrate control - this quality factor IS the
+# size/quality lever, and actual bitrate then depends on scene detail.
+# Override per-run for experiments: REC_Q=95 SOLO=0 python3 server.py
+REC_QUALITY = max(1, min(100, int(os.environ.get("REC_Q", "85"))))
 OUTPUT_DIR = "/mnt/video"           # NVMe mount; recordings land here
 FILENAME_PREFIX = "game"            # game_YYYY-MM-DD_HH-MM-SS.mkv
 # External USB SSD for field offload (the Manage Files page mounts/unmounts it).
