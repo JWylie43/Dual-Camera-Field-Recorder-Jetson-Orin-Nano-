@@ -60,6 +60,11 @@ QUALITY = int(os.environ.get("QUALITY", "90"))
 PORT = int(os.environ.get("PORT", "8081"))
 MONITOR = os.environ.get("MONITOR") == "1"
 ZOOM = os.environ.get("ZOOM") == "1"
+FLIP = int(os.environ.get("FLIP", "0"))    # nvvidconv flip-method (2 = 180deg)
+# CROP=1: browser stream = center 1920x1080 of the 4K frame, 1:1 sensor
+# pixels - the focus view for when no monitor is attached. ~10x less WiFi
+# than the full-4K stream, so raise FPS (e.g. FPS=10) for live ring-turning.
+CROP = os.environ.get("CROP") == "1"
 SINK = os.environ.get("SINK", "drm")        # drm = direct to display, 3d = X window
 METER = os.environ.get("METER", "center")   # AE region: center | full | "l,t,r,b"
 EV = float(os.environ.get("EV", "0"))       # exposure compensation, -2.0 .. 2.0
@@ -126,13 +131,21 @@ def _monitor_branch():
             f"! {conv} ! {sink} ")
 
 
+if CROP:
+    _cl, _ct = (FULL_W - 1920) // 2, (FULL_H - 1080) // 2
+    _stream_conv = (f"nvvidconv flip-method={FLIP} left={_cl} right={_cl + 1920} "
+                    f"top={_ct} bottom={_ct + 1080} "
+                    f"! video/x-raw,format=I420,width=1920,height=1080 ")
+else:
+    _stream_conv = f"nvvidconv flip-method={FLIP} ! video/x-raw,format=I420 "
+
 DESC = (
     f"nvarguscamerasrc name=cam sensor-id={CAM} {ARGUS_TUNING} {_ae_props()}"
     f"! video/x-raw(memory:NVMM),width={FULL_W},height={FULL_H},framerate={MODE_FPS}/1 "
     f"! tee name=t "
     + (_monitor_branch() if MONITOR else "") +
     f"t. ! queue leaky=downstream max-size-buffers=4 "
-    f"! nvvidconv ! video/x-raw,format=I420 "
+    f"! {_stream_conv}"
     f"! videorate drop-only=true ! video/x-raw,framerate={FPS}/1 "
     f"! nvjpegenc quality={QUALITY} "
     f"! appsink name=preview emit-signals=true max-buffers=1 drop=true"
