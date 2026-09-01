@@ -32,7 +32,7 @@ half's resolution (1920x1200, 16:10 center crop + supersampled downscale) as
 MJPEG through the identical preview/record plumbing, for A/B comparison:
     sudo systemctl stop camera-rig.service
     SOLO=0 python3 server.py          # sensor-id 0; SOLO=1 for the other cam
-    # FOCUS=1 SOLO=0 python3 server.py  previews at the record resolution
+    # solo preview = the recording itself (1920x1200, record quality) at 10fps
 """
 
 import datetime
@@ -87,15 +87,20 @@ SOLO_CROP = f"left={SOLO_CROP_L} right={SOLO_CROP_R} top=0 bottom={SOLO_CAP_H}"
 # frames flowing over WiFi without needing smooth motion.
 _FOCUS = os.environ.get("FOCUS") == "1"
 if _SOLO is not None:
-    # Solo previews carry the same 16:10 crop as the recording so what you
-    # frame is what you record. Focus-preview is the RECORD resolution: 1:1
-    # with the pixels that land in the file is the honest "will the recording
-    # be sharp" view, at a fraction of the WiFi bytes of a 4K preview.
-    PREVIEW_W, PREVIEW_H = (SOLO_REC_W, SOLO_REC_H) if _FOCUS else (1280, 800)
+    # Solo preview IS the recording, minus frame rate: same 16:10 center crop,
+    # same 1920x1200, same JPEG quality - so the browser shows exactly what
+    # lands in the file and is honest enough to judge ISP/tuning output. 10fps
+    # keeps it ~1/3 of the record bitrate (~40-50 Mbit/s on busy scenes) which
+    # a decent 5 GHz link carries; if WiFi chokes, the appsink drops frames
+    # (max-buffers=1) so the view degrades to fewer fps, never to lag. FOCUS=1
+    # is redundant in solo - this already is the full-fidelity view.
+    PREVIEW_W, PREVIEW_H = SOLO_REC_W, SOLO_REC_H
+    PREVIEW_QUALITY = 85
+    PREVIEW_FPS = 10
 else:
     PREVIEW_W, PREVIEW_H = (COMBINED_W, EYE_H) if _FOCUS else (1280, 360)
-PREVIEW_QUALITY = 90 if _FOCUS else 50
-PREVIEW_FPS = 5 if _FOCUS else 15
+    PREVIEW_QUALITY = 90 if _FOCUS else 50
+    PREVIEW_FPS = 5 if _FOCUS else 15
 # Full-res record JPEG quality. 85 = visually ~lossless (the dial-in on real
 # game footage). MJPEG has no bitrate control - this quality factor IS the
 # size/quality lever, and actual bitrate then depends on scene detail.
