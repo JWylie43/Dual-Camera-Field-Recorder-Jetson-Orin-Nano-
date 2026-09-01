@@ -84,9 +84,9 @@ BOUNDARY = "focusframe"
 EE_MODE = int(os.environ.get("EE_MODE", "2"))
 EE = float(os.environ.get("EE", "0.3"))
 TNR_MODE = int(os.environ.get("TNR_MODE", "2"))
-TNR = float(os.environ.get("TNR", "0.5"))
+TNR = float(os.environ.get("TNR", "0.15"))
 SAT = float(os.environ.get("SAT", "1"))
-WB = int(os.environ.get("WB", "1"))
+WB = int(os.environ.get("WB", "6"))
 GAIN_MAX = os.environ.get("GAIN_MAX", "8")
 ARGUS_TUNING = (f'tnr-mode={TNR_MODE} tnr-strength={TNR} '
                 f'ee-mode={EE_MODE} ee-strength={EE} '

@@ -138,12 +138,18 @@ BOUNDARY = "spinframe"
 EXPOSURE_MIN_US, EXPOSURE_MAX_US = 13, 33000     # 13us floor; 33ms = 1/30s ceiling @ 30fps
 GAIN_MIN, GAIN_MAX = 1.0, 22.25
 
-# ISP tuning applied to both sensors (dialed in by eye, outdoors, Aug 2026).
-# AE/AWB stay fully automatic - these only pick the high-quality ISP algorithms
-# and fence how far AE may push gain: past ~8x analog the IMX477 is grain soup,
-# and Argus's default digital gain ceiling (256x) is pure noise amplification.
-# aeantibanding=3 pins flicker correction to 60 Hz (US lighting).
-ARGUS_TUNING = ('tnr-mode=2 tnr-strength=0.5 ee-mode=2 ee-strength=0.3 '
+# ISP tuning applied to both sensors (dialed in Sept 2026 via the snap.sh
+# capture->grade loop on a focused lens). TNR is LOW on purpose: 0.5 smeared
+# wind-moving texture; daylight at gain 1 barely needs NR. EE stays modest -
+# final sharpening happens in post (grade.sh / stitcher), and stacking strong
+# in-camera EE under post sharpening double-halos. wbmode=6 (cloudy-daylight
+# preset) FREEZES white balance: the stock tuning's teal cast survives any
+# preset, but a constant cast is correctable with one measured matrix in post
+# (rr=1.37 bb=1.40, measured against WB=6 - changing wbmode invalidates it).
+# Gain fences: past ~8x analog the IMX477 is grain soup, and Argus's default
+# digital ceiling (256x) is pure noise amplification. aeantibanding=3 pins
+# flicker correction to 60 Hz (US lighting).
+ARGUS_TUNING = ('tnr-mode=2 tnr-strength=0.15 ee-mode=2 ee-strength=0.3 wbmode=6 '
                 'gainrange="1 8" ispdigitalgainrange="1 2" aeantibanding=3')
 AUTO_GAIN_MAX = 8.0                 # auto-mode analog gain fence (matches ARGUS_TUNING)
 
@@ -223,7 +229,9 @@ _appsink.connect("new-sample", _on_new_sample)
 # NOTE: we never set Argus properties on the cameras during startup - only in
 # response to a user control change - because a set re-creates the capture stream,
 # and doing that mid-startup on two cameras crashes. Startup is pure auto-exposure.
-_ctrl = {"auto": True, "exposure_us": 8000, "gain": 4.0}
+# Manual-mode landing values = the dialed-in sunny-outdoor line (2ms freezes
+# sports motion at gain 1; cloudy days want ~4000us).
+_ctrl = {"auto": True, "exposure_us": 2000, "gain": 1.0}
 _ctrl_lock = threading.Lock()
 
 

@@ -21,12 +21,14 @@
 #   EE=0.3       edge-enhance (sharpen) strength -1..1. Crisper detail; too
 #                high = halos on high-contrast edges + crunchy noise.
 #   EE_MODE=2    0 off, 1 fast, 2 high quality
-#   TNR=0.5      temporal noise reduction -1..1. Cleaner flat areas; cost is
+#   TNR=0.15     temporal noise reduction -1..1. Cleaner flat areas; cost is
 #                smeared motion + eaten fine texture. Try 0 to see the truth.
 #   TNR_MODE=2   0 off, 1 fast, 2 high quality
 #   SAT=1.0      saturation 0..2. Taste. 1 = calibrated, 1.3 = punchy.
-#   WB=1         white balance: 1 auto, 0 off, presets 2-8 (6 = daylight).
-#                A preset keeps color constant across captures.
+#   WB=6         white balance: 1 auto, 0 off, presets 2-8 (5 = daylight,
+#                6 = cloudy-daylight). A preset keeps color constant across
+#                captures; 6 is the rig standard - the post color matrix in
+#                grade.sh was measured against it.
 #   FLIP=0       nvvidconv flip-method: 2 = 180 (sensor mounted upside down)
 #   Q=95         JPEG quality of the saved still
 #   SETTLE=45    frames to run before keeping one (AE/AWB/TNR convergence;
@@ -46,8 +48,8 @@ set -euo pipefail
 CAM=${CAM:-0}
 GAIN_MAX=${GAIN_MAX:-8}
 EE=${EE:-0.3}; EE_MODE=${EE_MODE:-2}
-TNR=${TNR:-0.5}; TNR_MODE=${TNR_MODE:-2}
-SAT=${SAT:-1.0}; WB=${WB:-1}
+TNR=${TNR:-0.15}; TNR_MODE=${TNR_MODE:-2}
+SAT=${SAT:-1.0}; WB=${WB:-6}
 FLIP=${FLIP:-0}; Q=${Q:-95}; SETTLE=${SETTLE:-45}
 EV=${EV:-0}
 
