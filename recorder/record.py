@@ -96,7 +96,8 @@ class Config:
     fps = 30                        # frames per second
     pixel_format = "UYVY"           # camera output (UYVY 4:2:2, from the onboard ISP)
 
-    jpeg_quality = 85               # MJPEG quality 0-100 (85 ~ visually lossless)
+    jpeg_quality = 95               # MJPEG quality 0-100 (95 = transparent; 100 ~2x the
+                                    # bytes for no visible gain, 85 shows blocking in grass)
 
     thermal_interval_ms = 5000      # tegrastats sampling interval when --log-thermals
 
@@ -129,6 +130,18 @@ class Config:
     controls = {
         "frame_rate": fps,          # make sure the sensor is at our target rate
         "trigger_mode": 0,          # 0 = free-run (kit handles stereo sync internally)
+        # Exposure recipe (2026-09 outdoor bracket tests): auto-exposure ON, but
+        # with a LOW backlight-compensation bias - the driver default of 6 makes
+        # AE expose for the shadows and clip sunlit grass to pure white, which
+        # no post pass can recover. blc=2 biases darker; a too-dark frame is
+        # recoverable in the grade, a clipped one is gone. Gain pinned to 0
+        # (cleanest); AE lengthens the shutter for clouds/evening on its own.
+        # NOTE this sensor's oddball mapping: `exposure` is the 0/1 AE toggle,
+        # and `brightness` is the shutter time (~us, 0-33000) used when AE is
+        # off. UI --set-ctrl overrides still win over all of these.
+        "exposure": 1,              # auto-exposure ON
+        "backlight_compensation": 2,
+        "gain": 0,
     }
 
 
