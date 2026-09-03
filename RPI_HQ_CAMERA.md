@@ -130,18 +130,40 @@ defocused blur. Keep the dust caps on when not testing.
 
 ---
 
-## Next: genlock (master/slave sync) — future work
+## Genlock (master/slave sync) — VALIDATED 2026-09-03
 
-The Pi HQ exposes **XVS** and **GND** solder pads. Tying XVS between the two cameras
-(one master, one slave) is the documented hardware sync approach. The catch: NVIDIA's
-stock `imx477` driver **does not expose master/slave sync registers** — Raspberry Pi's
-own kernel driver has that support, so it will need to be ported into the driver here.
-That's a kernel-module build, separate from this overlay switch.
+The Pi HQ exposes **XVS** and **GND** solder pads. Tying XVS between the two
+cameras (one master/source, one slave/sink) hard-syncs their frame timing.
+**Proven on this rig**: XVS pads wired directly (1.8 V logic — no level shift,
+no pull-up needed for two boards), then `DUR=60 POKE=1 ./recorder/sync_test.sh`:
 
-- NVIDIA's `imx477` driver + mode tables: L4T `public_sources` (`nv_imx477.c`,
-  `tegra234-camera-imx477-*.dtsi`).
-- Raspberry Pi's driver with sync support: `raspberrypi/linux`,
-  `drivers/media/i2c/imx477.c` (GPL).
+- baseline: offset creeping at ~3 µs/s (free-running, crystals ~3 ppm apart —
+  ~10 ms drift per hour, a third of a frame, hence genlock)
+- at the 20 s register poke the offset **snapped to 0.000 ms and held for the
+  rest of the run** — sub-microsecond master/slave lock
 
-XVS is 1.8 V logic — tie the pads directly between the two cameras only; do not
-level-shift to anything else.
+The sensor does it all; the driver only has to set four registers (from
+Raspberry Pi's GPL `imx477.c`, its `trigger_mode` support) before/at stream-on:
+
+| Reg | Name | Source | Sink |
+|---|---|---|---|
+| `0x3F0B` | MC_MODE | 1 | 1 |
+| `0x3041` | MS_SEL | 1 | 0 |
+| `0x3040` | XVS_IO_CTRL | 1 | 0 |
+| `0x4B81` | EXTOUT_EN | 1 | 0 |
+
+`sync_test.sh POKE=1` writes these mid-stream with `i2ctransfer -f` (sink first,
+then source — **never both source**: two drivers fighting on the line). That's
+out-of-spec (datasheet wants standby) and doesn't persist across stream restarts,
+so it's the validation tool, not the solution.
+
+**Remaining work**: port those writes into `nv_imx477.c` (keyed per camera:
+i2c-9 → source, i2c-10 → sink, e.g. via a DT property) so every stream start
+comes up genlocked. Kernel-module build on the Orin. Sources: L4T
+`public_sources` (`nv_imx477.c`), `raspberrypi/linux`
+`drivers/media/i2c/imx477.c` (GPL).
+
+Debug gotcha hit during wiring: with a camera ribbon mis-seated after the
+soldering session, powering the sensors took the whole board's network down
+(rail brownout at probe). Symptom: boots and reaches the internet, unreachable
+on the LAN, fine with cameras unplugged. Reseat the ribbons.
