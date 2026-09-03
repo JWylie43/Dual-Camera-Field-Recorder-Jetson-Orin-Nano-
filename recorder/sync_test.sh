@@ -88,25 +88,41 @@ python3 - "$TMPD/cam0.ts" "$TMPD/cam1.ts" <<'EOF'
 import sys, bisect
 
 def load(p):
+    # keep only strictly-increasing timestamps: a glitched stream (e.g. the
+    # mid-run register poke) can emit duplicate/backwards ts lines
+    ts, last = [], -1.0
     with open(p) as f:
-        ts = [float(l) for l in f if l.strip()]
+        for l in f:
+            if not l.strip():
+                continue
+            v = float(l)
+            if v > last:
+                ts.append(v)
+                last = v
     return ts
 
 a, b = load(sys.argv[1]), load(sys.argv[2])
 if len(a) < 10 or len(b) < 10:
     sys.exit("!! too few frames captured to analyze")
 
-t0 = min(a[0], b[0])
+# only compare the window where BOTH cameras were streaming - one stream
+# ending early otherwise produces huge junk offsets at the tail
+lo, hi = max(a[0], b[0]), min(a[-1], b[-1])
+t0 = lo
 
 # For each cam0 frame, signed offset to the NEAREST cam1 frame (ms). With
 # free-running cameras this sawtooths through +-half a frame period as they
 # drift past each other; when locked it sits flat.
 pts = []
 for t in a:
+    if t < lo or t > hi:
+        continue
     i = bisect.bisect_left(b, t)
     cands = [b[j] for j in (i - 1, i) if 0 <= j < len(b)]
     near = min(cands, key=lambda x: abs(x - t))
     pts.append((t - t0, (t - near) * 1e3))
+if len(pts) < 10:
+    sys.exit("!! streams barely overlap - too little common data to analyze")
 
 # one line per second: mean offset in that second
 print("\n   t(s)   cam0-cam1 offset (ms)")
@@ -117,16 +133,21 @@ for s in sorted(buckets):
     v = buckets[s]
     print(f"  {s:5d}   {sum(v)/len(v):+9.3f}")
 
-# drift rate: compare mean offset of first and last 3 seconds
+# drift rate over the FINAL 10 seconds (least-squares slope of the
+# per-second means) - so a POKE run is judged on its post-poke state, not
+# on the deliberately-drifting baseline at the start
 secs = sorted(buckets)
-head = [o for s in secs[:3] for o in buckets[s]]
-tail = [o for s in secs[-3:] for o in buckets[s]]
-span = (secs[-1] - secs[0]) or 1
-drift = (sum(tail)/len(tail) - sum(head)/len(head)) / span * 1e3  # us/s
+tail_secs = secs[-10:]
+xs = tail_secs
+ys = [sum(buckets[s]) / len(buckets[s]) for s in tail_secs]
+n = len(xs)
+mx, my = sum(xs) / n, sum(ys) / n
+den = sum((x - mx) ** 2 for x in xs) or 1
+drift = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den * 1e3  # us/s
 last = buckets[secs[-1]]
 jitter = (max(last) - min(last)) * 1e3  # us peak-to-peak, final second
 
-print(f"\n>> drift: {drift:+.2f} us/s   jitter (last second): {jitter:.0f} us p-p")
+print(f"\n>> drift (last {len(tail_secs)}s): {drift:+.2f} us/s   jitter (last second): {jitter:.0f} us p-p")
 # A locked pair is FLAT - drift indistinguishable from zero. Free-running
 # crystals show a steady linear creep (even well-matched ones drift ~3 us/s).
 if abs(drift) < 0.3 and jitter < 500:
