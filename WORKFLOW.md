@@ -16,6 +16,7 @@ Commands note which machine they run on. Replace `game_YYYY-MM-DD_HH-MM-SS` with
 | Recordings live on the Orin at | `/mnt/video/` |
 | Each take produces | `game_TS.mkv` (video) · `game_TS_aN.wav` (audio, one per mic segment) · `game_TS.sync.json` (A/V sync anchors) · optional `game_TS.tegrastats.log` |
 | Recording bitrate (real game footage, q85) | ~**2.15 GB/min** ≈ **~130 GB/hr** (audio adds only ~**0.35 GB/hr**) |
+| Recording bitrate at the new default **q95** | expect roughly **1.4–1.5×** the q85 figures (~**180–195 GB/hr**) — re‑measure on the first real game |
 | A ~75‑min game | ~**155–170 GB** |
 | External SSD (SanDisk, exFAT) mounts at | `/mnt/usb` |
 | Copy glob — grab a whole take | `game_TS*` (**no dot** — the dot form misses `_aN.wav`) |
@@ -240,6 +241,25 @@ Common flags:
 | `--no-jobs` | force single process |
 | `--out-file <path>` | output (keep `.mp4`) |
 | `--tune` | open the browser tuner |
+| `--no-look` | disable the delivery look pass (see 3e) — bare encode, old behavior |
+| `--cas S` | look sharpening strength, 0–1 (default **0.35**; 0.3–0.45 sane) |
+| `--gamma G` | look brightness lift, e.g. `1.1` (default off; for the dark-leaning capture) |
+| `--look-width W` | look upscale target width (default **3840**; `0` = keep pano size) |
+| `--bitrate B` | video bitrate (default **40M** with the upscale, **25M** without) |
+
+### 3e. Delivery look pass (on by default)
+
+Every video encode runs, in order: **denoise** (`hqdn3d`, before sharpening so noise
+isn't amplified) → optional **`--gamma` lift** (the capture recipe deliberately errs
+dark to protect highlights — this is where brightness comes back, per game) →
+**lanczos upscale to 3840‑wide** (YouTube then serves its ≥1440p VP9/AV1 tier instead
+of 1080p AVC — the biggest delivered‑quality win) → **CAS sharpen** at final
+resolution (counters the camera ISP's baked‑in smoothing without halos).
+
+- Output with no flags: ~3840×1730 @ 40M. `--no-look` reproduces the pre‑look output exactly.
+- To tune `--cas` once: render a 10 s clip at 0.25 / 0.35 / 0.5 and compare grass/jerseys at 100%.
+- The pass runs inside the final ffmpeg encode only — tuner preview images don't get it,
+  and `--jobs` children inherit the parent's look settings automatically.
 
 ### 3c. Stitch a time range only
 
