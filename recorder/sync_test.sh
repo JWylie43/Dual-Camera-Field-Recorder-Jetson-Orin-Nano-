@@ -16,7 +16,10 @@
 # Dials (env vars):
 #   DUR=30      seconds to stream
 #   W=1920 H=1080  sensor mode (1080p binned; W=3840 H=2160 for full res)
-#   FPS=60      the 1080p mode's native rate - only used to size the run
+#   FPS=30      assumed delivery rate, only used to size the run. The 1080p
+#               mode advertises 60fps but delivers 30 via this v4l2 path
+#               (measured); if the run finishes early/late the analysis is
+#               unaffected - everything is computed from real timestamps.
 #   POKE=0      1 = ONE-SHOT SYNC TEST: after DUR/3 of baseline, write the
 #               IMX477 XVS sync registers over i2c mid-stream (cam1 -> sink
 #               first, then cam0 -> source). If the pads are wired and work,
@@ -34,7 +37,7 @@
 set -euo pipefail
 
 DUR=${DUR:-30}
-W=${W:-1920}; H=${H:-1080}; FPS=${FPS:-60}
+W=${W:-1920}; H=${H:-1080}; FPS=${FPS:-30}
 POKE=${POKE:-0}
 I2C0=${I2C0:-9}; I2C1=${I2C1:-10}
 ADDR=0x1a
@@ -123,8 +126,10 @@ drift = (sum(tail)/len(tail) - sum(head)/len(head)) / span * 1e3  # us/s
 last = buckets[secs[-1]]
 jitter = (max(last) - min(last)) * 1e3  # us peak-to-peak, final second
 
-print(f"\n>> drift: {drift:+.1f} us/s   jitter (last second): {jitter:.0f} us p-p")
-if abs(drift) < 5 and jitter < 500:
+print(f"\n>> drift: {drift:+.2f} us/s   jitter (last second): {jitter:.0f} us p-p")
+# A locked pair is FLAT - drift indistinguishable from zero. Free-running
+# crystals show a steady linear creep (even well-matched ones drift ~3 us/s).
+if abs(drift) < 0.3 and jitter < 500:
     print(">> verdict: LOCKED - offset is frozen; XVS sync is working")
 else:
     print(">> verdict: FREE-RUNNING - offset drifts; no sync (expected before")
