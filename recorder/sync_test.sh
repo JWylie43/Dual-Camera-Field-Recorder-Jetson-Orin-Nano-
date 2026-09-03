@@ -43,10 +43,14 @@ FRAMES=$(( DUR * FPS ))
 TMPD=$(mktemp -d /tmp/synctest.XXXXXX)
 trap 'rm -rf "$TMPD"' EXIT
 
+# bypass_mode=0 is required for direct v4l2 capture on Jetson (default routes
+# the VI to Argus and the stream hangs with no frames). The timeout is a
+# backstop so a wedged stream can't hang the test forever.
 stream() {
   local dev=$1 out=$2
-  v4l2-ctl -d "/dev/video$dev" \
+  timeout $(( DUR * 3 + 15 )) v4l2-ctl -d "/dev/video$dev" \
     --set-fmt-video=width=$W,height=$H \
+    --set-ctrl bypass_mode=0 \
     --stream-mmap --stream-count=$FRAMES --verbose 2>&1 \
     | grep -o 'ts: [0-9.]*' | cut -d' ' -f2 > "$out"
 }
@@ -73,7 +77,8 @@ if [[ "$POKE" == 1 ]]; then
   poke_regs "$I2C0" 1
 fi
 
-wait $P0 $P1
+wait $P0 || true
+wait $P1 || true
 echo ">> cam0: $(wc -l < "$TMPD/cam0.ts") frames, cam1: $(wc -l < "$TMPD/cam1.ts") frames"
 
 python3 - "$TMPD/cam0.ts" "$TMPD/cam1.ts" <<'EOF'
