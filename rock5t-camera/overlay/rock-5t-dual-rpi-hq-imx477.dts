@@ -1,0 +1,379 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * ROCK 5T: dual Raspberry Pi HQ Camera (Sony IMX477), one per CAM connector,
+ * with XVS hardware genlock roles baked in (CAM0 sensor = source/master,
+ * CAM1 sensor = sink/slave; the XVS pads are wired together off-board).
+ *
+ * Chains copied from Radxa's own rock-5t-cam{0,1}-radxa-camera-8m-219.dts
+ * (the shipped, working 2-lane Sony-sensor overlays for this exact board),
+ * with the sensor nodes swapped to imx477@1a. Wiring facts cross-checked
+ * against the ROCK 5T v1.2 schematic sheet 18 (see ../SCHEMATIC_FACTS.md):
+ *
+ *   CAM0 (J5002): i2c3,      pwdn GPIO1_D3, csi2_dphy0 -> mipi2_csi2
+ *                 -> rkcif_mipi_lvds2 -> rkisp0_vir0
+ *   CAM1 (J10):   i2c4 (m1), pwdn GPIO2_A6, csi2_dphy4 -> mipi4_csi2
+ *                 -> rkcif_mipi_lvds4 -> rkisp1_vir1
+ *
+ * The Pi HQ generates its own 24 MHz on-camera; the clk_cam_24m nodes are
+ * fixed-clock stubs satisfying the driver's clock request.
+ *
+ * Requires the out-of-tree imx477.ko (../driver/) which reads the
+ * trigger-mode property. IQ file: imx477_RPI-HQ_default.json (../iqfiles/).
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+
+/ {
+	metadata {
+		title = "Enable dual Raspberry Pi HQ Camera (IMX477, XVS genlock)";
+		compatible = "radxa,rock-5t", "radxa,rock-5t-industrial";
+		category = "camera";
+		exclusive = "csi2_dphy0", "csi2_dphy4";
+		description = "Raspberry Pi HQ Camera (IMX477) on CAM0 and CAM1, genlocked via XVS (CAM0 source, CAM1 sink).";
+	};
+};
+
+&{/} {
+	camera_pwdn_gpio: camera-pwdn-gpio {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_pwdn_gpio";
+		regulator-always-on;
+		regulator-boot-on;
+		enable-active-high;
+		gpio = <&gpio1 RK_PD3 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_pwdn_gpio>;
+	};
+
+	camera_pwdn_gpio_1: camera-pwdn-gpio-1 {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_pwdn_gpio_1";
+		regulator-always-on;
+		regulator-boot-on;
+		enable-active-high;
+		gpio = <&gpio2 RK_PA6 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_pwdn_gpio_1>;
+	};
+
+	clk_cam0_24m: external-camera0-clock-24m {
+		compatible = "fixed-clock";
+		clock-frequency = <24000000>;
+		clock-output-names = "clk_cam0_24m";
+		#clock-cells = <0>;
+	};
+
+	clk_cam1_24m: external-camera1-clock-24m {
+		compatible = "fixed-clock";
+		clock-frequency = <24000000>;
+		clock-output-names = "clk_cam1_24m";
+		#clock-cells = <0>;
+	};
+};
+
+/* ------------------------- CAM0: genlock SOURCE ------------------------- */
+
+&i2c3 {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	camera_imx477_0: camera-imx477@1a {
+		compatible = "sony,imx477";
+		reg = <0x1a>;
+
+		clocks = <&clk_cam0_24m>;
+		clock-names = "xvclk";
+
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "RPI-HQ";
+		rockchip,camera-module-lens-name = "default";
+
+		/* XVS genlock: this sensor drives the shared XVS wire */
+		trigger-mode = "source";
+
+		port {
+			imx477_out0: endpoint {
+				remote-endpoint = <&mipidphy0_in_ucam1>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+};
+
+&csi2_dphy0_hw {
+	status = "okay";
+};
+
+&csi2_dphy0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipidphy0_in_ucam1: endpoint@2 {
+				reg = <2>;
+				remote-endpoint = <&imx477_out0>;
+				data-lanes = <1 2>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			csidphy0_out: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&mipi2_csi2_input>;
+			};
+		};
+	};
+};
+
+&mipi2_csi2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi2_csi2_input: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&csidphy0_out>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi2_csi2_output: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&cif_mipi2_in0>;
+			};
+		};
+	};
+};
+
+&rkcif_mipi_lvds2 {
+	status = "okay";
+
+	port {
+		cif_mipi2_in0: endpoint {
+			remote-endpoint = <&mipi2_csi2_output>;
+		};
+	};
+};
+
+&rkcif_mipi_lvds2_sditf {
+	status = "okay";
+
+	port {
+		mipi_lvds2_sditf: endpoint {
+			remote-endpoint = <&isp0_vir0>;
+		};
+	};
+};
+
+&isp0_mmu {
+	status = "okay";
+};
+
+&rkisp0 {
+	status = "okay";
+};
+
+&rkisp0_vir0 {
+	status = "okay";
+
+	port {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		isp0_vir0: endpoint@0 {
+			reg = <0>;
+			remote-endpoint = <&mipi_lvds2_sditf>;
+		};
+	};
+};
+
+/* -------------------------- CAM1: genlock SINK -------------------------- */
+
+&i2c4 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c4m1_xfer>;
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	camera_imx477_1: camera-imx477@1a {
+		compatible = "sony,imx477";
+		reg = <0x1a>;
+
+		clocks = <&clk_cam1_24m>;
+		clock-names = "xvclk";
+
+		rockchip,camera-module-index = <1>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "RPI-HQ";
+		rockchip,camera-module-lens-name = "default";
+
+		/* XVS genlock: this sensor re-aligns to pulses on the XVS wire */
+		trigger-mode = "sink";
+
+		port {
+			imx477_out1: endpoint {
+				remote-endpoint = <&mipidphy4_in_ucam1>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+};
+
+&csi2_dphy1_hw {
+	status = "okay";
+};
+
+&csi2_dphy4 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipidphy4_in_ucam1: endpoint@2 {
+				reg = <2>;
+				remote-endpoint = <&imx477_out1>;
+				data-lanes = <1 2>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			csidphy4_out: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&mipi4_csi2_input>;
+			};
+		};
+	};
+};
+
+&mipi4_csi2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi4_csi2_input: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&csidphy4_out>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi4_csi2_output: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&cif_mipi4_in0>;
+			};
+		};
+	};
+};
+
+&rkcif_mipi_lvds4 {
+	status = "okay";
+
+	port {
+		cif_mipi4_in0: endpoint {
+			remote-endpoint = <&mipi4_csi2_output>;
+		};
+	};
+};
+
+&rkcif_mipi_lvds4_sditf {
+	status = "okay";
+
+	port {
+		mipi_lvds4_sditf: endpoint {
+			remote-endpoint = <&isp1_vir1>;
+		};
+	};
+};
+
+&isp1_mmu {
+	status = "okay";
+};
+
+&rkisp1 {
+	status = "okay";
+};
+
+&rkisp1_vir1 {
+	status = "okay";
+
+	port {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		isp1_vir1: endpoint@0 {
+			reg = <0>;
+			remote-endpoint = <&mipi_lvds4_sditf>;
+		};
+	};
+};
+
+/* ------------------------------- shared -------------------------------- */
+
+&rkcif {
+	status = "okay";
+};
+
+&rkcif_mmu {
+	status = "okay";
+};
+
+&pinctrl {
+	camera {
+		cam_pwdn_gpio: cam-pwdn-gpio {
+			rockchip,pins = <1 RK_PD3 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+
+		cam_pwdn_gpio_1: cam-pwdn-gpio-1 {
+			rockchip,pins = <2 RK_PA6 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+};
