@@ -139,8 +139,11 @@ class Config:
         # NOTE this sensor's oddball mapping: `exposure` is the 0/1 AE toggle,
         # and `brightness` is the shutter time (~us, 0-33000) used when AE is
         # off. UI --set-ctrl overrides still win over all of these.
+        # blc scale, from CONVERGED-AE footage only (snapshots taken seconds
+        # after enabling AE catch it half-settled and mislead): 6 clips sunlit
+        # grass, 2 lands ~2 stops under (YAVG ~39/255). 4 is the midpoint.
         "exposure": 1,              # auto-exposure ON
-        "backlight_compensation": 2,
+        "backlight_compensation": 4,
         "gain": 0,
     }
 

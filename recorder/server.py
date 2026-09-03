@@ -1374,7 +1374,7 @@ if __name__ == "__main__":
     # clip sunlit grass - without this the preview looks blown out until the first
     # recording or slider touch. Values mirror record.py Config.controls; a failure
     # is non-fatal (camera unplugged / different sensor) and just logged.
-    for _name, _value in (("exposure", 1), ("backlight_compensation", 2), ("gain", 0)):
+    for _name, _value in (("exposure", 1), ("backlight_compensation", 4), ("gain", 0)):
         _ok, _err = _set_control(_name, _value)
         if not _ok:
             print(f"  boot control {_name}={_value} failed: {_err}")
