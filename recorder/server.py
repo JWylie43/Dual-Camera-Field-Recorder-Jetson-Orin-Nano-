@@ -1368,16 +1368,18 @@ setInterval(() => { if(!xferActive && !state.q && !selected().length) load(); },
 
 if __name__ == "__main__":
     print(f"Camera rig control panel on http://0.0.0.0:{PORT}  (find IP: hostname -I)")
-    # Apply the exposure recipe at boot so the idle PREVIEW matches what recordings
-    # get (record.py applies the same values, and wins if they ever diverge). After
-    # a power cycle the driver reverts to backlight_compensation=6, which makes AE
-    # clip sunlit grass - without this the preview looks blown out until the first
-    # recording or slider touch. Values mirror record.py Config.controls; a failure
-    # is non-fatal (camera unplugged / different sensor) and just logged.
-    for _name, _value in (("exposure", 1), ("backlight_compensation", 4), ("gain", 0)):
-        _ok, _err = _set_control(_name, _value)
-        if not _ok:
-            print(f"  boot control {_name}={_value} failed: {_err}")
+    # Seed the exposure recipe as boot-time control overrides so the idle PREVIEW
+    # matches what recordings get (record.py applies the same values). Seeding
+    # _ctrl_overrides - rather than a one-shot v4l2-ctl - matters because STARTING
+    # A STREAM RESETS THE SENSOR to its power-on defaults (backlight_compensation
+    # 6, which makes AE clip sunlit grass): the overrides are re-applied by
+    # _schedule_reapply after every preview/record (re)start, so the recipe
+    # actually sticks. The UI sliders update this same dict, so a live tweak
+    # still wins until the next service restart. Values mirror record.py
+    # Config.controls; the immediate apply is best-effort (camera may be absent).
+    with _ctrl_lock:
+        _ctrl_overrides.update({"exposure": 1, "backlight_compensation": 4, "gain": 0})
+    _reapply_controls()
     # No preview on boot: the camera stays idle until a browser opens /preview.mjpg.
     try:
         app.run(host="0.0.0.0", port=PORT, threaded=True)
