@@ -37,6 +37,25 @@ straight into the new driver.
    curve, CCMs at ~8 color temperatures, gamma. The IQ file is a translation
    into the rkisp v30 JSON, not a re-measurement.
 
+## Status (2026-09-03): all three pieces DRAFTED, awaiting hardware
+
+- **Driver**: `rock5t-camera/driver/imx477.c` + Makefile + NOTES.md — Rockchip
+  imx577 body + RPi imx477 sensor facts + XVS genlock via DT `trigger-mode`.
+  NOT yet compiled — first action next time the Rock is on: `make` against the
+  installed headers (expected 1-line fixups listed in NOTES.md).
+- **Overlay**: `rock5t-camera/overlay/rock-5t-dual-rpi-hq-imx477.dts` — both
+  cameras, genlock roles baked in (CAM0 source, CAM1 sink). Chains verified
+  TWICE: schematic sheet 18 + Radxa's own upstream rock-5t camera overlays
+  (which the installed radxa-overlays 0.2.27 predates — `apt upgrade` gets
+  Radxa's stock ones too). Build/install: overlay/README.md.
+- **IQ file**: `rock5t-camera/iqfiles/imx477_RPI-HQ_default.json` — skeleton
+  switched to Radxa's shipping **imx577** IQ (sibling sensor; BLC cross-
+  validates RPi's to the LSB). RPi lab data transplanted: AWB gains, 14 CCMs,
+  gamma. LSC neutral (per-lens, later). Regenerate via gen_imx477_iq.py.
+- **Bring-up order** (Rock on, cameras cabled): compile driver -> install
+  .ko + .dtbo + IQ json -> reboot -> i2cdetect 0x1a on buses 3 & 4 ->
+  v4l2 raw smoke test -> rkaiq/ISP path -> port sync_test.sh for genlock proof.
+
 ## Work plan
 
 ### 1. Kernel driver (out-of-tree module `imx477.ko`)
