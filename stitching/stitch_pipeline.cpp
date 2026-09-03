@@ -31,6 +31,16 @@
 //   --no-jobs  (or --jobs 1) run everything in this one process - no parallelism.
 //   Requires ffmpeg on PATH for the concat. Images and --tune always run single-process.
 //
+// Delivery look pass (default ON; video encodes only - see the g_look globals):
+//   denoise (hqdn3d) -> optional --gamma lift -> lanczos upscale to --look-width
+//   (default 3840, so YouTube serves its >=1440p VP9/AV1 tier) -> --cas sharpen
+//   (default 0.35) at final resolution. Default --bitrate becomes 40M when the
+//   upscale is active (25M otherwise).
+//   --no-look        bare pad-only encode (the pre-look behavior)
+//   --cas S          sharpen strength 0..1 (0.3-0.45 sane; tune on stills at 100%)
+//   --gamma G        e.g. 1.1 to lift the deliberately-dark blc=2 capture
+//   --look-width W   upscale target width; 0 = keep native pano size
+//
 // Warp device: the stitching/warp always runs on the CPU (the OpenCL/GPU warp was
 // measured slower - see the note in main). The video ENCODER still uses the GPU
 // (hardware H.264, chooseVideoEncoder). Uses core/imgproc/imgcodecs/videoio; OpenCV 4.x/5.x.
@@ -104,6 +114,27 @@ static int runShell(string cmd);   // forward decl (defined near main); the enco
 static string g_vencExplicit;      // --venc NAME: force a specific encoder (also parent->child in --jobs)
 static bool   g_forceCpu = false;  // --cpu / --no-hwenc: force software libx264
 static string g_vbitrate  = "25M"; // --bitrate: target video bitrate passed to -b:v
+
+// ---- delivery "look" pass (set from CLI in main) -------------------------
+// Applied inside the encode's -vf chain, in this order (order matters):
+//   1. hqdn3d   - light spatial + temporal denoise, at native res, BEFORE the
+//                 sharpen so we never sharpen sensor/ISP noise. The pano
+//                 background is near-static frame to frame, so the temporal
+//                 pass is cheap and frees encoder bits for real detail.
+//   2. eq=gamma - optional shadow/mid lift (--gamma). The capture recipe errs
+//                 dark on purpose (clipped highlights are unrecoverable); this
+//                 is where that brightness comes back, per game, if wanted.
+//   3. scale    - lanczos upscale to --look-width (default 3840). No detail is
+//                 added, but >=1440p flips YouTube to its far better VP9/AV1
+//                 tier instead of 1080p AVC - the biggest delivered-quality win.
+//   4. cas      - contrast-adaptive sharpen at FINAL resolution (--cas). This
+//                 counters the camera ISP's baked-in noise reduction and the
+//                 stitch warp + upscale resampling, without unsharp's halos.
+// --no-look reverts to the bare pad-only chain (the pre-look behavior).
+static bool   g_look       = true;   // --no-look: disable the whole look pass
+static string g_lookCas    = "0.35"; // --cas: sharpen strength 0..1 (0.3-0.45 sane)
+static string g_lookGamma  = "";     // --gamma: e.g. 1.1 lifts shadows/mids; empty = off
+static string g_lookWidth  = "3840"; // --look-width: upscale target width; 0 = keep pano size
 
 struct StitchMaps
 {
@@ -564,10 +595,24 @@ static string buildEncodeCmd(const string &venc, int W, int H, double fps, const
     ostringstream c;
     c << "ffmpeg -y -hide_banner -loglevel error"
       << " -f rawvideo -pixel_format bgr24 -video_size " << W << "x" << H
-      << " -framerate " << fps << " -i - -an"
-      // Panorama W/H aren't guaranteed even, but H.264 4:2:0 needs even dims - pad up
-      // to the next even size (adds at most a 1px black edge; a no-op when already even).
-      << " -vf \"pad=ceil(iw/2)*2:ceil(ih/2)*2\""
+      << " -framerate " << fps << " -i - -an";
+    // Filter chain: the delivery look pass (see the g_look globals for the why and
+    // the ordering), or just the even-dims pad when --no-look. The scale's :-2
+    // yields an even height, so the upscaled path needs no pad; every other path
+    // keeps it - panorama W/H aren't guaranteed even and H.264 4:2:0 needs even
+    // dims (pad adds at most a 1px black edge; a no-op when already even).
+    string vf;
+    if (g_look)
+    {
+        vf = "hqdn3d=1.5:1.5:4:4";
+        if (!g_lookGamma.empty()) vf += ",eq=gamma=" + g_lookGamma;
+        if (g_lookWidth != "0")   vf += ",scale=" + g_lookWidth + ":-2:flags=lanczos";
+        vf += ",cas=" + g_lookCas;
+        if (g_lookWidth == "0")   vf += ",pad=ceil(iw/2)*2:ceil(ih/2)*2";
+    }
+    else
+        vf = "pad=ceil(iw/2)*2:ceil(ih/2)*2";
+    c << " -vf \"" << vf << "\""
       << " -c:v " << venc << " -b:v " << g_vbitrate;
     if (venc == "libx264") c << " -preset medium";
     // Pin output format so every encoder tags color the same way (avoids the AMF
@@ -602,13 +647,18 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
     VideoWriter writer;
     if (useFfmpeg)
     {
-        cout << "encoder: " << venc << " (ffmpeg pipe, " << g_vbitrate << ")\n";
+        cout << "encoder: " << venc << " (ffmpeg pipe, " << g_vbitrate
+             << (g_look ? ", look: denoise" + string(g_lookGamma.empty() ? "" : " + gamma " + g_lookGamma)
+                          + (g_lookWidth != "0" ? " + upscale " + g_lookWidth : "")
+                          + " + cas " + g_lookCas
+                        : ", look: off") << ")\n";
         pipe = popen(buildEncodeCmd(venc, m.OW, m.OH, fps, out).c_str(), PIPE_WMODE);
         if (!pipe) useFfmpeg = false;   // couldn't spawn - fall back below
     }
     if (!useFfmpeg)
     {
-        cout << "encoder: OpenCV avc1 (ffmpeg unavailable - using built-in writer)\n";
+        cout << "encoder: OpenCV avc1 (ffmpeg unavailable - using built-in writer; "
+                "the look pass needs ffmpeg and is SKIPPED)\n";
         writer.open(out, VideoWriter::fourcc('a', 'v', 'c', '1'), fps, Size(m.OW, m.OH));
         if (!writer.isOpened()) return "ERROR: cannot open output video";
     }
@@ -1083,6 +1133,10 @@ static string buildCliCommand(const string &source, const string &calibDir,
     if (!cropArg.empty())     c += " --crop " + q(cropArg);
     if (startFrame > 0)       c += " --start " + to_string(startFrame);
     if (endFrame >= 0)        c += " --end " + to_string(endFrame);
+    if (!g_look)              c += " --no-look";
+    if (g_lookCas != "0.35")  c += " --cas " + g_lookCas;
+    if (!g_lookGamma.empty()) c += " --gamma " + g_lookGamma;
+    if (g_lookWidth != "3840") c += " --look-width " + g_lookWidth;
     c += " --jobs " + to_string(jobs) + " --out-file " + q(outFile);
     return c;
 }
@@ -1738,6 +1792,11 @@ static int runParallelJobs(const string &source, const string &calibDir,
             + (cropArg.empty() ? "" : " --crop " + q(cropArg))
             + " --jobs 1 --start " + to_string(s) + " --end " + to_string(e)
             + " --venc " + q(resolvedEnc) + " --bitrate " + q(g_vbitrate)
+            // Pin the look pass too: every part must encode with the identical
+            // filter chain or the lossless -c copy concat would mix frame sizes.
+            + (g_look ? "" : " --no-look")
+            + " --cas " + q(g_lookCas) + " --look-width " + q(g_lookWidth)
+            + (g_lookGamma.empty() ? "" : " --gamma " + q(g_lookGamma))
             + " --progress-file " + q(prg)
             + " --out-file " + q(part) + " > " + q(log) + " 2>&1");
     }
@@ -1856,7 +1915,15 @@ int main(int argc, char **argv)
     // parent hands its resolved pick to --jobs children); --bitrate sets -b:v.
     g_forceCpu   = hasArg(argc, argv, "--cpu") || hasArg(argc, argv, "--no-hwenc");
     g_vencExplicit = argVal(argc, argv, "--venc", "");
-    g_vbitrate   = argVal(argc, argv, "--bitrate", "25M");
+    // Delivery look pass (see the g_look globals). Parsed before the bitrate so the
+    // bitrate default can track the output size: the look's 4K upscale needs more
+    // bits per second than the bare ~2660-wide pano (same bits/pixel).
+    g_look       = !hasArg(argc, argv, "--no-look");
+    g_lookCas    = argVal(argc, argv, "--cas", "0.35");
+    g_lookGamma  = argVal(argc, argv, "--gamma", "");
+    g_lookWidth  = argVal(argc, argv, "--look-width", "3840");
+    g_vbitrate   = argVal(argc, argv, "--bitrate",
+                          (g_look && g_lookWidth != "0") ? "40M" : "25M");
     // Attach the recording's audio after the stitch (mux from the .sync.json sidecar).
     // --audio auto-finds the sidecar next to --source; --audio-file names it. Never
     // passed to --jobs children, so only the top-level render attaches.
