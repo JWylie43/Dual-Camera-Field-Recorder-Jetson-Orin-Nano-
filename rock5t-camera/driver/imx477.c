@@ -102,12 +102,21 @@ MODULE_PARM_DESC(trigger_mode, "Set vsync trigger mode: 1=source, 2=sink");
 #define IMX477_LONG_EXP_SHIFT_MAX	7
 #define IMX477_LONG_EXP_SHIFT_REG	0x3100
 
-/* Analog gain control: gain = 1024 / (1024 - code), code 0..978 */
-#define IMX477_REG_ANALOG_GAIN		0x0204
-#define IMX477_ANA_GAIN_MIN		0
-#define IMX477_ANA_GAIN_MAX		978
-#define IMX477_ANA_GAIN_STEP		1
-#define IMX477_ANA_GAIN_DEFAULT		0x0
+/*
+ * Analog gain control, Rockchip vendor convention (as the imx577 vendor
+ * driver): V4L2_CID_ANALOGUE_GAIN takes LINEAR gain in 1/16 units
+ * (16 = 1.0x, 32 = 2.0x, ...) - this is what rkaiq and the IQ file's
+ * gain model assume.  The driver converts internally to the Sony
+ * hyperbolic register code: reg = 1024 - 1024 * 16 / ctrl_val, clamped
+ * to the IMX477 register ceiling 978 (= ~22.26x analog).
+ */
+#define IMX477_REG_GAIN_H		0x0204
+#define IMX477_REG_GAIN_L		0x0205
+#define IMX477_GAIN_MIN			0x10	/* 1.0x */
+#define IMX477_GAIN_MAX			356	/* ~22.26x -> reg code 978 */
+#define IMX477_GAIN_STEP		1
+#define IMX477_GAIN_DEFAULT		0x20	/* 2.0x */
+#define IMX477_ANA_GAIN_CODE_MAX	978
 
 /* Digital gain control: 8.8 fixed point, 0x0100 = 1.0x */
 #define IMX477_REG_DIGITAL_GAIN		0x020e
@@ -136,6 +145,9 @@ MODULE_PARM_DESC(trigger_mode, "Set vsync trigger mode: 1=source, 2=sink");
 
 #define IMX477_FETCH_EXP_H(VAL)		(((VAL) >> 8) & 0xFF)
 #define IMX477_FETCH_EXP_L(VAL)		((VAL) & 0xFF)
+
+#define IMX477_FETCH_AGAIN_H(VAL)	(((VAL) >> 8) & 0x03)
+#define IMX477_FETCH_AGAIN_L(VAL)	((VAL) & 0xFF)
 
 #define REG_NULL			0xFFFF
 
@@ -2115,6 +2127,7 @@ static int imx477_set_ctrl(struct v4l2_ctrl *ctrl)
 	struct i2c_client *client = imx477->client;
 	s64 max;
 	int ret = 0;
+	u32 again = 0;
 
 	/* Propagate change of current control to all related controls */
 	switch (ctrl->id) {
@@ -2141,12 +2154,27 @@ static int imx477_set_ctrl(struct v4l2_ctrl *ctrl)
 		dev_dbg(&client->dev, "set exposure 0x%x\n", ctrl->val);
 		break;
 	case V4L2_CID_ANALOGUE_GAIN:
-		/* gain = 1024 / (1024 - code), code = 0..978 */
-		ret = imx477_write_reg(imx477->client,
-				       IMX477_REG_ANALOG_GAIN,
-				       IMX477_REG_VALUE_16BIT,
-				       ctrl->val);
-		dev_dbg(&client->dev, "set analog gain 0x%x\n", ctrl->val);
+		/* gain_reg = 1024 - 1024 / gain_ana
+		 * manual multiple 16 to add accuracy:
+		 * then formula change to:
+		 * gain_reg = 1024 - 1024 * 16 / (gain_ana * 16)
+		 */
+		if (ctrl->val > IMX477_GAIN_MAX)
+			ctrl->val = IMX477_GAIN_MAX;
+		if (ctrl->val < IMX477_GAIN_MIN)
+			ctrl->val = IMX477_GAIN_MIN;
+
+		again = 1024 - 1024 * 16 / ctrl->val;
+		if (again > IMX477_ANA_GAIN_CODE_MAX)
+			again = IMX477_ANA_GAIN_CODE_MAX;
+		ret = imx477_write_reg(imx477->client, IMX477_REG_GAIN_H,
+				       IMX477_REG_VALUE_08BIT,
+				       IMX477_FETCH_AGAIN_H(again));
+		ret |= imx477_write_reg(imx477->client, IMX477_REG_GAIN_L,
+					IMX477_REG_VALUE_08BIT,
+					IMX477_FETCH_AGAIN_L(again));
+		dev_dbg(&client->dev, "set analog gain 0x%x (reg 0x%x)\n",
+			ctrl->val, again);
 		break;
 	case V4L2_CID_DIGITAL_GAIN:
 		ret = imx477_write_reg(imx477->client,
@@ -2233,10 +2261,10 @@ static int imx477_initialize_controls(struct imx477 *imx477)
 
 	imx477->anal_gain = v4l2_ctrl_new_std(handler, &imx477_ctrl_ops,
 					      V4L2_CID_ANALOGUE_GAIN,
-					      IMX477_ANA_GAIN_MIN,
-					      IMX477_ANA_GAIN_MAX,
-					      IMX477_ANA_GAIN_STEP,
-					      IMX477_ANA_GAIN_DEFAULT);
+					      IMX477_GAIN_MIN,
+					      IMX477_GAIN_MAX,
+					      IMX477_GAIN_STEP,
+					      IMX477_GAIN_DEFAULT);
 
 	imx477->digi_gain = v4l2_ctrl_new_std(handler, &imx477_ctrl_ops,
 					      V4L2_CID_DIGITAL_GAIN,

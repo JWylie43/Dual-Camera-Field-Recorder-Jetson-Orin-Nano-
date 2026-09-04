@@ -23,8 +23,10 @@ the structural base:
 sensor facts:
 - chip ID 0x0477 at reg 0x0016
 - `mode_common_regs` (one-time init table) and the three mode tables
-- exposure (0x0202, offset 22, min 4), analog gain (0x0204, linear code
-  0..978, gain = 1024/(1024-code)), digital gain (0x020e, 8.8 fixed point)
+- exposure (0x0202, offset 22, min 4), analog gain register facts (0x0204,
+  code 0..978, gain = 1024/(1024-code) — but see deviation 8: the V4L2
+  control contract is the Rockchip linear one), digital gain (0x020e, 8.8
+  fixed point)
 - VTS via 0x0340 with the long-exposure shift register 0x3100
   (`long_exp_shift`, max 7)
 - on-sensor DPC regs 0x0b05/0x0b06 (module param `dpc_enable`, default on)
@@ -113,9 +115,17 @@ for a 2160-row window is unpublished; verify on first stream test.
 7. hflip/vflip and the test-pattern RGB component controls were dropped
    (flips change the Bayer order, which the rkaiq IQ matching doesn't
    handle); Bayer order is fixed SRGGB.
-8. Analog gain is the raw IMX477 register code (0..978), not the imx577's
-   1024-based transform — rkaiq IQ files for this sensor must use the same
-   convention.
+8. **Analog gain follows the Rockchip vendor contract, not the RPi one**:
+   V4L2_CID_ANALOGUE_GAIN takes linear gain in 1/16 units (range 16..356,
+   step 1, default 32 = 2.0x) and the driver converts internally with the
+   imx577 reference's exact formula `reg = 1024 - 1024 * 16 / ctrl_val`
+   (integer division), clamped to the IMX477 register ceiling 978
+   (~22.26x; ctrl 356 -> reg 978). This is what rkaiq's AE and the
+   translated IQ file's sensor_calib gain model assume (the IQ
+   TRANSLATION_NOTES flag it as checklist item #1). Unlike the imx577,
+   gains above the analog ceiling do NOT spill into digital gain here —
+   digital gain stays a separate V4L2_CID_DIGITAL_GAIN control (0x020e,
+   8.8 fixed point, RPi convention).
 
 ## TODO(compile-check) / risks
 
