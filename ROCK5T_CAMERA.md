@@ -1,5 +1,10 @@
 # Raspberry Pi HQ Camera (IMX477) on the ROCK 5T
 
+> **Resuming this work (e.g. cables arrived)? Start with
+> [`NEXT_STEPS.md`](NEXT_STEPS.md)** — a self-contained handoff: current state,
+> how to operate the board, and the exact next-step sequence.
+
+
 Goal: run the two genlocked Pi HQ cameras on the **Radxa ROCK 5T** (RK3588).
 Three deliverables, none of which exist today: a **kernel driver**, a
 **device-tree overlay**, and an **ISP tuning (IQ) file**. The XVS genlock
