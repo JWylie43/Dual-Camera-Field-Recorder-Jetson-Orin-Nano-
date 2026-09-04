@@ -193,19 +193,24 @@ print('sensor_calib: resolution 4056x3040, CISTimeRegMin 4; gain model kept (lin
 # light.  Strategy: the shutter does ALL the work up to the frame limit
 # (33ms @30fps); analog gain stays pinned at 1.0 across the whole shutter
 # range and only rises to 2.0 as an absolute last resort at full shutter
-# (deep-shade / dusk safety margin so AE degrades to slightly-noisy instead
-# of black).  ISP digital gain is never used.  For actual recordings, manual
-# matched exposure overrides AE anyway -- this governs previews and any
-# auto-exposure sessions (see recorder/ae_follower.py: cam0 is the only AE).
+# of black).  ISP digital gain is never used.
+#
+# SPORTS BLUR CEILING: motion blur is the quality metric for game footage,
+# so the shutter is CAPPED AT 8ms -- past that, AE prefers gain 2.0 over
+# more blur, and only once gain is exhausted may the shutter extend to the
+# 33ms frame limit (truly dark scenes: degrade to blurry-but-visible).
+# Adaptation budget: sun ~1ms -> 8ms (3 stops) -> gain 2 (1 stop) = 4 stops,
+# covering sun-to-overcast with blur bounded and noise capped at gain 2.
+# The 8ms number is a taste call -- revisit with real game clips at bring-up.
 ae_route = isp['ae_calib']['LinearAeCtrl']['Route']
-ae_route['TimeDot'] = [0, 0.0005, 0.002, 0.008, 0.033, 0.033]
+ae_route['TimeDot'] = [0, 0.0005, 0.002, 0.008, 0.008, 0.033]
 ae_route['TimeDot_len'] = 6
-ae_route['GainDot'] = [1, 1, 1, 1, 1, 2]
+ae_route['GainDot'] = [1, 1, 1, 1, 2, 2]
 ae_route['GainDot_len'] = 6
 ae_route['IspDGainDot'] = [1, 1, 1, 1, 1, 1]
 ae_route['IspDGainDot_len'] = 6
-print('AE route: shutter-first daylight strategy -- gain pinned 1.0, '
-      'ceiling 2.0 at full shutter only, ISP dgain off')
+print('AE route: daylight sports strategy -- shutter capped 8ms, then gain '
+      'to 2.0, 33ms only as last resort; ISP dgain off')
 
 # ================================================================ write + validate
 # Serialize in the cJSON style rkaiq itself writes (and the skeleton ships in):
