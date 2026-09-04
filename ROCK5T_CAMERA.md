@@ -37,6 +37,41 @@ straight into the new driver.
    curve, CCMs at ~8 color temperatures, gamma. The IQ file is a translation
    into the rkisp v30 JSON, not a re-measurement.
 
+## Bring-up log (2026-09-04): software stack VALIDATED on hardware, awaiting cameras
+
+First install on the actual ROCK 5T (kernel 6.1.84-8-rk2410) — everything
+that can be proven without cameras is proven:
+
+- **Driver compiles clean** first try against the installed headers (only the
+  cosmetic Debian gcc point-release warning); `imx477.ko` vermagic matches the
+  running kernel; `trigger_mode` + `dpc_enable` params present.
+- **Overlay compiles** (only cosmetic graph_child_address warnings) to a 10.5KB
+  dtbo. Activated via `u-boot-update` (this image retired uEnv.txt; overlays =
+  every non-`.disabled` *.dtbo in /boot/dtbo/, baked into extlinux.conf's
+  `fdtoverlays` line).
+- **After reboot:** overlay applied — both chains live (`rkcif-mipi-lvds2` +
+  `rkcif-mipi-lvds4`) and **both** ISP mainpaths registered (`rkisp0-vir0`
+  video22-28, `rkisp1-vir1` video31-37). Driver auto-loaded via modalias,
+  bound BOTH nodes (`imx477 3-001a`, `imx477 4-001a`), fell back gracefully on
+  the absent reset/pwdn GPIOs + regulators (Pi HQ self-powers — by design),
+  reached the chip-ID read and reported `Unexpected sensor id(0000), ret(-5)`
+  on both buses — the correct "no sensor connected" signal.
+
+**Install steps that worked** (from ~/orin-recorder/rock5t-camera):
+```
+cd driver && make && sudo cp imx477.ko /lib/modules/$(uname -r)/kernel/drivers/media/i2c/ && sudo depmod -a
+sudo cp iqfiles/imx477_RPI-HQ_default.json /etc/iqfiles/
+cd overlay && H=/usr/src/linux-headers-$(uname -r); cpp -nostdinc -I "$H/include" -undef -x assembler-with-cpp rock-5t-dual-rpi-hq-imx477.dts | dtc -I dts -O dtb -@ -o rock-5t-dual-rpi-hq-imx477.dtbo
+sudo cp rock-5t-dual-rpi-hq-imx477.dtbo /boot/dtbo/ && sudo u-boot-update && sudo reboot
+```
+
+**At cable time**, expected success: `imx477 N-001a: ... sensor id 0x0477`,
+probe succeeds, `i2cdetect -y 3` / `-y 4` show `UU` at 0x1a, video pipeline
+completes. Then: `v4l2-ctl` raw smoke test -> rkaiq/ISP path (uses the IQ
+file) -> port sync_test.sh for genlock. If probe still reads 0000 WITH a
+camera attached, suspect cable/connector seating first, then the RPi-HQ R8
+power-down issue (see rpi-hq-camera-orin memory / RidgeRun).
+
 ## Status (2026-09-03): all three pieces DRAFTED, awaiting hardware
 
 - **Driver**: `rock5t-camera/driver/imx477.c` + Makefile + NOTES.md — Rockchip
