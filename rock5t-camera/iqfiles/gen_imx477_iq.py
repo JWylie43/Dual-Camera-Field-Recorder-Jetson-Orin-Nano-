@@ -188,6 +188,25 @@ sc['resolution'] = {'width': 4056, 'height': 3040}       # imx477 full active ar
 sc['CISTimeSet']['Linear']['CISTimeRegMin'] = 4          # imx477 kernel: min 4 lines
 print('sensor_calib: resolution 4056x3040, CISTimeRegMin 4; gain model kept (linear 1..16x)')
 
+# ================================================================ 8. AE route (daylight rig)
+# The rig records outdoors only, and analog gain adds noise without adding
+# light.  Strategy: the shutter does ALL the work up to the frame limit
+# (33ms @30fps); analog gain stays pinned at 1.0 across the whole shutter
+# range and only rises to 2.0 as an absolute last resort at full shutter
+# (deep-shade / dusk safety margin so AE degrades to slightly-noisy instead
+# of black).  ISP digital gain is never used.  For actual recordings, manual
+# matched exposure overrides AE anyway -- this governs previews and any
+# auto-exposure sessions (see recorder/ae_follower.py: cam0 is the only AE).
+ae_route = isp['ae_calib']['LinearAeCtrl']['Route']
+ae_route['TimeDot'] = [0, 0.0005, 0.002, 0.008, 0.033, 0.033]
+ae_route['TimeDot_len'] = 6
+ae_route['GainDot'] = [1, 1, 1, 1, 1, 2]
+ae_route['GainDot_len'] = 6
+ae_route['IspDGainDot'] = [1, 1, 1, 1, 1, 1]
+ae_route['IspDGainDot_len'] = 6
+print('AE route: shutter-first daylight strategy -- gain pinned 1.0, '
+      'ceiling 2.0 at full shutter only, ISP dgain off')
+
 # ================================================================ write + validate
 # Serialize in the cJSON style rkaiq itself writes (and the skeleton ships in):
 # tab indentation, '":\t"' separator, scalar arrays inline on one line.

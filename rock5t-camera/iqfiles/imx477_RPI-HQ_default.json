@@ -221,11 +221,11 @@
 									"InitHDCIrisTargetValue":	1023
 								},
 								"Route":	{
-									"TimeDot":	[0, 0.01, 0.01, 0.02, 0.03, 0.03],
+									"TimeDot":	[0, 0.0005, 0.002, 0.008, 0.033, 0.033],
 									"TimeDot_len":	6,
-									"GainDot":	[1, 1, 4, 8, 15.5, 64],
+									"GainDot":	[1, 1, 1, 1, 1, 2],
 									"GainDot_len":	6,
-									"IspDGainDot":	[1, 1, 1, 1, 1, 2],
+									"IspDGainDot":	[1, 1, 1, 1, 1, 1],
 									"IspDGainDot_len":	6,
 									"PIrisDot":	[512, 512, 512, 512, 512, 512],
 									"PIrisDot_len":	6
