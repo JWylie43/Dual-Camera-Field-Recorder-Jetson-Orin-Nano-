@@ -32,16 +32,48 @@ sensor facts:
   stop-stream EXTOUT_EN=0 write
 - XCLR power-on delay (8ms, datasheet T7)
 
-## Modes (all 2-lane, link freq 450 MHz = 900 Mbps/lane)
+**NVIDIA/RidgeRun nv_imx477 driver** (`imx477_mode_tbls.h`, fetched from
+the L4T public sources mirror
+`github.com/Consti10/Linux_for_Tegra .../kernel/nvidia/drivers/media/i2c/`,
+RidgeRun copyright 2020 — the same nv_imx477 already validated on the
+Jetson Orin) — source for the 3840x2160@30 mode:
+- its `imx477_mode_4032x3040_30fps` table: RAW10, 2-lane, line length
+  9024, frame length 3102, IOP PLL 24MHz/3*262 = 2096MHz VCO with IOPSYCK
+  div 1 -> 2096 Mbps/lane -> **1048 MHz link frequency**; full MIPI
+  global-timing register set for that rate (0x080a..0x0819,
+  0xe04c..0xe04f)
 
-| Mode | Format | HTS | VTS def | Max fps |
-|---|---|---|---|---|
-| 4056x3040 | SRGGB12 | 24000 | 3500 | 10 |
-| 2028x1520 (2x2 bin) | SRGGB12 | 12740 | 1648 | 40 |
-| 1332x990 (bin+crop) | SRGGB10 | 6664 | 1050 | 120 |
+## Modes (all 2-lane)
+
+| Mode | Format | HTS | VTS def | Max fps | Link freq |
+|---|---|---|---|---|---|
+| 4056x3040 | SRGGB12 | 24000 | 3500 | 10 | 450 MHz |
+| 2028x1520 (2x2 bin) | SRGGB12 | 12740 | 1648 | 40 | 450 MHz |
+| 1332x990 (bin+crop) | SRGGB10 | 6664 | 1050 | 120 | 450 MHz |
+| 3840x2160 (crop) | SRGGB10 | 9024 | 3102 | 30 | 1048 MHz |
 
 The RPi 2028x1080 50fps crop mode was left out (easy to add later: another
 table + mode entry).
+
+### 3840x2160@30 mode provenance (copied vs derived)
+
+Copied verbatim from nv_imx477's validated `imx477_mode_4032x3040_30fps`
+(which reads MORE rows/frame than 4K at the same link rate, so the rate is
+silicon-proven): all PLL/link registers, line length 9024, frame length
+3102, MIPI global timing, readout config, plus the 10-bit support regs
+(0x420b..0x9a4d) that nv_imx477 keeps in its common table (prepended to
+the mode table here, exactly as the RPi driver does for its 10-bit mode).
+
+Derived (only the window):
+- analog crop Y = rows 440..2599 (0x0346/47=0x01b8, 0x034a/4b=0x0a27) —
+  cross-validated: the RPi driver's own 2028x1080 mode uses these exact
+  values for the same centred 2160-row window
+- digital crop X offset 108 = (4056-3840)/2 (0x0409=0x6c), Y offset 0
+- crop/output size 3840x2160 (0x040c..0x040f, 0x034c..0x034f)
+
+One `TODO(compile-check)` left in the table: 0x3f56/0x3f57 (per-mode Sony
+readout/powersave timing) reused from the 4032x3040 table since the value
+for a 2160-row window is unpublished; verify on first stream test.
 
 ## Deliberate deviations from the references
 
@@ -103,7 +135,15 @@ uncertain spots are listed here instead:
   clamp to `0xffdc - height`.
 - CROP_BOUNDS for the 2028/1332 modes returns the full mode size (imx577
   behaviour); if rkisp complains about 16-pixel alignment on 2028-wide
-  modes, mirror the 4048 trick there.
+  modes, mirror the 4048 trick there (3840 and 2160 are already aligned).
+- **4K mode link rate**: 2096 Mbps/lane is above D-PHY v1.2 (1.5G) but
+  within both the IMX477 (2.1G/lane max) and the RK3588 D-PHY RX (2.5G)
+  limits. Risks for first stream test: the RK3588 CSI2/DPHY driver must
+  pick up the 1048MHz entry from V4L2_CID_LINK_FREQ (the driver switches
+  the control per-mode in set_fmt, imx577-style); flex/cable signal
+  integrity at 2.1G-class rates; and nv_imx477's odd 0x0820/0x0821 value
+  (0x20c0 = 8384 "Mbps" vs the expected 4192 total) was copied verbatim
+  since it streamed fine on Jetson.
 
 ## Build / install on the ROCK 5T
 

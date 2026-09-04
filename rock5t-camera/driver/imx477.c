@@ -61,10 +61,14 @@ module_param(trigger_mode, int, 0644);
 MODULE_PARM_DESC(trigger_mode, "Set vsync trigger mode: 1=source, 2=sink");
 
 /*
- * All modes run the CSI-2 link at 450MHz (900Mbps/lane, 2 lanes = 1800Mbps
- * total: registers 0x0820/0x0821 = 0x0708 in the mode tables).
+ * The Raspberry Pi modes run the CSI-2 link at 450MHz (900Mbps/lane,
+ * 2 lanes = 1800Mbps total: registers 0x0820/0x0821 = 0x0708 in those mode
+ * tables).  The 3840x2160@30 mode uses the NVIDIA/RidgeRun nv_imx477 IOP
+ * PLL configuration instead: 24MHz / 3 * 262 = 2096MHz VCO with IOPSYCK
+ * divider 1, i.e. 2096Mbps/lane DDR = 1048MHz link frequency.
  */
 #define IMX477_LINK_FREQ_450MHZ		450000000U
+#define IMX477_LINK_FREQ_1048MHZ	1048000000U
 
 /*
  * The IMX477 internal pixel array clock is fixed at 840MHz for all of these
@@ -919,6 +923,164 @@ static __maybe_unused const struct regval imx477_linear_10bit_1332x990_120fps_re
 };
 
 /*
+ * 3840x2160 30fps, RAW10, no binning, centred crop of the pixel array.
+ *
+ * Based on the NVIDIA/RidgeRun nv_imx477 driver's
+ * imx477_mode_4032x3040_30fps table (imx477_mode_tbls.h) - the exact
+ * mode/PLL configuration already validated on this sensor over 2 lanes on
+ * the Jetson Orin, which reads MORE rows per frame than this mode at the
+ * same link rate.  Copied verbatim except:
+ *  - analog crop Y window: rows 440..2599 (2160 rows, centred); these are
+ *    the same values the Raspberry Pi driver's 2028x1080 crop mode uses
+ *    (0x0346/47 = 0x01b8, 0x034a/4b = 0x0a27)
+ *  - digital crop: x offset 108 ((4056-3840)/2), y offset 0, 3840x2160
+ *  - output size registers 0x034c..0x034f: 3840x2160
+ * The 10-bit-mode support registers (0x420b..0x9a4d) that nv_imx477 keeps
+ * in its common table are prepended here instead, exactly as the Raspberry
+ * Pi driver does for its own 10-bit mode table.
+ * Line length 9024 and frame length 3102 (30.03fps at the 840MHz internal
+ * pixel clock) are unchanged from the validated NVIDIA mode.
+ */
+static __maybe_unused const struct regval imx477_linear_10bit_3840x2160_30fps_regs[] = {
+	{0x420b, 0x01},
+	{0x990c, 0x00},
+	{0x990d, 0x08},
+	{0x9956, 0x8c},
+	{0x9957, 0x64},
+	{0x9958, 0x50},
+	{0x9a48, 0x06},
+	{0x9a49, 0x06},
+	{0x9a4a, 0x06},
+	{0x9a4b, 0x06},
+	{0x9a4c, 0x06},
+	{0x9a4d, 0x06},
+	{0x0112, 0x0a},
+	{0x0113, 0x0a},
+	{0x0114, 0x01},
+	{0x0342, 0x23},
+	{0x0343, 0x40},
+	{0x0340, 0x0c},
+	{0x0341, 0x1e},
+	{0x0344, 0x00},
+	{0x0345, 0x00},
+	{0x0346, 0x01},
+	{0x0347, 0xb8},
+	{0x0348, 0x0f},
+	{0x0349, 0xd7},
+	{0x034a, 0x0a},
+	{0x034b, 0x27},
+	{0x00e3, 0x00},
+	{0x00e4, 0x00},
+	{0x00fc, 0x0a},
+	{0x00fd, 0x0a},
+	{0x00fe, 0x0a},
+	{0x00ff, 0x0a},
+	{0x0220, 0x00},
+	{0x0221, 0x11},
+	{0x0381, 0x01},
+	{0x0383, 0x01},
+	{0x0385, 0x01},
+	{0x0387, 0x01},
+	{0x0900, 0x00},
+	{0x0901, 0x11},
+	{0x0902, 0x02},
+	{0x3140, 0x02},
+	{0x3c00, 0x00},
+	{0x3c01, 0x01},
+	{0x3c02, 0x9c},
+	{0x3f0d, 0x00},
+	{0x5748, 0x00},
+	{0x5749, 0x00},
+	{0x574a, 0x00},
+	{0x574b, 0xa4},
+	{0x7b75, 0x0e},
+	{0x7b76, 0x09},
+	{0x7b77, 0x08},
+	{0x7b78, 0x06},
+	{0x7b79, 0x34},
+	{0x7b53, 0x00},
+	{0x9369, 0x73},
+	{0x936b, 0x64},
+	{0x936d, 0x5f},
+	{0x9304, 0x03},
+	{0x9305, 0x80},
+	{0x9e9a, 0x2f},
+	{0x9e9b, 0x2f},
+	{0x9e9c, 0x2f},
+	{0x9e9d, 0x00},
+	{0x9e9e, 0x00},
+	{0x9e9f, 0x00},
+	{0xa2a9, 0x27},
+	{0xa2b7, 0x03},
+	{0x0401, 0x00},
+	{0x0404, 0x00},
+	{0x0405, 0x10},
+	/* digital crop: x offset 108, y offset 0, 3840x2160 (derived) */
+	{0x0408, 0x00},
+	{0x0409, 0x6c},
+	{0x040a, 0x00},
+	{0x040b, 0x00},
+	{0x040c, 0x0f},
+	{0x040d, 0x00},
+	{0x040e, 0x08},
+	{0x040f, 0x70},
+	{0x034c, 0x0f},
+	{0x034d, 0x00},
+	{0x034e, 0x08},
+	{0x034f, 0x70},
+	{0x0301, 0x05},
+	{0x0303, 0x02},
+	{0x0305, 0x02},
+	{0x0306, 0x00},
+	{0x0307, 0xaf},
+	{0x0309, 0x0a},
+	{0x030b, 0x01},
+	{0x030d, 0x03},
+	{0x030e, 0x01},
+	{0x030f, 0x06},
+	{0x0310, 0x01},
+	{0x0820, 0x20},
+	{0x0821, 0xc0},
+	{0x0822, 0x00},
+	{0x0823, 0x00},
+	{0x080a, 0x00},
+	{0x080b, 0xc7},
+	{0x080c, 0x00},
+	{0x080d, 0x87},
+	{0x080e, 0x00},
+	{0x080f, 0xdf},
+	{0x0810, 0x00},
+	{0x0811, 0x97},
+	{0x0812, 0x00},
+	{0x0813, 0x8f},
+	{0x0814, 0x00},
+	{0x0815, 0x7f},
+	{0x0816, 0x02},
+	{0x0817, 0x27},
+	{0x0818, 0x00},
+	{0x0819, 0x6f},
+	{0xe04c, 0x00},
+	{0xe04d, 0xdf},
+	{0xe04e, 0x00},
+	{0xe04f, 0x1f},
+	{0x3e20, 0x01},
+	{0x3e37, 0x00},
+	{0x3f50, 0x00},
+	/*
+	 * TODO(compile-check): 0x3f56/0x3f57 copied from the validated
+	 * NVIDIA 4032x3040@30 table; these vary per mode in Sony tables
+	 * (readout/powersave timing) and the value for a 2160-row window
+	 * is not published.  Reused as-is since PLL/link config and line
+	 * length are identical and this mode reads fewer rows - verify on
+	 * first stream test.
+	 */
+	{0x3f56, 0x00},
+	{0x3f57, 0x56},
+	{0x3ff9, 0x01},
+	{REG_NULL, 0x00},
+};
+
+/*
  * HTS values are in units of the 840MHz internal pixel clock (as in the
  * Raspberry Pi driver's line_length_pix).  VTS defaults are computed from
  * the mode's max frame rate: vts = IMX477_PIXEL_RATE / (fps * hts).
@@ -978,10 +1140,29 @@ static const struct imx477_mode supported_modes[] = {
 		.link_freq_idx = 0,
 		.vc[PAD0] = 0,
 	},
+	{
+		/* 16:9 4K 30fps mode (nv_imx477 PLL, 1048MHz link freq) */
+		.width = 3840,
+		.height = 2160,
+		.max_fps = {
+			.numerator = 10000,
+			.denominator = 300000,
+		},
+		.exp_def = 0x0640,
+		.hts_def = 0x2340,	/* 9024 */
+		.vts_def = 0x0c1e,	/* 3102 -> 30.03 fps */
+		.bpp = 10,
+		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
+		.reg_list = imx477_linear_10bit_3840x2160_30fps_regs,
+		.hdr_mode = NO_HDR,
+		.link_freq_idx = 1,
+		.vc[PAD0] = 0,
+	},
 };
 
 static const s64 link_freq_items[] = {
 	IMX477_LINK_FREQ_450MHZ,
+	IMX477_LINK_FREQ_1048MHZ,
 };
 
 static const char * const imx477_test_pattern_menu[] = {
