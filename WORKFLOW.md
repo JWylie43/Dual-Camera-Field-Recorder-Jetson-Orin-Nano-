@@ -221,20 +221,24 @@ The stitcher is in `stitching/`. Build once (`stitch.bat` on Windows / `./stitch
 stitch.bat              # Windows
 ```
 
-Opens a browser tuner: **Import source…** → align the far/near edges → **Stitch all frames** (native "save as" dialog for the output). The tuner also shows the **equivalent CLI command** so you can reproduce a tuned render by hand.
+Opens a browser tuner: **Import source…** (geometry auto‑aligns itself on import — a few seconds while it measures) → drag the **crop box**, set **rotate** if the field is tilted → **Stitch all frames** (native "save as" dialog for the output). The old far/near shift knobs are gone; the measured values show read‑only in the bar and in the **equivalent CLI command**, so a tuned render is still reproducible by hand. A **parallax morph** checkbox (off by default) enables per‑pixel de‑ghosting in the overlap — try it when players near the seam double.
 
 ### 3b. Command line (headless)
 
 ```
-build\Release\StitchPipeline.exe --source "game_seekable.mkv" --shift-top 4 --shift-bottom 20 --jobs 6 --out-file "stitched.mp4"
+build\Release\StitchPipeline.exe --source "game_seekable.mkv" --jobs 6 --out-file "stitched.mp4"
 ```
+
+Alignment is measured automatically from the footage (printed as `auto-align: …` — those values also appear in the equivalent‑command line). Passing any `--shift-*` flag pins it manually and skips the measurement.
 
 Common flags:
 
 | Flag | Meaning |
 |---|---|
 | `--source <file>` | input video (or image) |
-| `--shift-top N` / `--shift-bottom N` | far/near edge alignment (your tuned values) |
+| `--shift-top N` / `--shift-bottom N` | manual far/near alignment override (default: auto‑measured) |
+| `--no-auto-align` | skip the measurement, keep shifts at 0 |
+| `--parallax` | per‑pixel flow morph in the overlap: de‑ghosts players at any depth (slower; opt‑in) |
 | `--crop x,y,w,h` | restrict to a bounding box (full‑canvas coords) |
 | `--start N` / `--end N` | frame range (see time→frame below) |
 | `--jobs N` | parallel processes (default **4**; ~6 saturates our GPU) |
@@ -269,7 +273,7 @@ resolution (counters the camera ISP's baked‑in smoothing without halos).
 - 3:00 → `180 × 30 = 5400`
 
 ```
-build\Release\StitchPipeline.exe --source "game_seekable.mkv" --shift-top 4 --shift-bottom 20 --start 2700 --end 5400 --out-file "clip_1m30-3m.mp4"
+build\Release\StitchPipeline.exe --source "game_seekable.mkv" --start 2700 --end 5400 --out-file "clip_1m30-3m.mp4"
 ```
 
 ### 3d. Parallel stitch — important

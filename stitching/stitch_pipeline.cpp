@@ -10,16 +10,25 @@
 //   --tune  -> launch an interactive browser tuner (see below)
 //
 // Right-image alignment (applied as one affine before the hard-seam composite):
+//   AUTO by default - measured from the footage itself (autoAlignEstimate): dense
+//   optical flow across the warped overlap band, per-row medians (rejects players,
+//   locks onto the field), line fit -> shift-top/bottom, median vertical flow ->
+//   shift-y. Estimated once per source; a sign self-check keeps it convention-proof.
+//   Manual override (any of these skips the measurement):
 //   --shift-top N     horizontal shift of the TOP rows   (aligns the FAR edge)
 //   --shift-bottom N  horizontal shift of the BOTTOM rows (aligns the NEAR edge)
 //   --shift-y N       vertical shift of the whole image
+//   --no-auto-align   keep the defaults (0) without measuring
 // If top != bottom this is a vertical SHEAR: the per-row horizontal shift is
 // interpolated between the two, so a receding field (near at the bottom, far at the
 // top) lines up along a straight vertical seam. (--shift-x N sets top=bottom=N.)
+// The shear is a ground-plane fit; content off that plane (players) can still ghost:
+//   --parallax   per-pixel flow morph in the overlap (see parallaxMorph) - opt-in.
 //
 // --tune warps the first frame once, starts a localhost web server, opens a browser
-// to a live tuner where you adjust those values and click "Stitch all frames" to run
-// the full stitch (progress bar + done). One command; UI opens itself.
+// to a live tuner. Geometry is auto-aligned on import; you pick the crop box, seam
+// home column, and rotation, then click "Stitch all frames" (progress bar + done).
+// One command; UI opens itself.
 //
 // Parallel video stitch (default ON):
 //   --jobs N   split the frame range across N child processes, then ffmpeg-concat
@@ -52,6 +61,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
+#include <opencv2/video.hpp>     // DISOpticalFlow (auto-align + --parallax)
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -135,6 +145,14 @@ static bool   g_look       = true;   // --no-look: disable the whole look pass
 static string g_lookCas    = "0.35"; // --cas: sharpen strength 0..1 (0.3-0.45 sane)
 static string g_lookGamma  = "";     // --gamma: e.g. 1.1 lifts shadows/mids; empty = off
 static string g_lookWidth  = "3840"; // --look-width: upscale target width; 0 = keep pano size
+
+// ---- parallax morph (--parallax; default off) -----------------------------
+// Per-frame dense-flow morph inside the overlap band: both images are warped
+// toward each other across a ramp so content at EVERY depth converges before
+// the seam + blend run. Fixes ghosting the global shear can't (the shear is a
+// ground-plane fit; players are vertical and off that plane). Opt-in while it
+// is evaluated - it trades ghosting for possible slight seam-band wobble.
+static bool g_parallax = false;
 
 struct StitchMaps
 {
@@ -467,10 +485,115 @@ static void exposureMatch(const UMat &warpL, UMat &right, int seam, int OW, int 
     merge(ch, right);
 }
 
-static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
-                      double degrees, const Align &a, vector<int> *prevSeam = nullptr)
+// Carried across frames by the video loop so the parallax flow can be smoothed
+// temporally (prevents the correction shimmering on estimation noise).
+struct FlowState { Mat uLR, uRL; };
+
+// Parallax morph (--parallax): dense optical flow between the two warped images
+// inside the overlap band = the per-pixel parallax, measured directly (the flow's
+// horizontal component IS the stereo disparity; no metric depth needed). Each side
+// is then warped toward the other across a ramp: at the band's left edge the left
+// image is untouched, at the right edge the right image is untouched, and in
+// between content at ANY depth converges to one position - so the downstream seam
+// and multi-band blend see agreeing pixels instead of two offset copies.
+// Safety valves: a forward/backward consistency weight fades the morph to zero
+// where flow is unreliable (occlusions - a near body hiding different background
+// in each camera), so failure degrades to today's behavior, never worse.
+static void parallaxMorph(UMat &leftU, UMat &rightU, const StitchMaps &m, FlowState *st)
 {
-    UMat right = warpR;
+    int x0 = max(0, m.ox0), x1 = min(m.OW, m.ox1), bw = x1 - x0, OH = m.OH;
+    if (bw < 32 || OH < 32) return;
+    Rect band(x0, 0, bw, OH);
+    Mat L, R; leftU(band).copyTo(L); rightU(band).copyTo(R);
+    Mat gL, gR; cvtColor(L, gL, COLOR_BGR2GRAY); cvtColor(R, gR, COLOR_BGR2GRAY);
+
+    // Flow at half resolution (plenty for a smooth disparity field; ~4x cheaper),
+    // both directions - the disagreement between them is the confidence signal.
+    Mat gLh, gRh; resize(gL, gLh, Size(), 0.5, 0.5, INTER_AREA); resize(gR, gRh, Size(), 0.5, 0.5, INTER_AREA);
+    Ptr<DISOpticalFlow> dis = DISOpticalFlow::create(DISOpticalFlow::PRESET_FAST);
+    Mat uh, vh;
+    dis->calc(gLh, gRh, uh);   // L -> R
+    dis->calc(gRh, gLh, vh);   // R -> L
+    Mat u, v;
+    resize(uh, u, Size(bw, OH), 0, 0, INTER_LINEAR); u *= 2.0;
+    resize(vh, v, Size(bw, OH), 0, 0, INTER_LINEAR); v *= 2.0;
+
+    // Temporal smoothing: lean on the previous frame's field so the correction
+    // doesn't jitter on per-frame estimation noise. 75% new / 25% old keeps moving
+    // players responsive while damping shimmer on the near-static background.
+    if (st && st->uLR.size() == u.size())
+    {
+        addWeighted(u, 0.75, st->uLR, 0.25, 0.0, u);
+        addWeighted(v, 0.75, st->uRL, 0.25, 0.0, v);
+    }
+    if (st) { st->uLR = u.clone(); st->uRL = v.clone(); }
+
+    // Confidence: forward + backward flow should cancel (u(p) + v(p) ~ 0 for
+    // consistent matches; residuals are small post-align so same-pixel lookup is
+    // fine). Weight fades 1 -> 0 as the disagreement grows, is zeroed on invalid
+    // (black-wedge) pixels and on implausibly large vectors, then smoothed so the
+    // morph strength has no speckle.
+    Mat w(OH, bw, CV_32F);
+    for (int y = 0; y < OH; y++)
+    {
+        const Vec2f *up = u.ptr<Vec2f>(y);
+        const Vec2f *vp = v.ptr<Vec2f>(y);
+        const uchar *lp = gL.ptr<uchar>(y);
+        const uchar *rp = gR.ptr<uchar>(y);
+        float *wp = w.ptr<float>(y);
+        for (int x = 0; x < bw; x++)
+        {
+            float ex = up[x][0] + vp[x][0], ey = up[x][1] + vp[x][1];
+            float err = sqrtf(ex * ex + ey * ey);
+            float ww = 1.0f - err / 6.0f;
+            if (lp[x] < 5 || rp[x] < 5) ww = 0.f;
+            float mag = fabsf(up[x][0]) + fabsf(up[x][1]);
+            if (mag > 48.f) ww = 0.f;
+            wp[x] = max(0.f, min(1.f, ww));
+        }
+    }
+    GaussianBlur(w, w, Size(15, 15), 0);
+
+    // Build the two backward remaps. alpha = weight of the LEFT image's geometry
+    // (smoothstep 1 -> 0 across the band): left content lands at p + (1-a)*u, right
+    // content at p + a*v, so the pair meets in the middle and each side is
+    // untouched at the band edge where it is the sole contributor - the morphed
+    // band joins the untouched image outside the overlap with no discontinuity.
+    vector<float> alpha(bw);
+    for (int x = 0; x < bw; x++)
+    {
+        float t = bw > 1 ? (float)x / (bw - 1) : 0.f;
+        alpha[x] = 1.f - (3.f * t * t - 2.f * t * t * t);   // smoothstep, 1 at x0 -> 0 at x1
+    }
+    Mat mLx(OH, bw, CV_32F), mLy(OH, bw, CV_32F), mRx(OH, bw, CV_32F), mRy(OH, bw, CV_32F);
+    for (int y = 0; y < OH; y++)
+    {
+        const Vec2f *up = u.ptr<Vec2f>(y);
+        const Vec2f *vp = v.ptr<Vec2f>(y);
+        const float *wp = w.ptr<float>(y);
+        float *lx = mLx.ptr<float>(y), *ly = mLy.ptr<float>(y);
+        float *rx = mRx.ptr<float>(y), *ry = mRy.ptr<float>(y);
+        for (int x = 0; x < bw; x++)
+        {
+            float aL = (1.f - alpha[x]) * wp[x];   // how far LEFT content moves (toward right)
+            float aR = alpha[x] * wp[x];           // how far RIGHT content moves (toward left)
+            lx[x] = x - aL * up[x][0]; ly[x] = y - aL * up[x][1];
+            rx[x] = x - aR * vp[x][0]; ry[x] = y - aR * vp[x][1];
+        }
+    }
+    Mat Lm, Rm;
+    remap(L, Lm, mLx, mLy, INTER_LINEAR, BORDER_REPLICATE);
+    remap(R, Rm, mRx, mRy, INTER_LINEAR, BORDER_REPLICATE);
+    Lm.copyTo(leftU(band));
+    Rm.copyTo(rightU(band));
+}
+
+static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
+                      double degrees, const Align &a, vector<int> *prevSeam = nullptr,
+                      FlowState *flowState = nullptr)
+{
+    UMat left = warpL, right = warpR;
+    bool rightOwned = false;
     if (a.shiftTop != 0.0 || a.shiftBottom != 0.0 || a.shiftY != 0.0)
     {
         // Per-row horizontal shear (top->bottom) + vertical shift, as one affine.
@@ -482,27 +605,36 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
         double shiftTopEff = a.shiftTop + k * m.cropY;
         Mat T = (Mat_<double>(2, 3) << 1, k, shiftTopEff, 0, 1, a.shiftY);
         warpAffine(warpR, right, T, Size(m.OW, m.OH));
+        rightOwned = true;
     }
-    if (a.exposure) exposureMatch(warpL, right, m.seam, m.OW, m.OH);
+    if (a.exposure) exposureMatch(left, right, m.seam, m.OW, m.OH);
+    if (g_parallax)
+    {
+        // The morph writes into both images' overlap bands; clone whatever still
+        // aliases the caller's warp buffers so we never mutate its inputs.
+        left = warpL.clone();
+        if (!rightOwned) right = right.clone();
+        parallaxMorph(left, right, m, flowState);
+    }
     UMat mask;
     if (a.smartSeam)
     {
         vector<int> local;
         vector<int> &ps = prevSeam ? *prevSeam : local;   // temporal only within a video loop
-        mask = computeSeamMask(warpL, right, m.ox0, m.ox1, m.OW, m.OH, ps, m.seam);
+        mask = computeSeamMask(left, right, m.ox0, m.ox1, m.OW, m.OH, ps, m.seam);
     }
     else
         mask = straightMask(m.seam, m.OW, m.OH);
     UMat pano;
     if (a.bands > 0)
     {
-        pano = multiBandBlend(warpL, right, mask, a.bands);
+        pano = multiBandBlend(left, right, mask, a.bands);
     }
     else
     {
         UMat mask8; mask.convertTo(mask8, CV_8U, 255.0);
         pano = right.clone();
-        warpL.copyTo(pano, mask8);          // left where mask, right elsewhere
+        left.copyTo(pano, mask8);           // left where mask, right elsewhere
     }
     if (degrees != 0.0)
     {
@@ -532,6 +664,186 @@ static bool seekFrame(VideoCapture &cap, int n)
     for (int i = pos; i < n; i++)                     // grab the remainder (or all, from 0)
         if (!cap.grab()) return false;
     return true;
+}
+
+// ---- automatic geometric alignment (replaces the manual shear/shift knobs) ----
+// The shear the knobs set is a ground-plane parallax fit: displacement between the
+// two warped images that varies linearly with row. Those values are recoverable from
+// the footage itself: dense optical flow between the warped overlap bands measures
+// the per-pixel displacement, the PER-ROW MEDIAN rejects players (each row is mostly
+// field, so the median locks onto the background - the same judgment made by eye in
+// the tuner), and a line fit over the rows yields shift-top/shift-bottom; the median
+// vertical flow yields shift-y. Estimated once per source from a handful of frames
+// spread across the video; on unindexed files (no fast seek) it samples early frames
+// instead - the rig geometry is constant, so when they were shot doesn't matter.
+
+static float medianOf(vector<float> &v)
+{
+    if (v.empty()) return 0.f;
+    size_t k = v.size() / 2;
+    nth_element(v.begin(), v.begin() + k, v.end());
+    return v[k];
+}
+
+struct AutoAlignResult { bool ok = false; double shiftTop = 0, shiftBottom = 0, shiftY = 0; int frames = 0; };
+
+static AutoAlignResult autoAlignEstimate(const string &source, bool video, int totalFrames,
+                                         const StitchMaps &m)
+{
+    AutoAlignResult res;
+    int x0 = max(0, m.ox0), x1 = min(m.OW, m.ox1), bw = x1 - x0, OH = m.OH;
+    if (bw < 32 || OH < 32) return res;
+    Rect band(x0, 0, bw, OH);
+
+    // Collect warped grayscale overlap bands from sample frames. One full warped
+    // pair is kept for the sign self-check below.
+    vector<Mat> gLs, gRs;
+    UMat keepL, keepR;
+    auto addSample = [&](const Mat &frame) {
+        UMat uF, wL, wR;
+        frame.copyTo(uF);
+        warpHalves(uF, m, wL, wR);
+        Mat L, R;
+        wL(band).copyTo(L); wR(band).copyTo(R);
+        Mat gL, gR;
+        cvtColor(L, gL, COLOR_BGR2GRAY); cvtColor(R, gR, COLOR_BGR2GRAY);
+        gLs.push_back(gL); gRs.push_back(gR);
+        wL.copyTo(keepL); wR.copyTo(keepR);
+    };
+    if (!video)
+    {
+        Mat img = imread(source);
+        if (img.empty()) return res;
+        addSample(img);
+    }
+    else
+    {
+        VideoCapture cap(source);
+        if (!cap.isOpened()) return res;
+        const int WANT = 9;
+        Mat frame;
+        bool indexed = false;
+        if (totalFrames > WANT * 4)
+        {
+            int t0 = totalFrames / (2 * WANT);
+            cap.set(CAP_PROP_POS_FRAMES, (double)t0);
+            indexed = ((int)cap.get(CAP_PROP_POS_FRAMES) == t0);
+            if (!indexed) cap.set(CAP_PROP_POS_FRAMES, 0.0);
+        }
+        if (indexed)
+        {
+            for (int i = 0; i < WANT; i++)
+            {
+                int t = (int)((i + 0.5) * totalFrames / (double)WANT);
+                cap.set(CAP_PROP_POS_FRAMES, (double)t);
+                if ((int)cap.get(CAP_PROP_POS_FRAMES) != t) continue;
+                if (cap.read(frame) && !frame.empty()) addSample(frame);
+            }
+        }
+        else
+        {
+            // No usable index: sample the first ~10s (every 30th frame). Fine - the
+            // geometry being measured is the rig, which doesn't change over the game.
+            for (int i = 0; i < 30 * (WANT - 1) + 1 && (int)gLs.size() < WANT; i++)
+            {
+                if (!cap.read(frame) || frame.empty()) break;
+                if (i % 30 == 0) addSample(frame);
+            }
+        }
+    }
+    if (gLs.empty()) return res;
+    res.frames = (int)gLs.size();
+
+    // Dense flow per sample; per-row median of the horizontal component.
+    Ptr<DISOpticalFlow> dis = DISOpticalFlow::create(DISOpticalFlow::PRESET_MEDIUM);
+    vector<vector<float>> rowMed(OH);       // per row: one median per sampled frame
+    vector<float> yMeds;                    // per frame: median vertical flow
+    for (size_t f = 0; f < gLs.size(); f++)
+    {
+        Mat flow;
+        dis->calc(gLs[f], gRs[f], flow);
+        vector<float> ys;
+        for (int y = 0; y < OH; y++)
+        {
+            const Vec2f *fp = flow.ptr<Vec2f>(y);
+            const uchar *lp = gLs[f].ptr<uchar>(y);
+            const uchar *rp = gRs[f].ptr<uchar>(y);
+            vector<float> xs;
+            for (int x = 0; x < bw; x++)
+            {
+                if (lp[x] < 5 || rp[x] < 5) continue;                 // black wedge
+                if (fabsf(fp[x][0]) > 80.f || fabsf(fp[x][1]) > 40.f) continue;  // implausible
+                xs.push_back(fp[x][0]);
+                ys.push_back(fp[x][1]);
+            }
+            if ((int)xs.size() > bw / 8) rowMed[y].push_back(medianOf(xs));
+        }
+        if (!ys.empty()) yMeds.push_back(medianOf(ys));
+    }
+
+    // Median across frames per row, then a least-squares line over the rows.
+    vector<double> Y, U;
+    for (int y = 0; y < OH; y++)
+        if (!rowMed[y].empty()) { Y.push_back(y); U.push_back(medianOf(rowMed[y])); }
+    if ((int)Y.size() < OH / 4 || yMeds.empty()) return res;
+    double n = (double)Y.size(), sy = 0, su = 0, syy = 0, syu = 0;
+    for (size_t i = 0; i < Y.size(); i++)
+    { sy += Y[i]; su += U[i]; syy += Y[i] * Y[i]; syu += Y[i] * U[i]; }
+    double den = n * syy - sy * sy;
+    double c1 = fabs(den) > 1e-9 ? (n * syu - sy * su) / den : 0.0;
+    double c0 = (su - c1 * sy) / n;
+    double uTop = c0, uBot = c0 + c1 * (OH - 1), uY = medianOf(yMeds);
+
+    // The correction moves the RIGHT image, so it should be the negation of the
+    // measured offset - but rather than trust the sign convention, test both against
+    // doing nothing on the kept sample pair and keep whichever measurably shrinks
+    // the residual misalignment.
+    auto residual = [&](double st, double sb, double sYv) -> double {
+        UMat right = keepR;
+        if (st != 0.0 || sb != 0.0 || sYv != 0.0)
+        {
+            double k = (OH > 1) ? (sb - st) / (OH - 1) : 0.0;
+            Mat T = (Mat_<double>(2, 3) << 1, k, st, 0, 1, sYv);
+            warpAffine(keepR, right, T, Size(m.OW, m.OH));
+        }
+        Mat L, R;
+        keepL(band).copyTo(L); right(band).copyTo(R);
+        Mat gL, gR;
+        cvtColor(L, gL, COLOR_BGR2GRAY); cvtColor(R, gR, COLOR_BGR2GRAY);
+        Mat flow;
+        dis->calc(gL, gR, flow);
+        vector<float> mags;
+        for (int y = 0; y < OH; y += 2)
+        {
+            const Vec2f *fp = flow.ptr<Vec2f>(y);
+            const uchar *lp = gL.ptr<uchar>(y);
+            const uchar *rp = gR.ptr<uchar>(y);
+            for (int x = 0; x < bw; x += 2)
+                if (lp[x] >= 5 && rp[x] >= 5 && fabsf(fp[x][0]) < 80.f)
+                    mags.push_back(fabsf(fp[x][0]) + fabsf(fp[x][1]));
+        }
+        return mags.empty() ? 1e9 : (double)medianOf(mags);
+    };
+    double r0 = residual(0, 0, 0);
+    double rNeg = residual(-uTop, -uBot, -uY);
+    double rPos = residual(uTop, uBot, uY);
+    double best = min(rNeg, rPos);
+    if (best >= r0 * 0.95)
+    {
+        cout << "auto-align: no measurable improvement (residual " << r0 << " -> " << best
+             << " px) - leaving alignment at 0. Use the shift flags to set it manually.\n";
+        return res;
+    }
+    double sgn = (rNeg <= rPos) ? -1.0 : 1.0;
+    auto rnd = [](double v) { return std::round(v * 100.0) / 100.0; };
+    res.shiftTop = rnd(sgn * uTop);
+    res.shiftBottom = rnd(sgn * uBot);
+    res.shiftY = rnd(sgn * uY);
+    res.ok = true;
+    cout << "auto-align: shift-top " << res.shiftTop << ", shift-bottom " << res.shiftBottom
+         << ", shift-y " << res.shiftY << "  (measured from " << res.frames
+         << " frame(s); overlap residual " << r0 << " -> " << best << " px)\n";
+    return res;
 }
 
 static string stitchImageFile(const string &source, StitchMaps &m, double degrees,
@@ -667,13 +979,14 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
     Mat frame, pano;
     UMat uFrame, wL, wR;
     vector<int> prevSeam;   // carried across frames for a temporally stable smart seam
+    FlowState flowState;    // carried across frames for a temporally stable parallax morph
     int written = 0;
     for (int i = s; i <= e; i++)
     {
         if (!cap.read(frame) || frame.empty()) break;   // also stops at EOF
         frame.copyTo(uFrame);
         warpHalves(uFrame, m, wL, wR);
-        composite(wL, wR, m, degrees, a, &prevSeam).copyTo(pano);
+        composite(wL, wR, m, degrees, a, &prevSeam, &flowState).copyTo(pano);
         if (pipe)
         {
             if (pano.type() != CV_8UC3) pano.convertTo(pano, CV_8UC3);
@@ -762,12 +1075,14 @@ static string tunerHtml()
 <div id="bar">
   <div class="grp"><button id="import">Import source…</button><input class="path" id="srcpath" type="text" readonly placeholder="no file loaded"></div>
   <div class="grp">Output <input class="path" id="outpath" type="text" readonly placeholder="chosen when you click Stitch"></div>
-  <div class="grp">Shift far (top) <button id="tl">&#9664;</button><input class="val" id="tv" type="number" value="0"><button id="tr">&#9654;</button></div>
-  <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
+  <div class="grp">Align <span class="hint" id="alignout">auto (measured on import)</span></div>
   <div class="grp">Seam <input class="val" id="mv" type="number" value="0"><button id="mc">reset</button> <span class="hint">or drag the red line</span></div>
   <div class="grp">Rotate&deg; <button id="rl">&#9664;</button><input class="val" id="rot" type="number" value="0" step="0.5"><button id="rr">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="showseam" checked> show seam line</label></div>
-  <!-- Hidden for now (smart seam, multi-band blend, and exposure match are on by default):
+  <!-- Hidden for now (smart seam, multi-band blend, exposure match are on by default;
+       geometry shifts are auto-measured on import - the old manual knobs are gone):
+  <div class="grp">Shift far (top) <button id="tl">&#9664;</button><input class="val" id="tv" type="number" value="0"><button id="tr">&#9654;</button></div>
+  <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
   <div class="grp">Shift-y <button id="yl">&#9664;</button><input class="val" id="yv" type="number" value="0"><button id="yr">&#9654;</button></div>
   <div class="grp">Seam <button id="ml">&#9664;</button><input class="val" id="mv" type="number" value="0"><button id="mr">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="mb" checked> multi-band blend</label></div>
@@ -777,10 +1092,10 @@ static string tunerHtml()
   <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
   <div class="grp"><label><input type="checkbox" id="crop" checked> crop to box</label> <span class="hint" id="cropdim"></span></div>
+  <div class="grp"><label><input type="checkbox" id="px"> parallax morph</label> <span class="hint">per-pixel de-ghosting (slower)</span></div>
   <div class="grp"><label><input type="checkbox" id="withaudio" checked> attach audio after stitch</label> <span class="hint">if a .sync.json sidecar is found</span></div>
   <button id="stitch" disabled>Stitch all frames</button>
   <button id="quit">Quit</button>
-  <span class="hint">&#8592;/&#8594; shift both</span>
 </div>
 <div id="status">Click "Import source…" to choose a video or image.</div>
 <div id="prog" style="padding:0 10px 10px;display:none">
@@ -799,12 +1114,12 @@ static string tunerHtml()
 let OW=0, OH=0, SEAM0=0, OX0=0, OX1=0, TOTAL=1, VIDEO=false, loaded=false;
 const cv=document.getElementById('c'), ctx=cv.getContext('2d');
 // Clamp the seam into the valid overlap band [OX0,OX1) (both cameras present there).
-const clampSeam=v=>{ const lo=OX0||0, hi=OX1||OW; return Math.max(lo,Math.min(hi,Math.round(v))); };
-const stepv=()=>{ return 1; };   // arrows nudge by 1
-const st=t=>{ document.getElementById('status').textContent=t; };
-const tv=document.getElementById('tv'), bv=document.getElementById('bv');
+const clampSeam=(v)=>{ const lo=OX0||0, hi=OX1||OW; return Math.max(lo,Math.min(hi,Math.round(v))); };
+const st=(t)=>{ return document.getElementById('status').textContent=t; };
 const stitchBtn=document.getElementById('stitch');
-let sTop=0, sBot=0, sY=0, seam=0, pending=0;   // sY fixed; seam set by the draggable bar
+// Geometry (shear/shift) is auto-measured server-side on import; the values arrive
+// via /state and /import and feed both the preview and the stitch. No knobs.
+let sTop=0, sBot=0, sY=0, seam=0, pending=0;   // seam set by the draggable bar
 let rot=0, showSeam=true;   // rot = whole-panorama rotation (deg); showSeam toggles the red line
 const clmp=(v,lo,hi)=>{ return Math.max(lo,Math.min(hi,v)); };
 // Crop box (in OW/OH panorama coords). cropOn toggles it; drag body to move,
@@ -819,7 +1134,6 @@ function drawRight(){
 }
 function render(){
   if(!loaded) return;
-  sTop=+tv.value||0; sBot=+bv.value||0;   // sY stays fixed; seam comes from the drag/number box
   ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=1; ctx.clearRect(0,0,OW,OH);
   // Preview the whole-panorama rotation the same way the engine does: rotate about the
   // canvas centre. The crop box stays axis-aligned (drawn after we restore).
@@ -857,10 +1171,6 @@ function drawCrop(){
   ctx.restore();
   document.getElementById('cropdim').textContent=Math.round(cropW)+'x'+Math.round(cropH);
 }
-const nudge=(el,d)=>{ el.value=(+el.value||0)+d; render(); };
-tl.onclick=()=>{ nudge(tv,-stepv()); }; tr.onclick=()=>{ nudge(tv,stepv()); };
-bl.onclick=()=>{ nudge(bv,-stepv()); }; br.onclick=()=>{ nudge(bv,stepv()); };
-[tv,bv].forEach(el=>{ el.oninput=render; });
 // Seam number box + reset (mirror the draggable red bar).
 const mv=document.getElementById('mv');
 if(mv){ mv.oninput=()=>{ seam=clampSeam(+mv.value||0); render(); }; }
@@ -915,12 +1225,6 @@ document.getElementById('crop').onchange=(e)=>{
   if(!cropOn) document.getElementById('cropdim').textContent='';
   render();
 };
-addEventListener('keydown',e=>{
-  if(e.target.tagName==='INPUT') return;      // let typing in the boxes work normally
-  const d=stepv();
-  if(e.key==='ArrowLeft'){tv.value=(+tv.value||0)-d; bv.value=(+bv.value||0)-d; render(); e.preventDefault();}
-  else if(e.key==='ArrowRight'){tv.value=(+tv.value||0)+d; bv.value=(+bv.value||0)+d; render(); e.preventDefault();}
-});
 // frame scrubbing (video only)
 const frange=document.getElementById('frange'), fval=document.getElementById('fval');
 const ftxt=n=>{ return 'Frame '+n+(TOTAL>1?(' / '+TOTAL):''); };
@@ -944,6 +1248,10 @@ fval.onchange=()=>{ loadFrame(fval.value); };
 function applyLoad(d){
   loaded=true; OW=d.ow; OH=d.oh; SEAM0=d.seam; TOTAL=d.total; VIDEO=d.video; seam=SEAM0;
   OX0=(d.ox0!=null?d.ox0:0); OX1=(d.ox1!=null?d.ox1:OW);   // valid overlap band for the seam drag
+  sTop=d.autotop||0; sBot=d.autobot||0; sY=d.autoy||0;     // auto-measured geometry
+  { const ao=document.getElementById('alignout');
+    if(ao){ ao.textContent='auto: top '+sTop+', bottom '+sBot+(sY?(', y '+sY):''); } }
+  { const px=document.getElementById('px'); if(px && d.parallax!=null){ px.checked=!!d.parallax; } }
   { const mv=document.getElementById('mv'); if(mv){ mv.value=seam; mv.min=OX0; mv.max=OX1; } }
   rot=0; { const r=document.getElementById('rot'); if(r) r.value=0; }   // reset rotation for a new source
   cropW=0;   // re-initialise the crop box to the new frame size on next draw
@@ -956,7 +1264,7 @@ function applyLoad(d){
   document.getElementById('framegrp').style.display = VIDEO ? '' : 'none';
   stitchBtn.disabled=false;
   pending=2; imgL.src=d.left; imgR.src=d.right;
-  st('Loaded. Align the far (top) and near (bottom) edges, then Stitch.');
+  st('Loaded & auto-aligned. Drag the crop box (and rotate if needed), then Stitch.');
 }
 document.getElementById('import').onclick=async()=>{
   st('Choose an input file…');
@@ -974,9 +1282,11 @@ document.getElementById('import').onclick=async()=>{
 
 let polling=null;
 const pb=document.getElementById('pb'), pct=document.getElementById('pct');
-// hidden controls fixed to defaults: shift-y 0, smart seam on, 6-band blend, exposure match on
+// hidden controls fixed to defaults: smart seam on, 6-band blend, exposure match on;
+// the geometry shifts are the auto-measured values delivered with the source.
 const params=()=>{
-  let p='shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty=0&seam='+Math.round(seam)+'&degrees='+rot+'&bands=6&exposure=1&smartseam=1';
+  let p='shifttop='+sTop+'&shiftbottom='+sBot+'&shifty='+sY+'&seam='+Math.round(seam)+'&degrees='+rot+'&bands=6&exposure=1&smartseam=1';
+  const px=document.getElementById('px'); p+='&parallax='+((px&&px.checked)?1:0);
   if(cropOn && cropW>0) p+='&cropx='+Math.round(cropX)+'&cropy='+Math.round(cropY)+'&cropw='+Math.round(cropW)+'&croph='+Math.round(cropH);
   var wa=document.getElementById('withaudio'); if(wa&&wa.checked) p+='&audio=1';
   return p;
@@ -1130,6 +1440,7 @@ static string buildCliCommand(const string &source, const string &calibDir,
     c += " --bands " + to_string(a.bands);
     if (!a.exposure)          c += " --no-exposure";
     if (!a.smartSeam)         c += " --no-smart-seam";
+    if (g_parallax)           c += " --parallax";
     if (!cropArg.empty())     c += " --crop " + q(cropArg);
     if (startFrame > 0)       c += " --start " + to_string(startFrame);
     if (endFrame >= 0)        c += " --end " + to_string(endFrame);
@@ -1155,7 +1466,8 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                           double degrees, int startFrame, int endFrame,
                           const string &outDir, const string &initSource,
                           const string &initOutFile, int port,
-                          const string &calibDir, int jobs)
+                          const string &calibDir, int jobs,
+                          const Align &initAlign, bool autoAlignOn)
 {
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -1171,6 +1483,10 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
     string curLeft, curRight;            // first-frame preview (data: URIs)
     VideoCapture frameCap;               // persistent for /frame scrubbing
     int frameCapPos = -1;
+    // Geometry for the loaded source: auto-measured on import (or the CLI's explicit
+    // shift flags when auto-align is off). The UI has no shear knobs anymore - these
+    // feed the preview and the stitch directly.
+    double autoTop = initAlign.shiftTop, autoBot = initAlign.shiftBottom, autoY = initAlign.shiftY;
 
     // Open a file: build the stitch maps and the first-frame preview. Returns
     // "" on success or an error message.
@@ -1196,6 +1512,13 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
         curLeft = "data:image/jpeg;base64," + base64(bL);
         curRight = "data:image/jpeg;base64," + base64(bR);
         frameCap.release(); frameCapPos = -1;
+        if (autoAlignOn)
+        {
+            cout << "auto-align: measuring geometry for " << path << " ...\n";
+            AutoAlignResult ar = autoAlignEstimate(path, isVid, tf, mm);
+            if (ar.ok) { autoTop = ar.shiftTop; autoBot = ar.shiftBottom; autoY = ar.shiftY; }
+            else       { autoTop = autoBot = autoY = 0; }
+        }
         return "";
     };
 
@@ -1205,6 +1528,8 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
         j << "{\"loaded\":true,\"ow\":" << m.OW << ",\"oh\":" << m.OH << ",\"seam\":" << m.seam
           << ",\"ox0\":" << m.ox0 << ",\"ox1\":" << m.ox1
           << ",\"total\":" << totalFrames << ",\"video\":" << (video ? "true" : "false")
+          << ",\"autotop\":" << autoTop << ",\"autobot\":" << autoBot << ",\"autoy\":" << autoY
+          << ",\"parallax\":" << (g_parallax ? "true" : "false")
           << ",\"source\":\"" << jsonEscape(source) << "\",\"output\":\"" << jsonEscape(outFile) << "\""
           << ",\"left\":\"" << curLeft << "\",\"right\":\"" << curRight << "\"}";
         return j.str();
@@ -1291,6 +1616,8 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                 a.bands = query.find("bands=") != string::npos ? stoi(qparam(query, "bands")) : 0;
                 a.exposure = qparam(query, "exposure") == "1";
                 a.smartSeam = qparam(query, "smartseam") == "1";
+                // Per-stitch parallax toggle from the UI checkbox (absent = keep CLI value).
+                if (query.find("parallax=") != string::npos) g_parallax = qparam(query, "parallax") == "1";
                 string ss = qparam(query, "seam");
                 StitchMaps mm = m;
                 if (!ss.empty()) mm.seam = stoi(ss);
@@ -1789,6 +2116,7 @@ static int runParallelJobs(const string &source, const string &calibDir,
             + " --shift-top " + to_string(a.shiftTop) + " --shift-bottom " + to_string(a.shiftBottom)
             + " --shift-y " + to_string(a.shiftY) + " --bands " + to_string(a.bands)
             + (a.exposure ? "" : " --no-exposure") + (a.smartSeam ? "" : " --no-smart-seam")
+            + (g_parallax ? " --parallax" : "")
             + (cropArg.empty() ? "" : " --crop " + q(cropArg))
             + " --jobs 1 --start " + to_string(s) + " --end " + to_string(e)
             + " --venc " + q(resolvedEnc) + " --bitrate " + q(g_vbitrate)
@@ -1903,6 +2231,13 @@ int main(int argc, char **argv)
     a.bands = stoi(argVal(argc, argv, "--bands", "6"));   // 0 = hard seam
     a.exposure = !hasArg(argc, argv, "--no-exposure");     // on by default
     a.smartSeam = !hasArg(argc, argv, "--no-smart-seam");  // on by default
+    // Auto-align (default ON): measure shift-top/bottom/y from the footage instead of
+    // the knobs. Any explicit shift flag pins the values and skips the measurement
+    // (that's also how --jobs children inherit the parent's one estimate).
+    bool explicitShift = hasArg(argc, argv, "--shift-top") || hasArg(argc, argv, "--shift-bottom")
+                      || hasArg(argc, argv, "--shift-y") || hasArg(argc, argv, "--shift-x");
+    bool autoAlign = !explicitShift && !hasArg(argc, argv, "--no-auto-align");
+    g_parallax = hasArg(argc, argv, "--parallax");   // per-pixel morph in the overlap (opt-in)
     int port = stoi(argVal(argc, argv, "--port", "8090"));
     bool tune = hasArg(argc, argv, "--tune");
     int jobs = stoi(argVal(argc, argv, "--jobs", "4"));    // parallel child processes (video); default 4
@@ -1953,7 +2288,8 @@ int main(int argc, char **argv)
     // so `source` may be empty here (empty page until the user imports).
     if (source.empty() || tune)
     {
-        runTuneServer(KL, DL, KR, DR, R, degrees, startFrame, endFrame, outDir, source, outFile, port, calibDir, jobs);
+        runTuneServer(KL, DL, KR, DR, R, degrees, startFrame, endFrame, outDir, source, outFile, port, calibDir, jobs,
+                      a, autoAlign);
         return 0;
     }
 
@@ -1981,6 +2317,16 @@ int main(int argc, char **argv)
         }
     }
     if (frame.empty()) { cerr << "Cannot read source: " << source << endl; return 1; }
+
+    // Auto-align: one estimate on the full (uncropped) canvas before any rendering;
+    // the values then flow to --jobs children as explicit flags, so every chunk uses
+    // the identical alignment.
+    if (autoAlign)
+    {
+        StitchMaps am = buildStitchMaps(KL, DL, KR, DR, R, frame.cols / 2, frame.rows, seamArg);
+        AutoAlignResult ar = autoAlignEstimate(source, video, totalFrames, am);
+        if (ar.ok) { a.shiftTop = ar.shiftTop; a.shiftBottom = ar.shiftBottom; a.shiftY = ar.shiftY; }
+    }
 
     // Parallel path: split the video across `jobs` child processes, then concat into
     // the single --out-file. Video only; images and the tuner always run single-process.
