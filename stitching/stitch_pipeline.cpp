@@ -1,8 +1,10 @@
-// stitch_pipeline.cpp - calibration-driven cylindrical stitch (C++), NO feature detection.
+// stitch_pipeline.cpp - calibration-driven cylindrical stitch (C++).
 //
 // Reads the rig calibration (left/right intrinsics + stereo extrinsics) and stitches
 // the combined LEFT|RIGHT feed into a cylindrical panorama, aligning the cameras from
-// the extrinsic rotation R. No BRISK / matcher / findHomography anywhere.
+// the extrinsic rotation R. The warp geometry never comes from feature matching; the
+// only corner detection in here is the tuner's "find tuning frames" scan, which uses
+// features to LOCATE good frames for manual tuning, not to warp anything.
 //
 // Modes:
 //   image source (.jpg/.png/...) -> stitch the single frame  -> pano.jpg
@@ -26,8 +28,13 @@
 //   --parallax   per-pixel flow morph in the overlap (see parallaxMorph) - opt-in.
 //
 // --tune warps the first frame once, starts a localhost web server, opens a browser
-// to a live tuner. Geometry is auto-aligned on import; you pick the crop box, seam
-// home column, and rotation, then click "Stitch all frames" (progress bar + done).
+// to a live tuner. Geometry is auto-aligned on import and SEEDS the editable shear
+// knobs (Shift far/near/y) - edit them to override, "reset to auto" restores the
+// measurement, and the values you see are the values the stitch uses. "Find tuning
+// frames" scans the source for the first frames with a clear, matchable feature in
+// the top / bottom of the overlap band (person, cone, sign - the things you'd align
+// by eye) and jumps the scrubber there. You pick the crop box, seam home column,
+// and rotation, then click "Stitch all frames" (progress bar + done).
 // One command; UI opens itself.
 //
 // Parallel video stitch (default ON):
@@ -61,7 +68,10 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
-#include <opencv2/video.hpp>     // DISOpticalFlow (auto-align + --parallax)
+#include <opencv2/video.hpp>     // DISOpticalFlow (auto-align + --parallax), PyrLK
+#if CV_VERSION_MAJOR >= 5
+#include <opencv2/features.hpp>  // goodFeaturesToTrack (moved out of imgproc in OpenCV 5)
+#endif
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -846,6 +856,90 @@ static AutoAlignResult autoAlignEstimate(const string &source, bool video, int t
     return res;
 }
 
+// ---- tuning-frame finder (tuner's "Find tuning frames" button) --------------
+// Finds frames that make good MANUAL shear-tuning targets: a distinct object
+// (person, cone, sign) inside the overlap band, clearly visible in BOTH cameras.
+// "Clear feature" = Shi-Tomasi corners in the left band that KLT-track into the
+// right band and survive a track-back check - the automated version of "a known
+// object you could align by eye". Grass contributes nothing (no 2-D gradient =
+// no corners), so unlike the dense-flow estimator this can't be outvoted by it.
+struct TuningFrames { int top = -1, bottom = -1, both = -1, scanned = 0; };
+
+static bool bandRegionHasFeature(const Mat &gL, const Mat &gR, const Mat &valid, const Rect &roi)
+{
+    vector<Point2f> pts;
+    goodFeaturesToTrack(gL(roi), pts, 40, 0.03, 12, valid(roi), 7);
+    if ((int)pts.size() < 6) return false;
+    for (auto &p : pts) p += Point2f((float)roi.x, (float)roi.y);
+    // Track into the right band and back; keep only round-trip-consistent matches
+    // with a plausible offset. This is the "matchable in both cameras" test.
+    vector<Point2f> fwd, back; vector<uchar> stF, stB; vector<float> err;
+    calcOpticalFlowPyrLK(gL, gR, pts, fwd, stF, err, Size(21, 21), 3);
+    calcOpticalFlowPyrLK(gR, gL, fwd, back, stB, err, Size(21, 21), 3);
+    int good = 0;
+    for (size_t i = 0; i < pts.size(); i++)
+    {
+        if (!stF[i] || !stB[i]) continue;
+        if (norm(back[i] - pts[i]) > 1.5) continue;
+        Point2f d = fwd[i] - pts[i];
+        if (fabs(d.x) > 80.f || fabs(d.y) > 40.f) continue;
+        good++;
+    }
+    return good >= 6;
+}
+
+static TuningFrames findTuningFrames(const string &source, bool video, const StitchMaps &m)
+{
+    TuningFrames tfr;
+    int x0 = max(0, m.ox0), x1 = min(m.OW, m.ox1), bw = x1 - x0, OH = m.OH;
+    if (bw < 32 || OH < 96) return tfr;
+    // Band-only remap tables: warping just the overlap columns is far cheaper than
+    // warpHalves on the full canvas, and the scan visits many frames.
+    Rect band(x0, 0, bw, OH);
+    UMat mLx = m.mapLx(band), mLy = m.mapLy(band), mRx = m.mapRx(band), mRy = m.mapRy(band);
+    Rect top(0, 0, bw, OH / 3), bottom(0, OH - OH / 3, bw, OH / 3);
+
+    auto check = [&](const Mat &frame, int idx) -> bool {   // true = "both" found, stop
+        int w = frame.cols / 2;
+        Mat L, R, gL, gR;
+        remap(frame(Rect(0, 0, w, frame.rows)), L, mLx, mLy, INTER_LINEAR, BORDER_CONSTANT);
+        remap(frame(Rect(w, 0, w, frame.rows)), R, mRx, mRy, INTER_LINEAR, BORDER_CONSTANT);
+        cvtColor(L, gL, COLOR_BGR2GRAY); cvtColor(R, gR, COLOR_BGR2GRAY);
+        // Validity mask, eroded so no corner sits near a black warp wedge (wedge
+        // edges are strong artificial corners that would match inconsistently).
+        Mat valid = (gL > 5) & (gR > 5);
+        erode(valid, valid, getStructuringElement(MORPH_RECT, Size(31, 31)));
+        bool t = bandRegionHasFeature(gL, gR, valid, top);
+        bool b = bandRegionHasFeature(gL, gR, valid, bottom);
+        if (t && tfr.top < 0) tfr.top = idx;
+        if (b && tfr.bottom < 0) tfr.bottom = idx;
+        if (t && b && tfr.both < 0) tfr.both = idx;
+        tfr.scanned++;
+        return tfr.both >= 0;
+    };
+
+    if (!video)
+    {
+        Mat img = imread(source);
+        if (!img.empty()) check(img, 0);
+        return tfr;
+    }
+    VideoCapture cap(source);
+    if (!cap.isOpened()) return tfr;
+    const int STRIDE = 15;         // ~0.5 s at 30 fps - a person/cone is in view far longer
+    const int MAX_SAMPLES = 600;   // ~5 min of footage; plenty for a pre-game scan
+    Mat frame;
+    for (int idx = 0, sampled = 0; sampled < MAX_SAMPLES; idx++)
+    {
+        if (!cap.grab()) break;
+        if (idx % STRIDE != 0) continue;
+        if (!cap.retrieve(frame) || frame.empty()) break;
+        sampled++;
+        if (check(frame, idx)) break;
+    }
+    return tfr;
+}
+
 static string stitchImageFile(const string &source, StitchMaps &m, double degrees,
                               const Align &a, const string &outDir, const string &outFile = "")
 {
@@ -1075,20 +1169,14 @@ static string tunerHtml()
 <div id="bar">
   <div class="grp"><button id="import">Import source…</button><input class="path" id="srcpath" type="text" readonly placeholder="no file loaded"></div>
   <div class="grp">Output <input class="path" id="outpath" type="text" readonly placeholder="chosen when you click Stitch"></div>
-  <div class="grp">Align <span class="hint" id="alignout">auto (measured on import)</span></div>
+  <div class="grp">Shift far (top) <button id="tl">&#9664;</button><input class="val" id="tv" type="number" value="0"><button id="tr">&#9654;</button></div>
+  <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
+  <div class="grp">Shift-y <input class="val" id="yv" type="number" value="0" step="0.5"></div>
+  <div class="grp"><button id="autoreset">reset to auto</button> <span class="hint" id="alignout">auto: (measured on import)</span></div>
   <div class="grp">Seam <input class="val" id="mv" type="number" value="0"><button id="mc">reset</button> <span class="hint">or drag the red line</span></div>
   <div class="grp">Rotate&deg; <button id="rl">&#9664;</button><input class="val" id="rot" type="number" value="0" step="0.5"><button id="rr">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="showseam" checked> show seam line</label></div>
-  <!-- Hidden for now (smart seam, multi-band blend, exposure match are on by default;
-       geometry shifts are auto-measured on import - the old manual knobs are gone):
-  <div class="grp">Shift far (top) <button id="tl">&#9664;</button><input class="val" id="tv" type="number" value="0"><button id="tr">&#9654;</button></div>
-  <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
-  <div class="grp">Shift-y <button id="yl">&#9664;</button><input class="val" id="yv" type="number" value="0"><button id="yr">&#9654;</button></div>
-  <div class="grp">Seam <button id="ml">&#9664;</button><input class="val" id="mv" type="number" value="0"><button id="mr">&#9654;</button></div>
-  <div class="grp"><label><input type="checkbox" id="mb" checked> multi-band blend</label></div>
-  <div class="grp"><label><input type="checkbox" id="xc" checked> exposure/color match</label></div>
-  <div class="grp"><label><input type="checkbox" id="ss" checked> seam avoidance (moving objects)</label></div>
-  -->
+  <div class="grp"><button id="ffind">Find tuning frames</button><span id="ffout" class="hint"></span></div>
   <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
   <div class="grp"><label><input type="checkbox" id="crop" checked> crop to box</label> <span class="hint" id="cropdim"></span></div>
@@ -1118,8 +1206,10 @@ const clampSeam=(v)=>{ const lo=OX0||0, hi=OX1||OW; return Math.max(lo,Math.min(
 const st=(t)=>{ return document.getElementById('status').textContent=t; };
 const stitchBtn=document.getElementById('stitch');
 // Geometry (shear/shift) is auto-measured server-side on import; the values arrive
-// via /state and /import and feed both the preview and the stitch. No knobs.
+// via /state and /import, seed the editable knobs, and feed both the preview and
+// the stitch. Edit the knobs to override; "reset to auto" restores the measurement.
 let sTop=0, sBot=0, sY=0, seam=0, pending=0;   // seam set by the draggable bar
+let autoTop0=0, autoBot0=0, autoY0=0;          // the measured values, for the reset button
 let rot=0, showSeam=true;   // rot = whole-panorama rotation (deg); showSeam toggles the red line
 const clmp=(v,lo,hi)=>{ return Math.max(lo,Math.min(hi,v)); };
 // Crop box (in OW/OH panorama coords). cropOn toggles it; drag body to move,
@@ -1171,6 +1261,39 @@ function drawCrop(){
   ctx.restore();
   document.getElementById('cropdim').textContent=Math.round(cropW)+'x'+Math.round(cropH);
 }
+// Shear knobs: mirror sTop/sBot/sY, re-render live. Arrows step by 1 px.
+const tv=document.getElementById('tv'), bv=document.getElementById('bv'), yv=document.getElementById('yv');
+const setShifts=(t,b,y)=>{ sTop=t; sBot=b; sY=y; tv.value=t; bv.value=b; yv.value=y; render(); };
+tv.oninput=()=>{ sTop=+tv.value||0; render(); };
+bv.oninput=()=>{ sBot=+bv.value||0; render(); };
+yv.oninput=()=>{ sY=+yv.value||0; render(); };
+document.getElementById('tl').onclick=()=>{ setShifts(sTop-1,sBot,sY); };
+document.getElementById('tr').onclick=()=>{ setShifts(sTop+1,sBot,sY); };
+document.getElementById('bl').onclick=()=>{ setShifts(sTop,sBot-1,sY); };
+document.getElementById('br').onclick=()=>{ setShifts(sTop,sBot+1,sY); };
+document.getElementById('autoreset').onclick=()=>{ setShifts(autoTop0,autoBot0,autoY0); };
+// Tuning-frame finder: scan the source for the first frames with a clear,
+// matchable feature near the top / bottom of the overlap band, then jump there.
+document.getElementById('ffind').onclick=async()=>{
+  if(!loaded){ st('Import a source first.'); return; }
+  const fo=document.getElementById('ffout');
+  fo.textContent='scanning…'; st('Scanning for tuning frames (features in the overlap band)…');
+  try{
+    const d=await (await fetch('/findframes')).json();
+    if(d.error){ fo.textContent=''; st('scan error: '+d.error); return; }
+    fo.textContent='';
+    const mk=(label,n)=>{ const b=document.createElement('button');
+      b.textContent=label+' @ '+n; b.style.marginLeft='4px';
+      b.onclick=()=>{ return loadFrame(n); }; fo.appendChild(b); };
+    if(d.both>=0) mk('both',d.both);
+    if(d.top>=0 && d.top!==d.both) mk('top',d.top);
+    if(d.bottom>=0 && d.bottom!==d.both) mk('bottom',d.bottom);
+    if(d.both<0 && d.top<0 && d.bottom<0){ fo.textContent='none found ('+d.scanned+' frames scanned)'; st('No clear tuning features found.'); return; }
+    const go=d.both>=0?d.both:(d.top>=0?d.top:d.bottom);
+    st('Tuning frames found (scanned '+d.scanned+') — jumping to frame '+go+'. Tick "overlap blend" and align top/bottom features.');
+    loadFrame(go);
+  }catch(e){ fo.textContent=''; st('scan failed: '+e); }
+};
 // Seam number box + reset (mirror the draggable red bar).
 const mv=document.getElementById('mv');
 if(mv){ mv.oninput=()=>{ seam=clampSeam(+mv.value||0); render(); }; }
@@ -1248,9 +1371,11 @@ fval.onchange=()=>{ loadFrame(fval.value); };
 function applyLoad(d){
   loaded=true; OW=d.ow; OH=d.oh; SEAM0=d.seam; TOTAL=d.total; VIDEO=d.video; seam=SEAM0;
   OX0=(d.ox0!=null?d.ox0:0); OX1=(d.ox1!=null?d.ox1:OW);   // valid overlap band for the seam drag
-  sTop=d.autotop||0; sBot=d.autobot||0; sY=d.autoy||0;     // auto-measured geometry
+  autoTop0=d.autotop||0; autoBot0=d.autobot||0; autoY0=d.autoy||0;   // measured geometry
+  setShifts(autoTop0,autoBot0,autoY0);                               // seed the editable knobs
   { const ao=document.getElementById('alignout');
-    if(ao){ ao.textContent='auto: top '+sTop+', bottom '+sBot+(sY?(', y '+sY):''); } }
+    if(ao){ ao.textContent='auto: top '+autoTop0+', bottom '+autoBot0+(autoY0?(', y '+autoY0):''); } }
+  { const fo=document.getElementById('ffout'); if(fo) fo.textContent=''; }
   { const px=document.getElementById('px'); if(px && d.parallax!=null){ px.checked=!!d.parallax; } }
   { const mv=document.getElementById('mv'); if(mv){ mv.value=seam; mv.min=OX0; mv.max=OX1; } }
   rot=0; { const r=document.getElementById('rot'); if(r) r.value=0; }   // reset rotation for a new source
@@ -1283,7 +1408,7 @@ document.getElementById('import').onclick=async()=>{
 let polling=null;
 const pb=document.getElementById('pb'), pct=document.getElementById('pct');
 // hidden controls fixed to defaults: smart seam on, 6-band blend, exposure match on;
-// the geometry shifts are the auto-measured values delivered with the source.
+// the geometry shifts are the knob values (auto-measured on import, editable).
 const params=()=>{
   let p='shifttop='+sTop+'&shiftbottom='+sBot+'&shifty='+sY+'&seam='+Math.round(seam)+'&degrees='+rot+'&bands=6&exposure=1&smartseam=1';
   const px=document.getElementById('px'); p+='&parallax='+((px&&px.checked)?1:0);
@@ -1484,8 +1609,8 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
     VideoCapture frameCap;               // persistent for /frame scrubbing
     int frameCapPos = -1;
     // Geometry for the loaded source: auto-measured on import (or the CLI's explicit
-    // shift flags when auto-align is off). The UI has no shear knobs anymore - these
-    // feed the preview and the stitch directly.
+    // shift flags when auto-align is off). These seed the tuner's editable shear
+    // knobs; the stitch uses whatever the knobs say at stitch time.
     double autoTop = initAlign.shiftTop, autoBot = initAlign.shiftBottom, autoY = initAlign.shiftY;
 
     // Open a file: build the stitch maps and the first-frame preview. Returns
@@ -1713,6 +1838,22 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                       << "\",\"right\":\"data:image/jpeg;base64," << base64(bR) << "\"}";
                     body = j.str();
                 }
+            }
+        }
+        else if (path == "/findframes")
+        {
+            ctype = "application/json";
+            if (!loaded) { body = "{\"error\":\"no source loaded\"}"; }
+            else
+            {
+                cout << "[tuner] scanning for tuning frames...\n";
+                TuningFrames t = findTuningFrames(source, video, m);
+                ostringstream j;
+                j << "{\"top\":" << t.top << ",\"bottom\":" << t.bottom
+                  << ",\"both\":" << t.both << ",\"scanned\":" << t.scanned << "}";
+                body = j.str();
+                cout << "[tuner] tuning frames: top " << t.top << ", bottom " << t.bottom
+                     << ", both " << t.both << "  (" << t.scanned << " frames scanned)\n";
             }
         }
         else if (path == "/progress")
