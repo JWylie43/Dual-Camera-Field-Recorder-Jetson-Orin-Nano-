@@ -27,7 +27,8 @@
 // interpolated between the two, so a receding field (near at the bottom, far at the
 // top) lines up along a straight vertical seam. (--shift-x N sets top=bottom=N.)
 // The shear is a ground-plane fit; content off that plane (players) can still ghost:
-//   --parallax   per-pixel flow morph in the overlap (see parallaxMorph) - opt-in.
+//   --parallax is ON by default (per-pixel flow morph in the overlap, see
+//   parallaxMorph); --no-parallax disables it.
 //
 // --tune warps the first frame once, starts a localhost web server, opens a browser
 // to a live tuner. Geometry is auto-aligned on import and SEEDS the editable shear
@@ -158,13 +159,14 @@ static string g_lookCas    = "0.35"; // --cas: sharpen strength 0..1 (0.3-0.45 s
 static string g_lookGamma  = "";     // --gamma: e.g. 1.1 lifts shadows/mids; empty = off
 static string g_lookWidth  = "3840"; // --look-width: upscale target width; 0 = keep pano size
 
-// ---- parallax morph (--parallax; default off) -----------------------------
+// ---- parallax morph (default ON; --no-parallax disables) -------------------
 // Per-frame dense-flow morph inside the overlap band: both images are warped
 // toward each other across a ramp so content at EVERY depth converges before
 // the seam + blend run. Fixes ghosting the global shear can't (the shear is a
-// ground-plane fit; players are vertical and off that plane). Opt-in while it
-// is evaluated - it trades ghosting for possible slight seam-band wobble.
-static bool g_parallax = false;
+// ground-plane fit; players are vertical and off that plane). Costs a dense
+// flow per frame; its confidence gate fades it to zero wherever the flow is
+// unreliable, so its failure mode is today's plain behavior.
+static bool g_parallax = true;
 
 struct StitchMaps
 {
@@ -200,6 +202,13 @@ static vector<int> g_partPct, g_partDone, g_partTotal;
 // The exact equivalent CLI command for the last/active stitch (shown in the tuner UI
 // and console) so you can reproduce a tuned render manually.
 static string g_cmd;
+// Cancel signal for an active render. The tuner's Quit sets g_stop; the in-process
+// frame loop polls it, and runParallelJobs relays it to its child processes by
+// creating a stop FILE (children are separate processes and can't see our atomics -
+// each child polls the --stop-file path in its own frame loop). Previously Quit
+// killed only the server and ORPHANED the children, which kept rendering.
+static std::atomic<bool> g_stop{false};
+static string g_stopFile;   // --stop-file: path this process polls (set for children)
 
 static void loadIntrinsics(const string &path, Mat &K, vector<double> &D)
 {
@@ -1169,8 +1178,13 @@ static string stitchVideoFile(const string &source, StitchMaps &m,
     vector<int> prevSeam;   // carried across frames for a temporally stable smart seam
     FlowState flowState;    // carried across frames for a temporally stable parallax morph
     int written = 0;
+    std::error_code stopEc;
     for (int i = s; i <= e; i++)
     {
+        // Cancel check (tuner Quit): our own atomic, or the parent's stop file.
+        if ((i - s) % 15 == 0 &&
+            (g_stop.load() || (!g_stopFile.empty() && fs::exists(g_stopFile, stopEc))))
+        { cout << "  render cancelled at frame " << i << " - finalizing output\n"; break; }
         if (!cap.read(frame) || frame.empty()) break;   // also stops at EOF
         frame.copyTo(uFrame);
         warpHalves(uFrame, m, wL, wR);
@@ -1274,7 +1288,7 @@ static string tunerHtml()
   <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
   <div class="grp"><label><input type="checkbox" id="crop" checked> crop to box</label> <span class="hint" id="cropdim"></span></div>
-  <div class="grp"><label><input type="checkbox" id="px"> parallax morph</label> <span class="hint">per-pixel de-ghosting (slower)</span></div>
+  <div class="grp"><label><input type="checkbox" id="px" checked> parallax morph</label> <span class="hint">per-pixel de-ghosting (on by default)</span></div>
   <div class="grp"><label><input type="checkbox" id="withaudio" checked> attach audio after stitch</label> <span class="hint">if a .sync.json sidecar is found</span></div>
   <button id="stitch" disabled>Stitch all frames</button>
   <button id="quit">Quit</button>
@@ -1566,7 +1580,12 @@ document.getElementById('finish').onclick=async()=>{
   try{await fetch('/quit');}catch(e){}
   st('Finished — server stopped. You can close this tab.'); try{window.close();}catch(e){}
 };
-document.getElementById('quit').onclick=async()=>{ try{await fetch('/quit');}catch(e){} st('Stopped. You can close this tab.'); };
+document.getElementById('quit').onclick=async()=>{
+  st(polling?'Cancelling render, then stopping…':'Stopping…');
+  try{await fetch('/quit');}catch(e){}
+  if(polling){ clearInterval(polling); polling=null; }
+  st('Stopped — any active render was cancelled. You can close this tab.');
+};
 </script></body></html>)HTML";
     return h.str();
 }
@@ -1669,7 +1688,7 @@ static string buildCliCommand(const string &source, const string &calibDir,
     c += " --bands " + to_string(a.bands);
     if (!a.exposure)          c += " --no-exposure";
     if (!a.smartSeam)         c += " --no-smart-seam";
-    if (g_parallax)           c += " --parallax";
+    if (!g_parallax)          c += " --no-parallax";
     if (!cropArg.empty())     c += " --crop " + q(cropArg);
     if (startFrame > 0)       c += " --start " + to_string(startFrame);
     if (endFrame >= 0)        c += " --end " + to_string(endFrame);
@@ -1985,7 +2004,20 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
         }
         else if (path == "/quit")
         {
-            body = "bye";
+            // Quit must also CANCEL an active render: signal the worker (and, via
+            // runParallelJobs' stop file, its child processes) and wait for it to
+            // wind down before exiting - otherwise the children are orphaned and
+            // keep rendering with the server gone.
+            if (g_busy)
+            {
+                cout << "[tuner] quit: cancelling active render...\n";
+                g_stop = true;
+                for (int i = 0; i < 150 && g_busy; i++)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                body = g_busy ? "bye (cancel signalled; workers still winding down)"
+                              : "bye (render cancelled)";
+            }
+            else body = "bye";
             running = false;
         }
         else { status = "404 Not Found"; body = "not found"; }
@@ -2344,6 +2376,11 @@ static int runParallelJobs(const string &source, const string &calibDir,
     string ext = op.extension().empty() ? ".mp4" : op.extension().string();
     fs::path dir = op.parent_path();
 
+    // Cancel relay: children poll this file (see g_stopFile); the monitor thread
+    // below creates it when g_stop is set, and every child winds down cleanly.
+    string stopFile = (dir / (stem + ".stop")).string();
+    { std::error_code ec; fs::remove(stopFile, ec); }
+
     vector<string> parts, logs, progs, cmds;
     vector<int> rangeS, rangeE;
     for (int i = 0; i < jobs; i++)
@@ -2365,7 +2402,7 @@ static int runParallelJobs(const string &source, const string &calibDir,
             + " --shift-top " + to_string(a.shiftTop) + " --shift-bottom " + to_string(a.shiftBottom)
             + " --shift-y " + to_string(a.shiftY) + " --bands " + to_string(a.bands)
             + (a.exposure ? "" : " --no-exposure") + (a.smartSeam ? "" : " --no-smart-seam")
-            + (g_parallax ? " --parallax" : "")
+            + (g_parallax ? "" : " --no-parallax")
             + (cropArg.empty() ? "" : " --crop " + q(cropArg))
             + " --jobs 1 --start " + to_string(s) + " --end " + to_string(e)
             + " --venc " + q(resolvedEnc) + " --bitrate " + q(g_vbitrate)
@@ -2374,7 +2411,7 @@ static int runParallelJobs(const string &source, const string &calibDir,
             + (g_look ? "" : " --no-look")
             + " --cas " + q(g_lookCas) + " --look-width " + q(g_lookWidth)
             + (g_lookGamma.empty() ? "" : " --gamma " + q(g_lookGamma))
-            + " --progress-file " + q(prg)
+            + " --progress-file " + q(prg) + " --stop-file " + q(stopFile)
             + " --out-file " + q(part) + " > " + q(log) + " 2>&1");
     }
 
@@ -2399,8 +2436,15 @@ static int runParallelJobs(const string &source, const string &calibDir,
     // UI + the overall prog bar), and print a live per-process line to the console.
     std::atomic<bool> running{true};
     std::thread mon([&]() {
+        bool stopSignalled = false;
         while (running.load())
         {
+            if (g_stop.load() && !stopSignalled)
+            {
+                ofstream sf(stopFile, std::ios::trunc); if (sf) sf << "stop\n";
+                stopSignalled = true;
+                cout << "\njobs: cancel requested - signalling children via " << stopFile << "\n";
+            }
             int sum = 0;
             {
                 lock_guard<mutex> lk(g_partMu);
@@ -2427,6 +2471,14 @@ static int runParallelJobs(const string &source, const string &calibDir,
     running = false; mon.join();
     { lock_guard<mutex> lk(g_partMu); for (int i = 0; i < n; i++) g_partPct[i] = 100; }
     cout << "\n";
+    if (g_stop.load())
+    {
+        std::error_code ec;
+        fs::remove(stopFile, ec);
+        cerr << "jobs: render cancelled - partial part files left on disk, not concatenating.\n";
+        return 2;
+    }
+    { std::error_code ec; fs::remove(stopFile, ec); }
 
     bool ok = true;
     for (int i = 0; i < n; i++)
@@ -2486,7 +2538,8 @@ int main(int argc, char **argv)
     bool explicitShift = hasArg(argc, argv, "--shift-top") || hasArg(argc, argv, "--shift-bottom")
                       || hasArg(argc, argv, "--shift-y") || hasArg(argc, argv, "--shift-x");
     bool autoAlign = !explicitShift && !hasArg(argc, argv, "--no-auto-align");
-    g_parallax = hasArg(argc, argv, "--parallax");   // per-pixel morph in the overlap (opt-in)
+    g_parallax = !hasArg(argc, argv, "--no-parallax");   // per-pixel morph in the overlap (default on)
+    g_stopFile = argVal(argc, argv, "--stop-file", "");     // parent tuner's cancel signal (parallel children)
     int port = stoi(argVal(argc, argv, "--port", "8090"));
     bool tune = hasArg(argc, argv, "--tune");
     int jobs = stoi(argVal(argc, argv, "--jobs", "4"));    // parallel child processes (video); default 4
