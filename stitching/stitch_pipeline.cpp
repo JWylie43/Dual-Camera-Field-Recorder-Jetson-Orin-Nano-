@@ -12,10 +12,12 @@
 //   --tune  -> launch an interactive browser tuner (see below)
 //
 // Right-image alignment (applied as one affine before the hard-seam composite):
-//   AUTO by default - measured from the footage itself (autoAlignEstimate): dense
-//   optical flow across the warped overlap band, per-row medians (rejects players,
-//   locks onto the field), line fit -> shift-top/bottom, median vertical flow ->
-//   shift-y. Estimated once per source; a sign self-check keeps it convention-proof.
+//   AUTO by default - measured from the footage itself (autoAlignEstimate): sparse
+//   feature matches across the warped overlap band (Shi-Tomasi corners, KLT with a
+//   round-trip gate - grass has no corners so it cannot vote), RANSAC line fit of
+//   dx over row -> shift-top/bottom, median dy of inliers -> shift-y. Sanity bounds
+//   + a before/after feature-residual check make it refuse itself rather than apply
+//   a bad fit; refusal leaves 0 and the tuner knobs in charge.
 //   Manual override (any of these skips the measurement):
 //   --shift-top N     horizontal shift of the TOP rows   (aligns the FAR edge)
 //   --shift-bottom N  horizontal shift of the BOTTOM rows (aligns the NEAR edge)
@@ -349,6 +351,79 @@ static StitchMaps cropMaps(const StitchMaps &m, int cx, int cy, int cw, int ch)
     return c;
 }
 
+// Rotate-then-crop, baked into the remap tables. The panorama is rotated about the
+// FULL canvas centre (matching the tuner preview, which rotates the image and keeps
+// the crop box + seam squared to the output), then the axis-aligned crop is taken -
+// so rotating pulls real content into the crop corners instead of black wedges, and
+// the seam stays a straight vertical column of the DELIVERED frame. Positive degrees
+// = clockwise on screen, exactly as the preview shows it. Implemented by resampling
+// the cylinder->camera lookup tables through the combined transform once (zero
+// per-frame cost); the warped images then come out already level, so the shear,
+// seam search, blend and morph all operate in final output space. Must be called on
+// the full (uncropped) maps. degrees == 0 falls back to the exact ROI crop.
+static StitchMaps rotateCropMaps(const StitchMaps &m, double degrees,
+                                 int cx, int cy, int cw, int ch)
+{
+    if (degrees == 0.0) return cropMaps(m, cx, cy, cw, ch);
+    cx = max(0, min(cx, m.OW - 1));
+    cy = max(0, min(cy, m.OH - 1));
+    cw = max(1, min(cw, m.OW - cx));
+    ch = max(1, min(ch, m.OH - cy));
+    double ang = degrees * CV_PI / 180.0, c = cos(ang), s = sin(ang);
+    double Cx = m.OW / 2.0, Cy = m.OH / 2.0;
+    // Inverse mapping (output pixel -> pano coords), fed to warpAffine as-is via
+    // WARP_INVERSE_MAP: p = Ccanvas + Rcw^-1 * (q + cropOrigin - Ccanvas).
+    Mat M = (Mat_<double>(2, 3) << c, s, c * (cx - Cx) + s * (cy - Cy) + Cx,
+             -s, c, -s * (cx - Cx) + c * (cy - Cy) + Cy);
+
+    StitchMaps r = m;
+    r.OW = cw; r.OH = ch;
+    r.fullOH = (m.fullOH > 0 ? m.fullOH : m.OH);
+    r.cropX = m.cropX + cx;
+    r.cropY = m.cropY + cy;
+    // Resample each lookup table through the transform. Done entirely on Mat (maps
+    // are built once, not per frame). The -1 invalid sentinel must not bilinear-
+    // blend into real coordinates at the wedge borders, so a 0/1 validity mask
+    // rides along and anything not fully covered is re-marked invalid afterwards.
+    auto rotMap = [&](const UMat &mxU, const UMat &myU, Mat &ox, Mat &oy) {
+        Mat mx, my;
+        mxU.copyTo(mx); myU.copyTo(my);
+        Mat v; compare(mx, 0.0, v, CMP_GE); v.convertTo(v, CV_32F, 1.0 / 255.0);
+        warpAffine(mx, ox, M, Size(cw, ch), INTER_LINEAR | WARP_INVERSE_MAP,
+                   BORDER_CONSTANT, Scalar(-1));
+        warpAffine(my, oy, M, Size(cw, ch), INTER_LINEAR | WARP_INVERSE_MAP,
+                   BORDER_CONSTANT, Scalar(-1));
+        Mat vw;
+        warpAffine(v, vw, M, Size(cw, ch), INTER_LINEAR | WARP_INVERSE_MAP,
+                   BORDER_CONSTANT, Scalar(0));
+        Mat bad; compare(vw, 0.999, bad, CMP_LT);
+        ox.setTo(-1, bad); oy.setTo(-1, bad);
+    };
+    Mat lx, ly, rx, ry;
+    rotMap(m.mapLx, m.mapLy, lx, ly);
+    rotMap(m.mapRx, m.mapRy, rx, ry);
+    UMat ulx, uly, urx, ury;
+    lx.copyTo(ulx); ly.copyTo(uly); rx.copyTo(urx); ry.copyTo(ury);
+    r.mapLx = ulx; r.mapLy = uly; r.mapRx = urx; r.mapRy = ury;
+
+    // Overlap band + seam in OUTPUT coordinates. The band is recomputed exactly
+    // from the resampled maps; the seam anchor is the user's pano-space column
+    // pushed through the forward transform at mid-height.
+    Mat vL, vR;
+    compare(lx, 0.0, vL, CMP_GE);
+    compare(rx, 0.0, vR, CMP_GE);
+    Mat bothv; bitwise_and(vL, vR, bothv);
+    Mat colHit; cv::reduce(bothv, colHit, 0, REDUCE_MAX);
+    int o0 = -1, o1 = -1;
+    for (int x = 0; x < cw; x++)
+        if (colHit.at<uchar>(0, x)) { if (o0 < 0) o0 = x; o1 = x + 1; }
+    r.ox0 = o0 < 0 ? 0 : o0;
+    r.ox1 = o1 < 0 ? cw : o1;
+    int seamOut = (int)lround(Cx + c * (m.seam - Cx) - cx);
+    r.seam = max(r.ox0, min(seamOut, r.ox1 > r.ox0 ? r.ox1 - 1 : r.ox1));
+    return r;
+}
+
 static void warpHalves(const UMat &frame, const StitchMaps &m, UMat &warpL, UMat &warpR)
 {
     int w = frame.cols / 2, h = frame.rows;
@@ -599,7 +674,7 @@ static void parallaxMorph(UMat &leftU, UMat &rightU, const StitchMaps &m, FlowSt
 }
 
 static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
-                      double degrees, const Align &a, vector<int> *prevSeam = nullptr,
+                      const Align &a, vector<int> *prevSeam = nullptr,
                       FlowState *flowState = nullptr)
 {
     UMat left = warpL, right = warpR;
@@ -646,14 +721,8 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
         pano = right.clone();
         left.copyTo(pano, mask8);           // left where mask, right elsewhere
     }
-    if (degrees != 0.0)
-    {
-        double ang = degrees * CV_PI / 180.0;
-        double c = cos(ang), s = sin(ang), ccx = m.OW / 2.0, ccy = m.OH / 2.0;
-        Mat M = (Mat_<double>(2, 3) << c, s, (1 - c) * ccx - s * ccy,
-                 -s, c, s * ccx + (1 - c) * ccy);
-        warpAffine(pano, pano, M, Size(m.OW, m.OH));
-    }
+    // NOTE: --degrees rotation is no longer applied here - it is baked into the
+    // remap tables by rotateCropMaps (rotate-then-crop, seam vertical in output).
     return pano;
 }
 
@@ -679,13 +748,18 @@ static bool seekFrame(VideoCapture &cap, int n)
 // ---- automatic geometric alignment (replaces the manual shear/shift knobs) ----
 // The shear the knobs set is a ground-plane parallax fit: displacement between the
 // two warped images that varies linearly with row. Those values are recoverable from
-// the footage itself: dense optical flow between the warped overlap bands measures
-// the per-pixel displacement, the PER-ROW MEDIAN rejects players (each row is mostly
-// field, so the median locks onto the background - the same judgment made by eye in
-// the tuner), and a line fit over the rows yields shift-top/shift-bottom; the median
-// vertical flow yields shift-y. Estimated once per source from a handful of frames
-// spread across the video; on unindexed files (no fast seek) it samples early frames
-// instead - the rig geometry is constant, so when they were shot doesn't matter.
+// the footage, but only from pixels that can actually be MATCHED. The first estimator
+// used dense optical flow with per-row medians and failed on real game footage: on a
+// mostly-grass band, DIS flow returns the smoothness prior's guess (~0) for the
+// featureless majority, which outvotes the few real features - it measured an
+// inverted shear on real footage (+28/-11 vs the known-good -5/+20), and its residual
+// self-check shared the same grass blind spot. This estimator measures only
+// verifiable structure: Shi-Tomasi corners in the left band, KLT-matched into the
+// right band with a round-trip gate, then a RANSAC line fit of dx over row - the
+// automated version of aligning known objects by eye. Grass casts no votes; players
+// (off the ground plane) and repeated-texture mismatches fall out as RANSAC
+// outliers; and the result must pass sanity bounds plus a before/after residual
+// check on a kept sample pair or it refuses itself and leaves the knobs at 0.
 
 static float medianOf(vector<float> &v)
 {
@@ -697,28 +771,58 @@ static float medianOf(vector<float> &v)
 
 struct AutoAlignResult { bool ok = false; double shiftTop = 0, shiftBottom = 0, shiftY = 0; int frames = 0; };
 
+// One verified left->right band correspondence: row + displacement.
+struct BandMatch { float y, dx, dy; };
+
+// Shi-Tomasi corners in gL(roi), KLT-tracked into gR and back; only round-trip-
+// consistent matches with plausible offsets are kept. `valid` masks the warp
+// wedges. Shared by the auto-align estimator and the find-tuning-frames scan.
+static void matchBandFeatures(const Mat &gL, const Mat &gR, const Mat &valid,
+                              const Rect &roi, int maxCorners, vector<BandMatch> &out)
+{
+    vector<Point2f> pts;
+    goodFeaturesToTrack(gL(roi), pts, maxCorners, 0.02, 10, valid(roi), 7);
+    if (pts.empty()) return;
+    for (auto &p : pts) p += Point2f((float)roi.x, (float)roi.y);
+    vector<Point2f> fwd, back; vector<uchar> stF, stB; vector<float> err;
+    calcOpticalFlowPyrLK(gL, gR, pts, fwd, stF, err, Size(21, 21), 3);
+    calcOpticalFlowPyrLK(gR, gL, fwd, back, stB, err, Size(21, 21), 3);
+    for (size_t i = 0; i < pts.size(); i++)
+    {
+        if (!stF[i] || !stB[i]) continue;
+        if (norm(back[i] - pts[i]) > 1.2) continue;
+        float dx = fwd[i].x - pts[i].x, dy = fwd[i].y - pts[i].y;
+        if (fabsf(dx) > 80.f || fabsf(dy) > 40.f) continue;
+        out.push_back({pts[i].y, dx, dy});
+    }
+}
+
 static AutoAlignResult autoAlignEstimate(const string &source, bool video, int totalFrames,
                                          const StitchMaps &m)
 {
     AutoAlignResult res;
     int x0 = max(0, m.ox0), x1 = min(m.OW, m.ox1), bw = x1 - x0, OH = m.OH;
-    if (bw < 32 || OH < 32) return res;
-    Rect band(x0, 0, bw, OH);
+    if (bw < 32 || OH < 96) return res;
+    Rect band(x0, 0, bw, OH), whole(0, 0, bw, OH);
+    UMat mLx = m.mapLx(band), mLy = m.mapLy(band), mRx = m.mapRx(band), mRy = m.mapRy(band);
 
-    // Collect warped grayscale overlap bands from sample frames. One full warped
-    // pair is kept for the sign self-check below.
-    vector<Mat> gLs, gRs;
-    UMat keepL, keepR;
+    // Collect verified feature matches from sample frames (band-only warp); keep
+    // the richest sample pair for the acceptance check at the end.
+    vector<BandMatch> matches;
+    Mat keepL, keepR; size_t keepCount = 0;
     auto addSample = [&](const Mat &frame) {
-        UMat uF, wL, wR;
-        frame.copyTo(uF);
-        warpHalves(uF, m, wL, wR);
-        Mat L, R;
-        wL(band).copyTo(L); wR(band).copyTo(R);
-        Mat gL, gR;
+        int w = frame.cols / 2;
+        Mat L, R, gL, gR;
+        remap(frame(Rect(0, 0, w, frame.rows)), L, mLx, mLy, INTER_LINEAR, BORDER_CONSTANT);
+        remap(frame(Rect(w, 0, w, frame.rows)), R, mRx, mRy, INTER_LINEAR, BORDER_CONSTANT);
         cvtColor(L, gL, COLOR_BGR2GRAY); cvtColor(R, gR, COLOR_BGR2GRAY);
-        gLs.push_back(gL); gRs.push_back(gR);
-        wL.copyTo(keepL); wR.copyTo(keepR);
+        Mat valid = (gL > 5) & (gR > 5);
+        erode(valid, valid, getStructuringElement(MORPH_RECT, Size(31, 31)));
+        size_t before = matches.size();
+        matchBandFeatures(gL, gR, valid, whole, 200, matches);
+        if (matches.size() - before >= keepCount || keepL.empty())
+        { keepCount = matches.size() - before; keepL = gL; keepR = gR; }
+        res.frames++;
     };
     if (!video)
     {
@@ -754,138 +858,128 @@ static AutoAlignResult autoAlignEstimate(const string &source, bool video, int t
         {
             // No usable index: sample the first ~10s (every 30th frame). Fine - the
             // geometry being measured is the rig, which doesn't change over the game.
-            for (int i = 0; i < 30 * (WANT - 1) + 1 && (int)gLs.size() < WANT; i++)
+            for (int i = 0; i < 30 * (WANT - 1) + 1 && res.frames < WANT; i++)
             {
                 if (!cap.read(frame) || frame.empty()) break;
                 if (i % 30 == 0) addSample(frame);
             }
         }
     }
-    if (gLs.empty()) return res;
-    res.frames = (int)gLs.size();
-
-    // Dense flow per sample; per-row median of the horizontal component.
-    Ptr<DISOpticalFlow> dis = DISOpticalFlow::create(DISOpticalFlow::PRESET_MEDIUM);
-    vector<vector<float>> rowMed(OH);       // per row: one median per sampled frame
-    vector<float> yMeds;                    // per frame: median vertical flow
-    for (size_t f = 0; f < gLs.size(); f++)
+    if (res.frames == 0) return res;
+    if ((int)matches.size() < 12)
     {
-        Mat flow;
-        dis->calc(gLs[f], gRs[f], flow);
-        vector<float> ys;
-        for (int y = 0; y < OH; y++)
-        {
-            const Vec2f *fp = flow.ptr<Vec2f>(y);
-            const uchar *lp = gLs[f].ptr<uchar>(y);
-            const uchar *rp = gRs[f].ptr<uchar>(y);
-            vector<float> xs;
-            for (int x = 0; x < bw; x++)
-            {
-                if (lp[x] < 5 || rp[x] < 5) continue;                 // black wedge
-                if (fabsf(fp[x][0]) > 80.f || fabsf(fp[x][1]) > 40.f) continue;  // implausible
-                xs.push_back(fp[x][0]);
-                ys.push_back(fp[x][1]);
-            }
-            if ((int)xs.size() > bw / 8) rowMed[y].push_back(medianOf(xs));
-        }
-        if (!ys.empty()) yMeds.push_back(medianOf(ys));
+        cout << "auto-align: only " << matches.size() << " verifiable feature matches in the "
+                "overlap band - leaving alignment at 0. Set the shear knobs manually (the "
+                "'Find tuning frames' scan can locate good frames).\n";
+        return res;
     }
 
-    // Median across frames per row, then a least-squares line over the rows.
-    vector<double> Y, U;
-    for (int y = 0; y < OH; y++)
-        if (!rowMed[y].empty()) { Y.push_back(y); U.push_back(medianOf(rowMed[y])); }
-    if ((int)Y.size() < OH / 4 || yMeds.empty()) return res;
-    double n = (double)Y.size(), sy = 0, su = 0, syy = 0, syu = 0;
-    for (size_t i = 0; i < Y.size(); i++)
-    { sy += Y[i]; su += U[i]; syy += Y[i] * Y[i]; syu += Y[i] * U[i]; }
+    // RANSAC line fit of dx over row. Sampled pairs must span enough rows that the
+    // slope means something; inliers agree with the model within 1.5 px.
+    int N = (int)matches.size(), bestIn = -1;
+    double bc0 = 0, bc1 = 0;
+    unsigned rngState = 22695477u;
+    auto rnd_ = [&]() { rngState = rngState * 1664525u + 1013904223u; return rngState >> 8; };
+    for (int it = 0; it < 600; it++)
+    {
+        const BandMatch &A = matches[rnd_() % N], &B = matches[rnd_() % N];
+        if (fabsf(A.y - B.y) < OH / 6.0f) continue;
+        double c1 = (B.dx - A.dx) / (double)(B.y - A.y), c0 = A.dx - c1 * A.y;
+        int in = 0;
+        for (const auto &q : matches) if (fabs(q.dx - (c0 + c1 * q.y)) <= 1.5) in++;
+        if (in > bestIn) { bestIn = in; bc0 = c0; bc1 = c1; }
+    }
+    // Least-squares refit on the inliers. Their row SPAN decides whether the slope
+    // can be trusted: a fit supported by only one region of the band cannot be
+    // extrapolated to the canvas edges, so it degrades to a constant shift.
+    vector<float> dys;
+    double n = 0, sy = 0, su = 0, syy = 0, syu = 0;
+    float yMin = 1e9f, yMax = -1e9f;
+    for (const auto &q : matches)
+    {
+        if (bestIn < 0 || fabs(q.dx - (bc0 + bc1 * q.y)) > 1.5) continue;
+        n++; sy += q.y; su += q.dx; syy += (double)q.y * q.y; syu += (double)q.y * q.dx;
+        dys.push_back(q.dy);
+        yMin = min(yMin, q.y); yMax = max(yMax, q.y);
+    }
+    if (n < 10)
+    {
+        cout << "auto-align: no consensus among the feature matches (" << (int)n << " of "
+             << N << " agree) - leaving alignment at 0.\n";
+        return res;
+    }
     double den = n * syy - sy * sy;
     double c1 = fabs(den) > 1e-9 ? (n * syu - sy * su) / den : 0.0;
     double c0 = (su - c1 * sy) / n;
-    double uTop = c0, uBot = c0 + c1 * (OH - 1), uY = medianOf(yMeds);
-
-    // The correction moves the RIGHT image, so it should be the negation of the
-    // measured offset - but rather than trust the sign convention, test both against
-    // doing nothing on the kept sample pair and keep whichever measurably shrinks
-    // the residual misalignment.
-    auto residual = [&](double st, double sb, double sYv) -> double {
-        UMat right = keepR;
-        if (st != 0.0 || sb != 0.0 || sYv != 0.0)
-        {
-            double k = (OH > 1) ? (sb - st) / (OH - 1) : 0.0;
-            Mat T = (Mat_<double>(2, 3) << 1, k, st, 0, 1, sYv);
-            warpAffine(keepR, right, T, Size(m.OW, m.OH));
-        }
-        Mat L, R;
-        keepL(band).copyTo(L); right(band).copyTo(R);
-        Mat gL, gR;
-        cvtColor(L, gL, COLOR_BGR2GRAY); cvtColor(R, gR, COLOR_BGR2GRAY);
-        Mat flow;
-        dis->calc(gL, gR, flow);
-        vector<float> mags;
-        for (int y = 0; y < OH; y += 2)
-        {
-            const Vec2f *fp = flow.ptr<Vec2f>(y);
-            const uchar *lp = gL.ptr<uchar>(y);
-            const uchar *rp = gR.ptr<uchar>(y);
-            for (int x = 0; x < bw; x += 2)
-                if (lp[x] >= 5 && rp[x] >= 5 && fabsf(fp[x][0]) < 80.f)
-                    mags.push_back(fabsf(fp[x][0]) + fabsf(fp[x][1]));
-        }
-        return mags.empty() ? 1e9 : (double)medianOf(mags);
-    };
-    double r0 = residual(0, 0, 0);
-    double rNeg = residual(-uTop, -uBot, -uY);
-    double rPos = residual(uTop, uBot, uY);
-    double best = min(rNeg, rPos);
-    if (best >= r0 * 0.95)
+    bool constOnly = (yMax - yMin) < OH / 3.0f;
+    if (constOnly) { c1 = 0.0; c0 = su / n; }
+    double uTop = c0, uBot = c0 + c1 * (OH - 1);
+    // The correction moves the RIGHT image, so it is the negation of the measured
+    // left->right displacement.
+    double st = -uTop, sb = -uBot, sYv = -medianOf(dys);
+    if (fabs(st) > 60 || fabs(sb) > 60 || fabs(sYv) > 20)
     {
-        cout << "auto-align: no measurable improvement (residual " << r0 << " -> " << best
-             << " px) - leaving alignment at 0. Use the shift flags to set it manually.\n";
+        cout << "auto-align: fit (top " << st << ", bottom " << sb << ", y " << sYv
+             << ") is outside plausible bounds - leaving alignment at 0.\n";
         return res;
     }
-    double sgn = (rNeg <= rPos) ? -1.0 : 1.0;
-    auto rnd = [](double v) { return std::round(v * 100.0) / 100.0; };
-    res.shiftTop = rnd(sgn * uTop);
-    res.shiftBottom = rnd(sgn * uBot);
-    res.shiftY = rnd(sgn * uY);
+
+    // Acceptance: apply the correction to the kept sample's right band and require
+    // the feature residual to shrink (features again - grass cannot fake this).
+    auto residual = [&](double t, double b, double yv) -> double {
+        Mat right = keepR;
+        if (t != 0.0 || b != 0.0 || yv != 0.0)
+        {
+            double k = (OH > 1) ? (b - t) / (OH - 1) : 0.0;
+            Mat T = (Mat_<double>(2, 3) << 1, k, t, 0, 1, yv);
+            warpAffine(keepR, right, T, keepR.size());
+        }
+        Mat valid = (keepL > 5) & (right > 5);
+        erode(valid, valid, getStructuringElement(MORPH_RECT, Size(31, 31)));
+        vector<BandMatch> ms;
+        matchBandFeatures(keepL, right, valid, whole, 200, ms);
+        if ((int)ms.size() < 6) return 1e9;
+        vector<float> mags; mags.reserve(ms.size());
+        for (const auto &q : ms) mags.push_back(fabsf(q.dx) + fabsf(q.dy));
+        return medianOf(mags);
+    };
+    double r0 = residual(0, 0, 0), r1 = residual(st, sb, sYv);
+    if (r0 < 0.75)
+    {
+        cout << "auto-align: overlap already aligned (residual " << r0
+             << " px) - leaving alignment at 0.\n";
+        return res;
+    }
+    if (r1 >= r0 * 0.95)
+    {
+        cout << "auto-align: correction did not improve the residual (" << r0 << " -> " << r1
+             << " px) - leaving alignment at 0. Set the shear knobs manually.\n";
+        return res;
+    }
+    auto rnd2 = [](double v) { return std::round(v * 100.0) / 100.0; };
+    res.shiftTop = rnd2(st); res.shiftBottom = rnd2(sb); res.shiftY = rnd2(sYv);
     res.ok = true;
     cout << "auto-align: shift-top " << res.shiftTop << ", shift-bottom " << res.shiftBottom
-         << ", shift-y " << res.shiftY << "  (measured from " << res.frames
-         << " frame(s); overlap residual " << r0 << " -> " << best << " px)\n";
+         << ", shift-y " << res.shiftY << "  (" << (int)n << "/" << N << " feature matches"
+         << (constOnly ? ", constant fit (row span too small for a slope)" : "")
+         << ", row span " << (int)(yMax - yMin) << " px, " << res.frames
+         << " frame(s); residual " << r0 << " -> " << r1 << " px)\n";
     return res;
 }
 
 // ---- tuning-frame finder (tuner's "Find tuning frames" button) --------------
 // Finds frames that make good MANUAL shear-tuning targets: a distinct object
 // (person, cone, sign) inside the overlap band, clearly visible in BOTH cameras.
-// "Clear feature" = Shi-Tomasi corners in the left band that KLT-track into the
-// right band and survive a track-back check - the automated version of "a known
-// object you could align by eye". Grass contributes nothing (no 2-D gradient =
-// no corners), so unlike the dense-flow estimator this can't be outvoted by it.
+// "Clear feature" = a region where matchBandFeatures finds enough verified
+// correspondences - the automated version of "a known object you could align by
+// eye". Grass contributes nothing (no 2-D gradient = no corners).
 struct TuningFrames { int top = -1, bottom = -1, both = -1, scanned = 0; };
 
 static bool bandRegionHasFeature(const Mat &gL, const Mat &gR, const Mat &valid, const Rect &roi)
 {
-    vector<Point2f> pts;
-    goodFeaturesToTrack(gL(roi), pts, 40, 0.03, 12, valid(roi), 7);
-    if ((int)pts.size() < 6) return false;
-    for (auto &p : pts) p += Point2f((float)roi.x, (float)roi.y);
-    // Track into the right band and back; keep only round-trip-consistent matches
-    // with a plausible offset. This is the "matchable in both cameras" test.
-    vector<Point2f> fwd, back; vector<uchar> stF, stB; vector<float> err;
-    calcOpticalFlowPyrLK(gL, gR, pts, fwd, stF, err, Size(21, 21), 3);
-    calcOpticalFlowPyrLK(gR, gL, fwd, back, stB, err, Size(21, 21), 3);
-    int good = 0;
-    for (size_t i = 0; i < pts.size(); i++)
-    {
-        if (!stF[i] || !stB[i]) continue;
-        if (norm(back[i] - pts[i]) > 1.5) continue;
-        Point2f d = fwd[i] - pts[i];
-        if (fabs(d.x) > 80.f || fabs(d.y) > 40.f) continue;
-        good++;
-    }
-    return good >= 6;
+    vector<BandMatch> ms;
+    matchBandFeatures(gL, gR, valid, roi, 40, ms);
+    return (int)ms.size() >= 6;
 }
 
 static TuningFrames findTuningFrames(const string &source, bool video, const StitchMaps &m)
@@ -940,7 +1034,7 @@ static TuningFrames findTuningFrames(const string &source, bool video, const Sti
     return tfr;
 }
 
-static string stitchImageFile(const string &source, StitchMaps &m, double degrees,
+static string stitchImageFile(const string &source, StitchMaps &m,
                               const Align &a, const string &outDir, const string &outFile = "")
 {
     Mat img = imread(source);
@@ -948,7 +1042,7 @@ static string stitchImageFile(const string &source, StitchMaps &m, double degree
     UMat uImg, wL, wR;
     img.copyTo(uImg);
     warpHalves(uImg, m, wL, wR);
-    UMat uPano = composite(wL, wR, m, degrees, a);
+    UMat uPano = composite(wL, wR, m, a);
     Mat pano; uPano.copyTo(pano);
     string out = !outFile.empty() ? outFile : (outDir + "/pano.jpg");
     imwrite(out, pano);
@@ -1028,7 +1122,7 @@ static string buildEncodeCmd(const string &venc, int W, int H, double fps, const
     return c.str();
 }
 
-static string stitchVideoFile(const string &source, StitchMaps &m, double degrees,
+static string stitchVideoFile(const string &source, StitchMaps &m,
                               const Align &a, int startFrame, int endFrame, int totalFrames,
                               const string &outDir, const string &outFile = "",
                               std::atomic<int> *prog = nullptr, const string &progFile = "")
@@ -1080,7 +1174,7 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
         if (!cap.read(frame) || frame.empty()) break;   // also stops at EOF
         frame.copyTo(uFrame);
         warpHalves(uFrame, m, wL, wR);
-        composite(wL, wR, m, degrees, a, &prevSeam, &flowState).copyTo(pano);
+        composite(wL, wR, m, a, &prevSeam, &flowState).copyTo(pano);
         if (pipe)
         {
             if (pano.type() != CV_8UC3) pano.convertTo(pano, CV_8UC3);
@@ -1222,26 +1316,36 @@ function drawRight(){
   const k=(OH>1)?(sBot-sTop)/(OH-1):0;         // per-row shear slope
   ctx.save(); ctx.transform(1,0,k,1,sTop,sY); ctx.drawImage(imgR,0,0); ctx.restore();
 }
+// The seam value lives in PANO coordinates (matching the engine param); on the
+// canvas it appears at the rotated column. The engine cuts the seam VERTICALLY in
+// output space (rotation is baked into the maps before the seam), so the red line
+// and the hard-seam clip stay squared to the output - only the image rotates.
+const seamToCanvas=(v)=>{ return OW/2 + Math.cos(rot*Math.PI/180)*(v-OW/2); };
+const canvasToSeam=(x)=>{ return OW/2 + (x-OW/2)/Math.max(0.2,Math.cos(rot*Math.PI/180)); };
+function drawRotated(fn){
+  ctx.save();
+  if(rot){ ctx.translate(OW/2,OH/2); ctx.rotate(rot*Math.PI/180); ctx.translate(-OW/2,-OH/2); }
+  fn(); ctx.restore();
+}
 function render(){
   if(!loaded) return;
   ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=1; ctx.clearRect(0,0,OW,OH);
-  // Preview the whole-panorama rotation the same way the engine does: rotate about the
-  // canvas centre. The crop box stays axis-aligned (drawn after we restore).
-  ctx.save();
-  if(rot){ ctx.translate(OW/2,OH/2); ctx.rotate(rot*Math.PI/180); ctx.translate(-OW/2,-OH/2); }
+  const sc=seamToCanvas(seam);
   if(document.getElementById('blend').checked){
-    ctx.globalAlpha=0.5; ctx.drawImage(imgL,0,0); drawRight(); ctx.globalAlpha=1;
+    drawRotated(()=>{ ctx.globalAlpha=0.5; ctx.drawImage(imgL,0,0); drawRight(); ctx.globalAlpha=1; });
   } else {
-    ctx.drawImage(imgL,0,0);
-    ctx.save(); ctx.beginPath(); ctx.rect(seam,0,OW-seam,OH); ctx.clip(); drawRight(); ctx.restore();
+    // Each side clipped in OUTPUT space at the (vertical) seam column, image rotated under it.
+    ctx.save(); ctx.beginPath(); ctx.rect(0,0,sc,OH); ctx.clip();
+    drawRotated(()=>{ return ctx.drawImage(imgL,0,0); }); ctx.restore();
+    ctx.save(); ctx.beginPath(); ctx.rect(sc,0,OW-sc,OH); ctx.clip();
+    drawRotated(()=>{ ctx.drawImage(imgL,0,0); drawRight(); }); ctx.restore();
   }
   if(showSeam){
     ctx.strokeStyle='#f33'; ctx.lineWidth=2;
-    ctx.beginPath(); ctx.moveTo(seam,0); ctx.lineTo(seam,OH); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(sc,0); ctx.lineTo(sc,OH); ctx.stroke();
     // Grab handle at mid-height so the seam line reads as draggable (hidden while cropping).
-    if(!cropOn){ const hh=Math.max(16,OH*0.03); ctx.fillStyle='#f33'; ctx.fillRect(seam-hh/2,OH/2-hh,hh,2*hh); }
+    if(!cropOn){ const hh=Math.max(16,OH*0.03); ctx.fillStyle='#f33'; ctx.fillRect(sc-hh/2,OH/2-hh,hh,2*hh); }
   }
-  ctx.restore();
   if(cropOn) drawCrop();
 }
 function drawCrop(){
@@ -1315,7 +1419,7 @@ cv.onmousedown=(e)=>{
   if(!loaded) return;
   const p=toCanvas(e);
   if(!cropOn){   // not cropping -> grab the red seam line if we're near it
-    if(Math.abs(p.x-seam)<Math.max(14, OW*0.012)){ dragMode='seam'; dragStart=p; e.preventDefault(); }
+    if(Math.abs(p.x-seamToCanvas(seam))<Math.max(14, OW*0.012)){ dragMode='seam'; dragStart=p; e.preventDefault(); }
     return;
   }
   const hs=Math.max(14, OW*0.016);
@@ -1329,11 +1433,11 @@ cv.onmousedown=(e)=>{
 cv.onmousemove=(e)=>{
   const p=toCanvas(e);
   if(!dragMode){   // hover feedback: show a resize cursor when over the draggable seam line
-    if(loaded && !cropOn){ cv.style.cursor=(Math.abs(p.x-seam)<Math.max(14,OW*0.012))?'ew-resize':'default'; }
+    if(loaded && !cropOn){ cv.style.cursor=(Math.abs(p.x-seamToCanvas(seam))<Math.max(14,OW*0.012))?'ew-resize':'default'; }
     return;
   }
   const dx=p.x-dragStart.x, dy=p.y-dragStart.y;
-  if(dragMode==='seam'){ seam=clampSeam(p.x); const mv=document.getElementById('mv'); if(mv) mv.value=seam; }
+  if(dragMode==='seam'){ seam=clampSeam(canvasToSeam(p.x)); const mv=document.getElementById('mv'); if(mv) mv.value=seam; }
   else if(dragMode==='move'){ cropX=clmp(cropStart.x+dx,0,OW-cropW); cropY=clmp(cropStart.y+dy,0,OH-cropH); }
   else if(dragMode==='br'){ cropW=clmp(cropStart.w+dx,20,OW-cropX); cropH=clmp(cropStart.h+dy,20,OH-cropY); }
   else if(dragMode==='tl'){
@@ -1746,6 +1850,10 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                 string ss = qparam(query, "seam");
                 StitchMaps mm = m;
                 if (!ss.empty()) mm.seam = stoi(ss);
+                // Global rotation (tuner's Rotate control; falls back to the CLI value).
+                // Baked into the maps together with the crop: rotate about the full-
+                // canvas centre, THEN crop - matching the preview exactly.
+                double dg = query.find("degrees=") != string::npos ? stod(qparam(query, "degrees")) : degrees;
                 // Optional crop (full-canvas coords): restrict all work to this region.
                 int cw = query.find("cropw=") != string::npos ? stoi(qparam(query, "cropw")) : 0;
                 int chh = query.find("croph=") != string::npos ? stoi(qparam(query, "croph")) : 0;
@@ -1756,9 +1864,12 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                     ? (to_string(cx) + "," + to_string(cy) + "," + to_string(cw) + "," + to_string(chh)) : "";
                 if (cw > 0 && chh > 0)
                 {
-                    mm = cropMaps(mm, cx, cy, cw, chh);
-                    cout << "[stitch] crop " << cw << "x" << chh << " @ (" << cx << "," << cy << ")\n";
+                    mm = rotateCropMaps(mm, dg, cx, cy, cw, chh);
+                    cout << "[stitch] crop " << cw << "x" << chh << " @ (" << cx << "," << cy << ")"
+                         << (dg != 0.0 ? " rotate " + to_string(dg) + " deg" : "") << "\n";
                 }
+                else if (dg != 0.0)
+                    mm = rotateCropMaps(mm, dg, 0, 0, mm.OW, mm.OH);
                 g_busy = true; g_done = false; g_percent = 0;
                 { lock_guard<mutex> lk(g_mu); g_result.clear(); }
                 { lock_guard<mutex> lk(g_partMu); g_partPct.clear(); g_partDone.clear(); g_partTotal.clear(); }
@@ -1770,9 +1881,6 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                 int seamVal = ss.empty() ? -1 : stoi(ss);
                 int endRes = endFrame >= 0 ? endFrame : (tf > 0 ? tf - 1 : -1);
                 string calib = calibDir;
-                // Global rotation of the finished panorama (tuner's Rotate control -> --degrees);
-                // falls back to whatever was passed on the command line when the param is absent.
-                double dg = query.find("degrees=") != string::npos ? stod(qparam(query, "degrees")) : degrees;
                 // Build + record the exact equivalent CLI command (shown in UI + console).
                 {
                     string fo = of.empty() ? (outDir + "/stitched_video.mp4") : of;
@@ -1793,8 +1901,8 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                     }
                     else                                           // single-process (image, or --no-jobs)
                         res = vid
-                            ? stitchVideoFile(src, mm, dg, a, startFrame, endFrame, tf, outDir, of, &g_percent)
-                            : stitchImageFile(src, mm, dg, a, outDir, of);
+                            ? stitchVideoFile(src, mm, a, startFrame, endFrame, tf, outDir, of, &g_percent)
+                            : stitchImageFile(src, mm, a, outDir, of);
                     // Attach the recording's audio to the finished stitch, if asked and available.
                     if (wantAudio && vid && res.rfind("ERROR", 0) != 0)
                     {
@@ -2487,19 +2595,23 @@ int main(int argc, char **argv)
 
     StitchMaps m = buildStitchMaps(KL, DL, KR, DR, R, frame.cols / 2, frame.rows, seamArg);
 
-    // Optional --crop "x,y,w,h" (full-canvas coords): restrict work to that region.
-    if (!cropArg.empty())
+    // Optional --crop "x,y,w,h" (full-canvas coords) and --degrees rotation, baked
+    // into the maps as one transform (rotate about the full-canvas centre, THEN crop).
     {
         int cx = 0, cy = 0, cw = 0, ch = 0;
-        if (sscanf(cropArg.c_str(), "%d,%d,%d,%d", &cx, &cy, &cw, &ch) == 4 && cw > 0 && ch > 0)
+        bool haveCrop = !cropArg.empty() &&
+            sscanf(cropArg.c_str(), "%d,%d,%d,%d", &cx, &cy, &cw, &ch) == 4 && cw > 0 && ch > 0;
+        if (haveCrop || degrees != 0.0)
         {
-            m = cropMaps(m, cx, cy, cw, ch);
-            cout << "crop " << cw << "x" << ch << " @ (" << cx << "," << cy << ")\n";
+            if (!haveCrop) { cx = 0; cy = 0; cw = m.OW; ch = m.OH; }
+            m = rotateCropMaps(m, degrees, cx, cy, cw, ch);
+            if (haveCrop) cout << "crop " << cw << "x" << ch << " @ (" << cx << "," << cy << ")\n";
+            if (degrees != 0.0) cout << "rotate " << degrees << " deg (baked into maps)\n";
         }
     }
 
-    string result = video ? stitchVideoFile(source, m, degrees, a, startFrame, endFrame, totalFrames, outDir, outFile, nullptr, progFile)
-                          : stitchImageFile(source, m, degrees, a, outDir, outFile);
+    string result = video ? stitchVideoFile(source, m, a, startFrame, endFrame, totalFrames, outDir, outFile, nullptr, progFile)
+                          : stitchImageFile(source, m, a, outDir, outFile);
     cout << (video ? "video -> " : "image -> ") << result << "\n";
     if (video && wantAudio) attachAudioToStitch(result, source, audioFile);
     return 0;
