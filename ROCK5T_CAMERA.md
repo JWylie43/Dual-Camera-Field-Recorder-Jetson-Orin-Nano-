@@ -182,6 +182,29 @@ attempt). Full-enable overlay, zero runtime workarounds.
   AE-converged), then
   `ffmpeg -f rawvideo -pix_fmt nv12 -s 1920x1080 -i X.nv12 -update 1 X.png`.
 
+## Bring-up log (2026-09-11, late): sensor modes proven; 4K30 has CRC noise, binned is clean
+
+- Mode switching works: set the sensor subdev fmt, then **restart rkaiq_3A**
+  before streaming (stale 3A state after a mode change = zero frames).
+  `SENx=$(media-ctl -d /dev/mediaN -e "m0X_b_imx477 ...")` then
+  `v4l2-ctl -d $SENx --set-subdev-fmt pad=0,width=W,height=H,code=C`
+  (0x3012=SRGGB12 for full/binned, 0x300f=SRGGB10 for 4K30).
+- **2028x1520@40 binned: flawless** (40.00fps, 25ms cadence, zero errors,
+  900Mbps). This is the working recording mode today.
+- **3840x2160@30: streams on BOTH cameras but with ~5k CSI CRC errors per
+  30-frame burst (~7% of lines), near-identical counts on both cables →
+  systematic, not one bad cable.** Candidate causes: cable/adapter SI margin
+  at 2.1Gbps, or rkisp/dphy hs-settle timing for the 2096Mbps rate (software,
+  affects both equally — check before buying cables). A still frame looks
+  visually clean — CIF appears to absorb/drop damaged data; measure real
+  delivered fps + motion artifacts before trusting 4K30.
+- AWB: strong blue cast, as predicted (imx577 detection zones). Fix =
+  daylight iteration session on gen_imx477_iq.py's AWB section (regenerate →
+  /etc/iqfiles → restart rkaiq_3A → recapture; ~1min/iteration). Note: RPi's
+  published AWB data cannot be converted to rkaiq's detection-zone format
+  analytically — the zones live in rkaiq's own stats space (hence the
+  imx577 placeholders).
+
 ## Status (2026-09-03): all three pieces DRAFTED, awaiting hardware
 
 - **Driver**: `rock5t-camera/driver/imx477.c` + Makefile + NOTES.md — Rockchip
