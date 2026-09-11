@@ -162,6 +162,26 @@ m01_b_imx477`, and ALL FOUR notifiers complete (rkcif-mipi-lvds2/4 AND
 rkisp0-vir0 / rkisp1-vir1 — the ISPs never completed on any stock-kernel
 attempt). Full-enable overlay, zero runtime workarounds.
 
+## Bring-up log (2026-09-11, night): FIRST LIGHT — both cameras imaging through the full ISP path
+
+- rkaiq_3A fixed as a boot service (systemd drop-in, see kernel-build/README).
+- Driver rev-2 (`trigger_mode` runtime override) built + installed; with the
+  XVS pads not yet wired, `echo 0 > /sys/module/imx477/parameters/trigger_mode`
+  free-runs both cameras (DT roles stay source/sink for genlock day).
+- Both cameras capture clean 1080p NV12 from the mainpaths (video22/video31),
+  steady at 10 fps = the sensor's default full-res 4056x3040@10 mode; the ISP
+  scales. **4K30 mode selection is still TODO** (bake into record_dual.sh).
+- **First-light images: sharp, detailed, correct geometry (inverted — cameras
+  physically upside down), same scene from offset positions = stereo pair
+  working.** Quality issues match the IQ TRANSLATION_NOTES predictions
+  exactly: strong blue cast (AWB regions are imx577-module values — the
+  flagged first recalibration) and dark indoors (8ms sports shutter cap +
+  evening room light + aperture). Tune AWB via gen_imx477_iq.py in daylight;
+  don't hand-edit the json.
+- Grab-a-frame recipe: v4l2-ctl 60 frames to /tmp/*.nv12 (last frames are
+  AE-converged), then
+  `ffmpeg -f rawvideo -pix_fmt nv12 -s 1920x1080 -i X.nv12 -update 1 X.png`.
+
 ## Status (2026-09-03): all three pieces DRAFTED, awaiting hardware
 
 - **Driver**: `rock5t-camera/driver/imx477.c` + Makefile + NOTES.md — Rockchip
