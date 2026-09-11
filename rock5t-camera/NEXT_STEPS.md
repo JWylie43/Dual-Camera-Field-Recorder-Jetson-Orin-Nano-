@@ -1,5 +1,15 @@
 # NEXT STEPS — resume here when the camera cables arrive
 
+> **UPDATE 2026-09-11 (cables arrived):** STEP 1–2 PASSED — both sensors detect
+> as 0x0477. Two stack bugs found on the way to STEP 3; both diagnosed, fixes in
+> `../ROCK5T_CAMERA.md` bring-up log (2026-09-11): (1) out-of-tree imx477.ko
+> loses the udev load-order race against the D-PHY → sensors never join the
+> media graph → fixed with `/etc/modprobe.d/imx477-order.conf` softdep (now an
+> install requirement); (2) `rkaiq_3A.service` kills itself at start — run
+> `sudo rkaiq_3A_server` manually. Also: this stack is CIF→ISP online — STEP 3's
+> raw-bypass grab doesn't apply; smoke-test via rkisp_mainpath (video22/video31,
+> NV12) with the 3A server running.
+
 **Read this first.** It is the single entry point for continuing the ROCK 5T
 IMX477 bring-up in a fresh session, with no prior context assumed. Companion
 docs: `ROCK5T_CAMERA.md` (plan + bring-up log), `SCHEMATIC_FACTS.md` (wiring),

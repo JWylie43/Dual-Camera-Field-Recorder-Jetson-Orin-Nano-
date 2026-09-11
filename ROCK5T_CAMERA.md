@@ -77,6 +77,49 @@ file) -> port sync_test.sh for genlock. If probe still reads 0000 WITH a
 camera attached, suspect cable/connector seating first, then the RPi-HQ R8
 power-down issue (see rpi-hq-camera-orin memory / RidgeRun).
 
+## Bring-up log (2026-09-11): cameras cabled — probe PASSES, async-bind race found + fixed
+
+Both Pi HQ cameras connected (CAM0 J5002, CAM1 J10) with the new 30-pin cables.
+
+- **STEP 2 PASS:** `Detected Sony imx0477 sensor` on `3-001a` AND `4-001a`;
+  `i2cdetect` shows `UU` at 0x1a on buses 3 and 4. Cables, wiring, overlay
+  chains, driver probe: all good. No R8 power-down issue.
+- **New blocker found: module load-order race.** The sensor entities never
+  appeared in the CIF media graphs (`csi2-dphy0/4` sink pads unlinked), so
+  rkaiq found no camera (and segfaulted — it crashes on an empty sensor list)
+  and mainpath STREAMON returned EPERM (`check rkisp_mainpath link or isp
+  input`). Root cause, from dmesg timeline + vendor `phy-rockchip-csi2-dphy.c`:
+  the D-PHY registers its sensor async-notifier at probe (~11.8s), and at
+  ~11.87s rkcif/rkisp run Rockchip's **"clear unready subdev"** — dropping the
+  not-yet-arrived sensor and force-completing the notifiers. Out-of-tree
+  `imx477.ko` loads via udev at ~14.5s: registers fine, matches nothing, ever.
+  Radxa's own cameras never hit this because their sensor drivers are **built
+  into the kernel** (`=y`) — only an out-of-tree sensor module can lose this
+  race. (Phandle fixups, DT graph, CONFIG_NO_GKI, driver binding: all verified
+  fine along the way.)
+- **Dead end, do not retry:** unbind/rebind of `csi2-dphy0` at runtime → kernel
+  oops (vendor rkcif/rkisp keep stale refs into the D-PHY after notifier
+  completion). Reboot required after any such attempt.
+- **Fix (install step, now required):** make udev load imx477 before the D-PHY:
+
+  ```
+  echo "softdep phy_rockchip_csi2_dphy pre: imx477" | sudo tee /etc/modprobe.d/imx477-order.conf
+  # + if lsinitramfs shows the dphy module in the initramfs:
+  echo imx477 | sudo tee -a /etc/initramfs-tools/modules && sudo update-initramfs -u
+  ```
+
+  Success signature after reboot: `dphy0 matches m00_b_imx477 3-001a` (and
+  dphy4/m01) in dmesg; `m0x_b_imx477` entities present in media0/media1.
+  **DKMS packaging must ship this modprobe.d file.**
+- **Also found:** `rkaiq_3A.service` is broken as shipped (oneshot wrapper
+  backgrounds the server, systemd then runs ExecStop = `killall`, so it dies
+  after ~16ms). Run `sudo rkaiq_3A_server` manually for now; fix the unit
+  (RemainAfterExit=yes or Type=forking) before relying on it.
+- **Topology note for STEP 3:** this stack runs CIF→ISP **online** — the rkcif
+  video nodes are not for raw capture here; the smoke test goes through
+  `rkisp_mainpath` (video22 = CAM0, video31 = CAM1, NV12) with rkaiq_3A_server
+  running. The raw-bypass grab in NEXT_STEPS STEP 3 doesn't apply as written.
+
 ## Status (2026-09-03): all three pieces DRAFTED, awaiting hardware
 
 - **Driver**: `rock5t-camera/driver/imx477.c` + Makefile + NOTES.md — Rockchip
