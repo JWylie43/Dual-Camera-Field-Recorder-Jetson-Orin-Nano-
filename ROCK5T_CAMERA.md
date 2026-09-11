@@ -100,17 +100,40 @@ Both Pi HQ cameras connected (CAM0 J5002, CAM1 J10) with the new 30-pin cables.
 - **Dead end, do not retry:** unbind/rebind of `csi2-dphy0` at runtime → kernel
   oops (vendor rkcif/rkisp keep stale refs into the D-PHY after notifier
   completion). Reboot required after any such attempt.
-- **Fix (install step, now required):** make udev load imx477 before the D-PHY:
+- **Load-order fixes that DON'T work (tried, keep for the record):** modprobe
+  softdep (parsed but never honored) and /etc/modules-load.d early static load
+  (userspace itself starts too late). Root reason found by timeline + vendor
+  source: the whole pipeline (dphy/csi2/cif/isp) is **builtin** (the .ko-looking
+  entries are in modules.builtin), it probes during kernel init, and the
+  "clear unready subdev" pass is a **late_initcall** — it runs BEFORE
+  `Run /init` (11.98s vs 11.99s on this image). The vendor clear
+  (`v4l2_async_notifier_clr_unready_dev`, CONFIG_NO_GKI) permanently
+  `list_del`s the pending sensor asd, so a later registration matches nothing.
+  **No module load ordering can ever win this race. The design assumes sensor
+  drivers are builtin (Radxa's all are `=y`).**
+- **Fix that works — split enable (now the required install):** the boot
+  overlay leaves the ten v4l2 pipeline nodes disabled (nothing camera-related
+  exists for the boot-time clear to purge); after boot,
+  /etc/modules-load.d loads `imx477` then `rk_cam_defer_enable.ko`
+  (driver/), which applies `overlay/rock-5t-cam-runtime-enable.dts` (installed
+  as /lib/firmware/rock5t-cam-enable.dtbo) via `of_overlay_fdt_apply()`
+  (EXPORT_SYMBOL_GPL; CONFIG_OF_OVERLAY=y on this kernel, no OF_CONFIGFS).
+  The builtin drivers then probe with the sensors already registered.
 
   ```
-  echo "softdep phy_rockchip_csi2_dphy pre: imx477" | sudo tee /etc/modprobe.d/imx477-order.conf
-  # + if lsinitramfs shows the dphy module in the initramfs:
-  echo imx477 | sudo tee -a /etc/initramfs-tools/modules && sudo update-initramfs -u
+  cd driver && make && sudo make install       # builds+installs both .ko
+  cd ../overlay && dtc -I dts -O dtb -o rock5t-cam-enable.dtbo rock-5t-cam-runtime-enable.dts
+  sudo cp rock5t-cam-enable.dtbo /lib/firmware/
+  # rebuild + reinstall the boot dtbo (same cpp|dtc command as above)
+  printf "imx477\nrk_cam_defer_enable\n" | sudo tee /etc/modules-load.d/imx477.conf
+  sudo reboot
   ```
 
-  Success signature after reboot: `dphy0 matches m00_b_imx477 3-001a` (and
-  dphy4/m01) in dmesg; `m0x_b_imx477` entities present in media0/media1.
-  **DKMS packaging must ship this modprobe.d file.**
+  Success signature after reboot: `rk_cam_defer_enable: applied ...`,
+  `dphy0 matches m00_b_imx477 3-001a` (and dphy4/m01) in dmesg;
+  `m0x_b_imx477` entities present in media graphs.
+  **DKMS packaging must ship both modules, the runtime dtbo, and the
+  modules-load.d file.**
 - **Also found:** `rkaiq_3A.service` is broken as shipped (oneshot wrapper
   backgrounds the server, systemd then runs ExecStop = `killall`, so it dies
   after ~16ms). Run `sudo rkaiq_3A_server` manually for now; fix the unit

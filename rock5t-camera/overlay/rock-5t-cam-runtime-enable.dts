@@ -1,0 +1,71 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Runtime enable of the ROCK 5T camera pipeline (dual IMX477).
+ *
+ * Applied AFTER boot by rk_cam_defer_enable.ko (../driver/), once the
+ * out-of-tree imx477 sensor driver has loaded and async-registered both
+ * sensors. The boot overlay (rock-5t-dual-rpi-hq-imx477.dts) deliberately
+ * leaves these ten nodes disabled so the vendor kernel's late_initcall
+ * "clear unready subdev" pass (which would permanently orphan a
+ * not-yet-registered sensor) has nothing camera-related to clear.
+ *
+ * Pure target-path + status fragments: no phandle references, so build
+ * with plain dtc (no -@, no cpp):
+ *
+ *   dtc -I dts -O dtb -o rock5t-cam-enable.dtbo rock-5t-cam-runtime-enable.dts
+ *   sudo cp rock5t-cam-enable.dtbo /lib/firmware/
+ */
+
+/ {
+	fragment@0 {
+		target-path = "/csi2-dphy0";
+		__overlay__ { status = "okay"; };
+	};
+
+	fragment@1 {
+		target-path = "/mipi2-csi2";
+		__overlay__ { status = "okay"; };
+	};
+
+	fragment@2 {
+		target-path = "/rkcif-mipi-lvds2";
+		__overlay__ { status = "okay"; };
+	};
+
+	fragment@3 {
+		target-path = "/rkcif-mipi-lvds2-sditf";
+		__overlay__ { status = "okay"; };
+	};
+
+	fragment@4 {
+		target-path = "/rkisp0-vir0";
+		__overlay__ { status = "okay"; };
+	};
+
+	fragment@5 {
+		target-path = "/csi2-dphy4";
+		__overlay__ { status = "okay"; };
+	};
+
+	fragment@6 {
+		target-path = "/mipi4-csi2";
+		__overlay__ { status = "okay"; };
+	};
+
+	fragment@7 {
+		target-path = "/rkcif-mipi-lvds4";
+		__overlay__ { status = "okay"; };
+	};
+
+	fragment@8 {
+		target-path = "/rkcif-mipi-lvds4-sditf";
+		__overlay__ { status = "okay"; };
+	};
+
+	fragment@9 {
+		target-path = "/rkisp1-vir1";
+		__overlay__ { status = "okay"; };
+	};
+};
