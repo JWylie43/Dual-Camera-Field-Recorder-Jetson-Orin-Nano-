@@ -53,6 +53,16 @@ for name, ct in sorted(ILLUM_CT.items(), key=lambda kv: kv[1]):
 D50g, D65g = gains['D50'], gains['D65']
 
 wb = isp['wb_v21']
+# MANUAL white balance is the shipped default (validated 2026-09-11: manual
+# D50 gains produce correct color; auto mode misclassifies because the
+# detection zones are imx577-module values). Manual is also the RIGHT design
+# for this rig: both cameras get identical locked WB, so the stitched pano
+# has no left/right color seam, and the use case is outdoor daylight sports.
+# Set WB_MODE = 'auto' only for future zone-recalibration experiments.
+WB_MODE = 'manual'
+wb['control']['mode'] = ('CALIB_WB_MODE_MANUAL' if WB_MODE == 'manual'
+                         else 'CALIB_WB_MODE_AUTO')
+print(f'AWB control mode: {wb["control"]["mode"]}')
 # manual gains (scene DAYLIGHT, CCT 5000 in the skeleton) -> RPi D50
 wb['manualPara']['cfg']['mwbGain'] = [D50g[0], 1, 1, D50g[1]]
 for ls in wb['autoPara']['lightSources']:

@@ -444,7 +444,7 @@
 						"wb_v21":	{
 							"control":	{
 								"byPass":	0,
-								"mode":	"CALIB_WB_MODE_AUTO"
+								"mode":	"CALIB_WB_MODE_MANUAL"
 							},
 							"manualPara":	{
 								"mode":	"CALIB_MWB_MODE_WBGAIN",
