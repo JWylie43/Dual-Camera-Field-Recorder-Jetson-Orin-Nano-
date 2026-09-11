@@ -143,6 +143,25 @@ Both Pi HQ cameras connected (CAM0 J5002, CAM1 J10) with the new 30-pin cables.
   `rkisp_mainpath` (video22 = CAM0, video31 = CAM1, NV12) with rkaiq_3A_server
   running. The raw-bypass grab in NEXT_STEPS STEP 3 doesn't apply as written.
 
+## Bring-up log (2026-09-11, later): PIPELINE COMPLETE on custom builtin-driver kernel
+
+The stock-kernel workaround attempts (see the earlier 2026-09-11 entry) kept
+hitting new vendor races, so Joe chose the kernel route:
+`kernel-build/build-kernel.sh` clones radxa/kernel **linux-6.1-stan-rkr4.1**
+(= 6.1.84, matching the shipped 6.1.84-8-rk2410; rkr1 is 6.1.43 — wrong),
+injects the driver in-tree, sets CONFIG_VIDEO_IMX477=y on the stock config,
+and builds debs. Built in ~6 min in an arm64 Debian docker container on the
+Mac M5 Pro (vs 1-2h native on the Rock) — container flow: clone in container
+FS (not a bind mount), copy in /boot/config-* from the Rock + imx477.c,
+`make -j18 bindeb-pkg LOCALVERSION=""`, docker cp the debs out, scp to Rock,
+dpkg -i + u-boot-update (stock kernel remains the boot-menu fallback).
+
+**First boot of 6.1.84-8-rk2410-imx477: complete success.** Sensors detect at
+11.83s (kernel init), `dphy0 matches m00_b_imx477` / `dphy4 matches
+m01_b_imx477`, and ALL FOUR notifiers complete (rkcif-mipi-lvds2/4 AND
+rkisp0-vir0 / rkisp1-vir1 — the ISPs never completed on any stock-kernel
+attempt). Full-enable overlay, zero runtime workarounds.
+
 ## Status (2026-09-03): all three pieces DRAFTED, awaiting hardware
 
 - **Driver**: `rock5t-camera/driver/imx477.c` + Makefile + NOTES.md — Rockchip
