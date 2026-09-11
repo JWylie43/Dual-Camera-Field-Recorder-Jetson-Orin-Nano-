@@ -7,7 +7,8 @@ init (`late_initcall`, i.e. before `/init` runs) — permanently. A loadable
 `imx477.ko` therefore can never join the media graph on a stock kernel, no
 matter how it's ordered (softdep, modules-load.d, initramfs: all tried,
 all lose by design; full autopsy in `../../ROCK5T_CAMERA.md`, bring-up log
-2026-09-11). Building the driver in — exactly like every in-tree Rockchip
+2026-09-11 — a partial runtime-overlay workaround lives in git history at
+df6b0ec). Building the driver in — exactly like every in-tree Rockchip
 sensor — makes the problem not exist.
 
 ## Build + install (on the Rock, ~1–2 h)

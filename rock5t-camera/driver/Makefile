@@ -5,7 +5,7 @@
 # Install:              sudo make install
 # Clean:                make clean
 
-obj-m := imx477.o rk_cam_defer_enable.o
+obj-m := imx477.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
@@ -16,8 +16,6 @@ default:
 install: default
 	sudo install -D -m 644 imx477.ko \
 		/lib/modules/$(shell uname -r)/extra/imx477.ko
-	sudo install -D -m 644 rk_cam_defer_enable.ko \
-		/lib/modules/$(shell uname -r)/extra/rk_cam_defer_enable.ko
 	sudo depmod -a
 
 clean:

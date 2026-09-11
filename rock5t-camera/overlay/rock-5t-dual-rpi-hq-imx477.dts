@@ -24,9 +24,9 @@
  * builtin camera pipeline purges not-yet-registered sensors in a
  * late_initcall (before /init), so a loadable imx477.ko can never join the
  * media graph with this full-enable overlay — see ROCK5T_CAMERA.md
- * bring-up log 2026-09-11, and the runtime split-enable fallback
- * (rock-5t-cam-runtime-enable*.dts + driver/rk_cam_defer_enable.c) if a
- * stock kernel must be used. Reads the trigger-mode property for XVS
+ * bring-up log 2026-09-11 (a runtime split-enable fallback for stock
+ * kernels was built, worked partially, and lives in git history at
+ * df6b0ec if ever needed). Reads the trigger-mode property for XVS
  * genlock. IQ file: imx477_RPI-HQ_default.json (../iqfiles/).
  */
 
