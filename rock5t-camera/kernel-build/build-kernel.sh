@@ -18,7 +18,8 @@
 
 set -euo pipefail
 
-BRANCH="${BRANCH:-linux-6.1-stan-rkr1}"
+# rkr4.1 == 6.1.84, matching the shipped 6.1.84-8-rk2410 (rkr1 is 6.1.43 — too old)
+BRANCH="${BRANCH:-linux-6.1-stan-rkr4.1}"
 SRC="${SRC:-$HOME/radxa-kernel}"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"   # rock5t-camera/
 LOCALVER="-imx477"
@@ -42,6 +43,15 @@ if [ ! -d "$SRC" ]; then
 fi
 cd "$SRC"
 
+# hard stop if the source version doesn't match the running kernel
+SRCVER="$(make -s kernelversion)"
+RUNBASE="$(uname -r | cut -d- -f1)"
+if [ "$SRCVER" != "$RUNBASE" ]; then
+    echo "ERROR: source is $SRCVER but running kernel is $RUNBASE." >&2
+    echo "Wrong branch ($BRANCH)? Remove $SRC and set BRANCH to the matching one." >&2
+    exit 1
+fi
+
 # --- inject the driver ------------------------------------------------------
 cp "$REPO_DIR/driver/imx477.c" drivers/media/i2c/imx477.c
 
@@ -56,11 +66,15 @@ if ! grep -q "config VIDEO_IMX477" drivers/media/i2c/Kconfig; then
         drivers/media/i2c/Kconfig
 fi
 
+# commit the injected driver so setlocalversion doesn't append a '+' (dirty tree)
+git add -A && git -c user.email=build@local -c user.name=build commit -q -m "imx477 in-tree" || true
+
 # --- config: running kernel's config + our driver builtin -------------------
 cp "/boot/config-$(uname -r)" .config
 ./scripts/config --enable CONFIG_VIDEO_IMX477
 # distinct release string so the package coexists with the stock kernel
-./scripts/config --set-str CONFIG_LOCALVERSION "$(uname -r | sed "s/^$(make -s kernelversion 2>/dev/null || echo 6.1.84)//")$LOCALVER"
+# (e.g. running 6.1.84-8-rk2410 -> LOCALVERSION "-8-rk2410-imx477")
+./scripts/config --set-str CONFIG_LOCALVERSION "-$(uname -r | cut -d- -f2-)$LOCALVER"
 # don't fail the build over missing signing/debug artifacts from the distro config
 ./scripts/config --disable CONFIG_MODULE_SIG_ALL || true
 ./scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS "" || true
