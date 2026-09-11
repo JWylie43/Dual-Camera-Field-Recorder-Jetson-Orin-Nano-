@@ -55,10 +55,18 @@ static int dpc_enable = 1;
 module_param(dpc_enable, int, 0644);
 MODULE_PARM_DESC(dpc_enable, "Enable on-sensor DPC");
 
-/* Fallback when the DT "trigger-mode" property is absent: 1=source, 2=sink */
-static int trigger_mode;
+/*
+ * Runtime override of the XVS genlock role, applied at every stream start:
+ *   -1 = follow the DT "trigger-mode" property (default)
+ *    0 = force free-run, 1 = force source, 2 = force sink
+ * Writable at runtime: /sys/module/imx477/parameters/trigger_mode
+ * (restart the stream to apply). Also serves as the probe-time fallback
+ * when the DT property is absent.
+ */
+static int trigger_mode = -1;
 module_param(trigger_mode, int, 0644);
-MODULE_PARM_DESC(trigger_mode, "Set vsync trigger mode: 1=source, 2=sink");
+MODULE_PARM_DESC(trigger_mode,
+		 "XVS trigger mode override: -1=follow DT, 0=none, 1=source, 2=sink");
 
 /*
  * The Raspberry Pi modes run the CSI-2 link at 450MHz (900Mbps/lane,
@@ -1678,6 +1686,11 @@ static int imx477_apply_trigger_mode(struct imx477 *imx477)
 	enum imx477_trigger_mode tm = imx477->xvs_trigger_mode;
 	u32 mc_mode, ms_sel, xvs_io_ctrl, extout_en;
 	int ret;
+
+	/* module param overrides the DT role when set (>= 0) */
+	if (trigger_mode >= IMX477_TRIGGER_MODE_NONE &&
+	    trigger_mode <= IMX477_TRIGGER_MODE_SINK)
+		tm = trigger_mode;
 
 	switch (tm) {
 	case IMX477_TRIGGER_MODE_SOURCE:
