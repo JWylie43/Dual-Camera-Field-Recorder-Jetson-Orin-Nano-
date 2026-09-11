@@ -59,6 +59,16 @@ wb = isp['wb_v21']
 # for this rig: both cameras get identical locked WB, so the stitched pano
 # has no left/right color seam, and the use case is outdoor daylight sports.
 # Set WB_MODE = 'auto' only for future zone-recalibration experiments.
+# The imx577 skeleton ships Evbias = -1.2 (a >1-stop deliberate underexposure
+# inherited by accident, discovered 2026-09-11 — footage ran dark). Neutral 0
+# is the sane baseline; revisit against real outdoor footage (a mild negative
+# bias MAY be wanted for highlight protection in sports, but choose it, don't
+# inherit it). AecGridWeight (metering zones) and BackLightCtrl exist in the
+# skeleton for later tuning; left untouched — for the stitched pano, both
+# cameras should meter identically (cam0 is the single AE brain anyway).
+isp['ae_calib']['LinearAeCtrl']['Evbias'] = 0.0
+print('AE Evbias: -1.2 (skeleton) -> 0.0')
+
 WB_MODE = 'manual'
 wb['control']['mode'] = ('CALIB_WB_MODE_MANUAL' if WB_MODE == 'manual'
                          else 'CALIB_WB_MODE_AUTO')

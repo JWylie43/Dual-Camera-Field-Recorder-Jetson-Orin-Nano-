@@ -210,7 +210,7 @@
 								"RawStatsEn":	1,
 								"ToleranceIn":	5,
 								"ToleranceOut":	8,
-								"Evbias":	-1.2,
+								"Evbias":	0,
 								"StrategyMode":	"AECV2_STRATEGY_MODE_LOWLIGHT",
 								"InitExp":	{
 									"InitTimeValue":	0.003,
