@@ -85,6 +85,7 @@ make olddefconfig
 grep -E "CONFIG_VIDEO_IMX477|CONFIG_LOCALVERSION=" .config
 
 # --- build ------------------------------------------------------------------
-make -j"$JOBS" bindeb-pkg
+# LOCALVERSION="" suppresses the '+' an untagged clone would append
+make -j"$JOBS" bindeb-pkg LOCALVERSION=""
 echo
 echo "Build done. Debs are in $SRC/.. — run: $0 install"
