@@ -50,5 +50,17 @@ if Radxa moved on, run both steps again).
 ## Known-broken vendor bits (independent of kernel choice)
 
 - `rkaiq_3A.service` kills its own daemon at start (oneshot wrapper +
-  `ExecStop=killall`). Run `sudo rkaiq_3A_server` manually, or fix the
-  unit with a drop-in (`Type=forking` or `RemainAfterExit=yes`).
+  `ExecStop=killall` — the wrapper backgrounds the server, systemd sees it
+  exit and runs stop). **Fixed on the Rock 2026-09-11** with a drop-in at
+  `/etc/systemd/system/rkaiq_3A.service.d/override.conf`:
+
+  ```
+  [Service]
+  Type=simple
+  ExecStart=
+  ExecStart=/usr/bin/rkaiq_3A_server
+  ExecStop=
+  ```
+
+  (plus `chmod 644` on the world-writable unit). Any fresh install needs
+  this drop-in too.
