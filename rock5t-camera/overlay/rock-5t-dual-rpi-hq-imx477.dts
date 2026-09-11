@@ -19,19 +19,15 @@
  * The Pi HQ generates its own 24 MHz on-camera; the clk_cam_24m nodes are
  * fixed-clock stubs satisfying the driver's clock request.
  *
- * Requires the out-of-tree imx477.ko (../driver/) which reads the
- * trigger-mode property. IQ file: imx477_RPI-HQ_default.json (../iqfiles/).
- *
- * SPLIT-ENABLE DESIGN (required for out-of-tree sensor modules): this boot
- * overlay declares the full graph but deliberately leaves the ten v4l2
- * pipeline nodes (csi2_dphy0/4, mipi2/4_csi2, rkcif_mipi_lvds2/4 + sditf,
- * rkisp0_vir0 / rkisp1_vir1) at their base status = "disabled". The vendor
- * kernel's builtin pipeline runs a late_initcall "clear unready subdev"
- * pass BEFORE /init, permanently dropping any sensor not yet registered —
- * a race a module can never win. So the pipeline is enabled after boot,
- * once imx477.ko has registered, by rock-5t-cam-runtime-enable.dts applied
- * via rk_cam_defer_enable.ko (see /etc/modules-load.d ordering). Only the
- * sensor nodes, clocks, regulators, and hw blocks are live at boot.
+ * REQUIRES the imx477 driver BUILT INTO the kernel (CONFIG_VIDEO_IMX477=y,
+ * built via ../kernel-build/build-kernel.sh). The stock Radxa kernel's
+ * builtin camera pipeline purges not-yet-registered sensors in a
+ * late_initcall (before /init), so a loadable imx477.ko can never join the
+ * media graph with this full-enable overlay — see ROCK5T_CAMERA.md
+ * bring-up log 2026-09-11, and the runtime split-enable fallback
+ * (rock-5t-cam-runtime-enable*.dts + driver/rk_cam_defer_enable.c) if a
+ * stock kernel must be used. Reads the trigger-mode property for XVS
+ * genlock. IQ file: imx477_RPI-HQ_default.json (../iqfiles/).
  */
 
 #include <dt-bindings/gpio/gpio.h>
@@ -121,8 +117,8 @@
 };
 
 &csi2_dphy0 {
-	/* status stays disabled at boot; enabled at runtime by
-	 * rock-5t-cam-runtime-enable.dts via rk_cam_defer_enable.ko */
+	status = "okay";
+
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -153,8 +149,8 @@
 };
 
 &mipi2_csi2 {
-	/* status stays disabled at boot; enabled at runtime by
-	 * rock-5t-cam-runtime-enable.dts via rk_cam_defer_enable.ko */
+	status = "okay";
+
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -184,8 +180,8 @@
 };
 
 &rkcif_mipi_lvds2 {
-	/* status stays disabled at boot; enabled at runtime by
-	 * rock-5t-cam-runtime-enable.dts via rk_cam_defer_enable.ko */
+	status = "okay";
+
 	port {
 		cif_mipi2_in0: endpoint {
 			remote-endpoint = <&mipi2_csi2_output>;
@@ -194,8 +190,8 @@
 };
 
 &rkcif_mipi_lvds2_sditf {
-	/* status stays disabled at boot; enabled at runtime by
-	 * rock-5t-cam-runtime-enable.dts via rk_cam_defer_enable.ko */
+	status = "okay";
+
 	port {
 		mipi_lvds2_sditf: endpoint {
 			remote-endpoint = <&isp0_vir0>;
@@ -212,8 +208,8 @@
 };
 
 &rkisp0_vir0 {
-	/* status stays disabled at boot; enabled at runtime by
-	 * rock-5t-cam-runtime-enable.dts via rk_cam_defer_enable.ko */
+	status = "okay";
+
 	port {
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -263,8 +259,8 @@
 };
 
 &csi2_dphy4 {
-	/* status stays disabled at boot; enabled at runtime by
-	 * rock-5t-cam-runtime-enable.dts via rk_cam_defer_enable.ko */
+	status = "okay";
+
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -295,8 +291,8 @@
 };
 
 &mipi4_csi2 {
-	/* status stays disabled at boot; enabled at runtime by
-	 * rock-5t-cam-runtime-enable.dts via rk_cam_defer_enable.ko */
+	status = "okay";
+
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -326,8 +322,8 @@
 };
 
 &rkcif_mipi_lvds4 {
-	/* status stays disabled at boot; enabled at runtime by
-	 * rock-5t-cam-runtime-enable.dts via rk_cam_defer_enable.ko */
+	status = "okay";
+
 	port {
 		cif_mipi4_in0: endpoint {
 			remote-endpoint = <&mipi4_csi2_output>;
@@ -336,8 +332,8 @@
 };
 
 &rkcif_mipi_lvds4_sditf {
-	/* status stays disabled at boot; enabled at runtime by
-	 * rock-5t-cam-runtime-enable.dts via rk_cam_defer_enable.ko */
+	status = "okay";
+
 	port {
 		mipi_lvds4_sditf: endpoint {
 			remote-endpoint = <&isp1_vir1>;
@@ -354,8 +350,8 @@
 };
 
 &rkisp1_vir1 {
-	/* status stays disabled at boot; enabled at runtime by
-	 * rock-5t-cam-runtime-enable.dts via rk_cam_defer_enable.ko */
+	status = "okay";
+
 	port {
 		#address-cells = <1>;
 		#size-cells = <0>;
