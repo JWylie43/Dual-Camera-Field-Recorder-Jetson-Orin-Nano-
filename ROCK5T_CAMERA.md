@@ -205,6 +205,19 @@ attempt). Full-enable overlay, zero runtime workarounds.
   analytically — the zones live in rkaiq's own stats space (hence the
   imx577 placeholders).
 
+## Bring-up log (2026-09-12): 4K30 CRC SOLVED — link re-clocked 2096 -> 1600Mbps/lane
+
+Driver 4K30 mode re-clocked (kernel deb rev 3): IOP PLL 24/3*200 = 1600Mbps/lane
+(800MHz link), hts 9024->11200 (per-line burst 1.44Gbps sustained, 11%
+headroom), vts 3102->2500 (exactly 30.00 fps), MIPI global timing set to
+sensor-auto (0x0808=0; the nv manual values were 2096-specific). First boot:
+**data_rate 1600, 300/300 frames at 30.00 fps, ZERO CRC errors** (was
+thousands at 2096 — cable SI margin, both cables identically). 4K30 is now
+fully clean on the existing 30-pin FFC/adapters. Also validated this session:
+Evbias -1.2 (accidental imx577 inheritance) -> 0; recording pipeline
+(io-mode=dmabuf + queue) = timing-clean 4K30 H.265 recordings, all baked
+into record_dual.sh.
+
 ## Status (2026-09-03): all three pieces DRAFTED, awaiting hardware
 
 - **Driver**: `rock5t-camera/driver/imx477.c` + Makefile + NOTES.md — Rockchip
