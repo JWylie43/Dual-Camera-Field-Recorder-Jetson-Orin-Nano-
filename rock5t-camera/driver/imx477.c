@@ -71,12 +71,19 @@ MODULE_PARM_DESC(trigger_mode,
 /*
  * The Raspberry Pi modes run the CSI-2 link at 450MHz (900Mbps/lane,
  * 2 lanes = 1800Mbps total: registers 0x0820/0x0821 = 0x0708 in those mode
- * tables).  The 3840x2160@30 mode uses the NVIDIA/RidgeRun nv_imx477 IOP
- * PLL configuration instead: 24MHz / 3 * 262 = 2096MHz VCO with IOPSYCK
- * divider 1, i.e. 2096Mbps/lane DDR = 1048MHz link frequency.
+ * tables).  The 3840x2160@30 mode originally used the NVIDIA/RidgeRun
+ * nv_imx477 IOP PLL configuration (24MHz / 3 * 262 = 2096MHz VCO =
+ * 2096Mbps/lane); re-clocked 2026-09-12 to 24MHz / 3 * 200 = 1600MHz =
+ * 1600Mbps/lane (800MHz link) for cable signal margin, with hts/vts
+ * rebalanced (11200 x 2500) to keep the per-line burst within the slower
+ * link and the frame rate at exactly 30.00.
  */
 #define IMX477_LINK_FREQ_450MHZ		450000000U
-#define IMX477_LINK_FREQ_1048MHZ	1048000000U
+/* 4K30 mode: 1600Mbps/lane. Originally the nv_imx477 1048MHz/2096Mbps
+ * config; re-clocked 2026-09-12 because 2096 exceeds the 30-pin FFC
+ * cable margin (constant CSI CRC errors) while 1600 still fits 4K30
+ * with rebalanced line timing. */
+#define IMX477_LINK_FREQ_800MHZ		800000000U
 
 /*
  * The IMX477 internal pixel array clock is fixed at 840MHz for all of these
@@ -977,10 +984,17 @@ static __maybe_unused const struct regval imx477_linear_10bit_3840x2160_30fps_re
 	{0x0112, 0x0a},
 	{0x0113, 0x0a},
 	{0x0114, 0x01},
-	{0x0342, 0x23},
-	{0x0343, 0x40},
-	{0x0340, 0x0c},
-	{0x0341, 0x1e},
+	/*
+	 * Line/frame timing rebalanced for the 1600Mbps/lane link (2026-09-12):
+	 * hts 9024->11200 stretches the per-line burst window so the slower
+	 * link keeps up (3840px * 10bit / 2 lanes / 13.33us line = 1.44Gbps
+	 * sustained, 11% headroom); vts 3102->2500 keeps 840MHz/(hts*vts) =
+	 * exactly 30.00 fps. Max exposure stays ~33ms.
+	 */
+	{0x0342, 0x2b},
+	{0x0343, 0xc0},
+	{0x0340, 0x09},
+	{0x0341, 0xc4},
 	{0x0344, 0x00},
 	{0x0345, 0x00},
 	{0x0346, 0x01},
@@ -1056,13 +1070,28 @@ static __maybe_unused const struct regval imx477_linear_10bit_3840x2160_30fps_re
 	{0x0309, 0x0a},
 	{0x030b, 0x01},
 	{0x030d, 0x03},
-	{0x030e, 0x01},
-	{0x030f, 0x06},
+	/*
+	 * IOP PLL multiplier 262->200: VCO = 24MHz/3*200 = 1600MHz =
+	 * 1600Mbps/lane (was 2096). The 2096 rate ran out of cable signal
+	 * margin on the 30-pin FFC/adapters (constant CSI CRC errors,
+	 * 2026-09-11); ~31% wider bits at 1600 buys the margin back while
+	 * still fitting 4K30 with the stretched hts above.
+	 */
+	{0x030e, 0x00},
+	{0x030f, 0xc8},
 	{0x0310, 0x01},
-	{0x0820, 0x20},
-	{0x0821, 0xc0},
+	/* requested link bit rate: 3200 Mbps total (1600 x 2 lanes) */
+	{0x0820, 0x0c},
+	{0x0821, 0x80},
 	{0x0822, 0x00},
 	{0x0823, 0x00},
+	/*
+	 * MIPI global timing AUTO (0x0808=0): the manual values below came
+	 * from the nv_imx477 2096Mbps config and are rate-specific (RPi's
+	 * 900Mbps tables use different ones); auto derives spec-compliant
+	 * timings from the actual clock. Manual regs left in place, ignored.
+	 */
+	{0x0808, 0x00},
 	{0x080a, 0x00},
 	{0x080b, 0xc7},
 	{0x080c, 0x00},
@@ -1161,7 +1190,9 @@ static const struct imx477_mode supported_modes[] = {
 		.vc[PAD0] = 0,
 	},
 	{
-		/* 16:9 4K 30fps mode (nv_imx477 PLL, 1048MHz link freq) */
+		/* 16:9 4K 30fps mode (800MHz link / 1600Mbps/lane, was the
+		 * nv_imx477 2096Mbps config - re-clocked 2026-09-12 for cable
+		 * signal margin; timing rebalance keeps exactly 30.00 fps) */
 		.width = 3840,
 		.height = 2160,
 		.max_fps = {
@@ -1169,8 +1200,8 @@ static const struct imx477_mode supported_modes[] = {
 			.denominator = 300000,
 		},
 		.exp_def = 0x0640,
-		.hts_def = 0x2340,	/* 9024 */
-		.vts_def = 0x0c1e,	/* 3102 -> 30.03 fps */
+		.hts_def = 0x2bc0,	/* 11200 */
+		.vts_def = 0x09c4,	/* 2500 -> 30.00 fps */
 		.bpp = 10,
 		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
 		.reg_list = imx477_linear_10bit_3840x2160_30fps_regs,
@@ -1182,7 +1213,7 @@ static const struct imx477_mode supported_modes[] = {
 
 static const s64 link_freq_items[] = {
 	IMX477_LINK_FREQ_450MHZ,
-	IMX477_LINK_FREQ_1048MHZ,
+	IMX477_LINK_FREQ_800MHZ,
 };
 
 static const char * const imx477_test_pattern_menu[] = {
