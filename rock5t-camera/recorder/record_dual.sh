@@ -59,15 +59,43 @@ fi
 echo ">> cam0(source)=${DEVS[0]}  cam1(sink)=${DEVS[1]}"
 echo ">> ${W}x${H}@$FPS, $DUR s, $CODEC @ $(( BR / 1000000 )) Mbit/cam"
 
+# ---- sensor mode + capture node selection (validated 2026-09-11/12) --------
+# The sensor mode must be asserted via the subdev fmt IMMEDIATELY before
+# recording (rkaiq can silently reset it between sessions), followed by an
+# rkaiq_3A restart or the stream delivers zero frames / a stale mode.
+# Bus code: the 4K30 mode is 10-bit (0x300f); the others are 12-bit (0x3012).
+# Capture node: gstreamer rejects the whole caps range when the mainpath's
+# max width isn't a multiple of 8 (binned mode: 2028) -> use the selfpath
+# (mainpath node + 1, max 1920x1080) for binned; mainpath otherwise.
+case "${W}x${H}" in
+  3840x2160) CODE=0x300f; CAPW=3840; CAPH=2160; NODE_OFF=0 ;;
+  2028x1520) CODE=0x3012; CAPW=1920; CAPH=1080; NODE_OFF=1 ;;
+  4056x3040) CODE=0x3012; CAPW=4056; CAPH=3040; NODE_OFF=0 ;;
+  *) echo "W x H must be a sensor mode: 3840x2160 | 2028x1520 | 4056x3040"; exit 1 ;;
+esac
+
+SUBDEV0=$(media-ctl -d /dev/media0 -e "m00_b_imx477 3-001a")
+SUBDEV1=$(media-ctl -d /dev/media1 -e "m01_b_imx477 4-001a")
+for sd in "$SUBDEV0" "$SUBDEV1"; do
+  v4l2-ctl -d "$sd" --set-subdev-fmt pad=0,width=$W,height=$H,code=$CODE >/dev/null 2>&1
+done
+sudo systemctl restart rkaiq_3A
+sleep 3
+
 FILES=()
 PIDS=()
 for i in 0 1; do
   f="$OUT/rock_cam${i}_$STAMP.mkv"
   FILES+=("$f")
+  dev_num=$(basename "${DEVS[$i]}" | tr -d 'video')
+  cap_dev="/dev/video$(( dev_num + NODE_OFF ))"
+  # io-mode=dmabuf (zero-copy into the mpp encoder) + queue: without both,
+  # capture drops ~2 frames/sec at 4K30 from copy latency / backpressure.
+  # No framerate in caps: rkisp does not negotiate it (fps = sensor mode).
   gst-launch-1.0 -q -e \
-    v4l2src device="${DEVS[$i]}" num-buffers=$FRAMES ! \
-    "video/x-raw,format=NV12,width=$W,height=$H,framerate=$FPS/1" ! \
-    queue max-size-buffers=8 ! \
+    v4l2src device="$cap_dev" io-mode=dmabuf num-buffers=$FRAMES ! \
+    "video/x-raw,format=NV12,width=$CAPW,height=$CAPH" ! \
+    queue max-size-buffers=8 max-size-time=0 max-size-bytes=0 ! \
     $ENC bps=$BR bps-max=$(( BR * 3 / 2 )) ! \
     $PARSE ! matroskamux ! filesink location="$f" &
   PIDS+=($!)
