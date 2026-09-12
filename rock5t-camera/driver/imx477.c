@@ -57,16 +57,19 @@ MODULE_PARM_DESC(dpc_enable, "Enable on-sensor DPC");
 
 /*
  * Runtime override of the XVS genlock role, applied at every stream start:
- *   -1 = follow the DT "trigger-mode" property (default)
- *    0 = force free-run, 1 = force source, 2 = force sink
+ *   -1 = follow the DT "trigger-mode" property
+ *    0 = force free-run (DEFAULT while the XVS pads are unwired: a DT
+ *        "sink" camera never streams without master pulses, and per-boot
+ *        echo 0 was a recurring trap - set to -1, or change this default,
+ *        once the genlock wire is in)
+ *    1 = force source, 2 = force sink
  * Writable at runtime: /sys/module/imx477/parameters/trigger_mode
- * (restart the stream to apply). Also serves as the probe-time fallback
- * when the DT property is absent.
+ * (restart the stream to apply).
  */
-static int trigger_mode = -1;
+static int trigger_mode;
 module_param(trigger_mode, int, 0644);
 MODULE_PARM_DESC(trigger_mode,
-		 "XVS trigger mode override: -1=follow DT, 0=none, 1=source, 2=sink");
+		 "XVS trigger mode override: -1=follow DT, 0=none (default), 1=source, 2=sink");
 
 /*
  * The Raspberry Pi modes run the CSI-2 link at 450MHz (900Mbps/lane,
@@ -1136,6 +1139,30 @@ static __maybe_unused const struct regval imx477_linear_10bit_3840x2160_30fps_re
  */
 static const struct imx477_mode supported_modes[] = {
 	{
+		/* 16:9 4K 30fps mode (800MHz link / 1600Mbps/lane, was the
+		 * nv_imx477 2096Mbps config - re-clocked 2026-09-12 for cable
+		 * signal margin; timing rebalance keeps exactly 30.00 fps).
+		 * FIRST ENTRY = the boot/reset default mode: this rig records
+		 * 4K30, so the recording mode is what every boot and every
+		 * rkaiq re-init lands in (moved here 2026-09-12; was full-res
+		 * 10fps, which silently reasserted itself between sessions). */
+		.width = 3840,
+		.height = 2160,
+		.max_fps = {
+			.numerator = 10000,
+			.denominator = 300000,
+		},
+		.exp_def = 0x0640,
+		.hts_def = 0x2bc0,	/* 11200 */
+		.vts_def = 0x09c4,	/* 2500 -> 30.00 fps */
+		.bpp = 10,
+		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
+		.reg_list = imx477_linear_10bit_3840x2160_30fps_regs,
+		.hdr_mode = NO_HDR,
+		.link_freq_idx = 1,
+		.vc[PAD0] = 0,
+	},
+	{
 		/* 12MPix full-res 10fps mode */
 		.width = 4056,
 		.height = 3040,
@@ -1187,26 +1214,6 @@ static const struct imx477_mode supported_modes[] = {
 		.reg_list = imx477_linear_10bit_1332x990_120fps_regs,
 		.hdr_mode = NO_HDR,
 		.link_freq_idx = 0,
-		.vc[PAD0] = 0,
-	},
-	{
-		/* 16:9 4K 30fps mode (800MHz link / 1600Mbps/lane, was the
-		 * nv_imx477 2096Mbps config - re-clocked 2026-09-12 for cable
-		 * signal margin; timing rebalance keeps exactly 30.00 fps) */
-		.width = 3840,
-		.height = 2160,
-		.max_fps = {
-			.numerator = 10000,
-			.denominator = 300000,
-		},
-		.exp_def = 0x0640,
-		.hts_def = 0x2bc0,	/* 11200 */
-		.vts_def = 0x09c4,	/* 2500 -> 30.00 fps */
-		.bpp = 10,
-		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
-		.reg_list = imx477_linear_10bit_3840x2160_30fps_regs,
-		.hdr_mode = NO_HDR,
-		.link_freq_idx = 1,
 		.vc[PAD0] = 0,
 	},
 };
