@@ -91,12 +91,15 @@ for i in 0 1; do
   cap_dev="/dev/video$(( dev_num + NODE_OFF ))"
   # io-mode=dmabuf (zero-copy into the mpp encoder) + queue: without both,
   # capture drops ~2 frames/sec at 4K30 from copy latency / backpressure.
-  # No framerate in caps: rkisp does not negotiate it (fps = sensor mode).
+  # rkisp advertises no framerate, and WITHOUT one the mpp encoder cannot
+  # budget bits-per-frame and silently ignores bps (700Mbps files, found
+  # 2026-09-13): videorate stamps an explicit rate so CBR works.
   gst-launch-1.0 -q -e \
     v4l2src device="$cap_dev" io-mode=dmabuf num-buffers=$FRAMES ! \
     "video/x-raw,format=NV12,width=$CAPW,height=$CAPH" ! \
+    videorate ! "video/x-raw,framerate=$FPS/1" ! \
     queue max-size-buffers=8 max-size-time=0 max-size-bytes=0 ! \
-    $ENC bps=$BR bps-max=$(( BR * 3 / 2 )) ! \
+    $ENC rc-mode=cbr bps=$BR bps-max=$(( BR * 3 / 2 )) ! \
     $PARSE ! matroskamux ! filesink location="$f" &
   PIDS+=($!)
 done
