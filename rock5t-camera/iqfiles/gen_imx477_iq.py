@@ -232,6 +232,64 @@ ae_route['IspDGainDot_len'] = 6
 print('AE route: daylight sports strategy -- shutter capped 8ms, then gain '
       'to 2.0, 33ms only as last resort; ISP dgain off')
 
+# ================================================= 9. texture tuning (round 1)
+# First-light 1:1 crops (2026-09-13, outdoor daylight, base ISO): grass texture
+# smeared to watercolor by spatial NR that has nothing to denoise in full sun,
+# and hard sharpening halos on car edges (imx577-inherited sharp_ratio = 15!).
+# Round 1: calm the LOW-ISO rows only (<= 400 tapered; real noise at high gain
+# keeps the inherited values), and disable the two scene-ADAPTIVE features --
+# dehaze and DRC -- on principle: two cameras seeing different scene halves
+# must not make independent content-reactive tone/contrast decisions, or the
+# stitched pano gets a moving seam. Static tone comes from the RPi gamma.
+
+# dehaze: fully off
+dh = isp['adehaze_calib_v11']['DehazeTuningPara']
+dh['Enable'] = 0
+dh['dehaze_setting']['en'] = 0
+if 'enhance_setting' in dh:
+    dh['enhance_setting']['en'] = 0
+print('dehaze: DISABLED (was enabled, scene-adaptive)')
+
+# DRC: adaptive tone off
+isp['adrc_calib_v11']['DrcTuningPara']['Enable'] = 0
+print('DRC: DISABLED (was enabled, scene-adaptive)')
+
+# per-ISO scaling: full effect at ISO<=200, half effect at 400, untouched above
+def _rows(mod):
+    for setting in isp[mod]['TuningPara']['Setting']:
+        for row in setting['Tuning_ISO']:
+            if row['iso'] <= 200:
+                yield row, 1.0
+            elif row['iso'] == 400:
+                yield row, 0.5
+
+YNR_SCALE = 0.5     # halve luma spatial NR strength at base ISO
+for row, eff in _rows('ynr_v3'):
+    for f in ('low_weight', 'high_weight', 'low_filt1_strength',
+              'low_filt2_strength', 'low_bf1', 'low_bf2'):
+        row[f] = r6(row[f] * (1 - eff * (1 - YNR_SCALE)))
+print(f'ynr_v3: low-ISO spatial strengths x{YNR_SCALE}')
+
+B2D_SCALE = 0.5     # raw-domain 2D NR likewise
+for row, eff in _rows('bayer2dnr_v2'):
+    for f in ('filter_strength', 'weight'):
+        row[f] = r6(row[f] * (1 - eff * (1 - B2D_SCALE)))
+print(f'bayer2dnr_v2: low-ISO filter_strength/weight x{B2D_SCALE}')
+
+CNR_SCALE = 0.6     # chroma NR: milder cut (color blotch shows faster)
+for row, eff in _rows('cnr_v2'):
+    for f in ('hf_denoise_strength', 'lf_denoise_strength',
+              'thumb_denoise_strength'):
+        row[f] = r6(row[f] * (1 - eff * (1 - CNR_SCALE)))
+print(f'cnr_v2: low-ISO denoise strengths x{CNR_SCALE}')
+
+# sharpening: ratio 15 -> 6 at base ISO (taper via eff at 400)
+SHARP_TARGET = 6.0
+for row, eff in _rows('sharp_v4'):
+    row['sharp_ratio'] = r6(row['sharp_ratio']
+                            + eff * (SHARP_TARGET - row['sharp_ratio']))
+print(f'sharp_v4: low-ISO sharp_ratio -> {SHARP_TARGET}')
+
 # ================================================================ write + validate
 # Serialize in the cJSON style rkaiq itself writes (and the skeleton ships in):
 # tab indentation, '":\t"' separator, scalar arrays inline on one line.
