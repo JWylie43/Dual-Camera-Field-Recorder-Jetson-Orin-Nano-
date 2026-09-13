@@ -232,6 +232,18 @@ ae_route['IspDGainDot_len'] = 6
 print('AE route: daylight sports strategy -- shutter capped 8ms, then gain '
       'to 2.0, 33ms only as last resort; ISP dgain off')
 
+# ============================================ 8b. AE brightness setpoint raise
+# Midday measurement (2026-09-13): the imx577 skeleton's DySetpoint sits at
+# 16-20% (and DROPS for bright scenes) -> sunny frames average ~44/255 with
+# only 0.25% highlight clip. That's a stop of unused headroom, and lifting
+# 8-bit H.265 in post costs quality. Raise the target ~0.7EV; verified against
+# clip stats on re-shot frames (target: mean ~70-80/255, clip < ~2%).
+_ds = isp['ae_calib']['LinearAeCtrl']['DySetpoint']
+_old = list(_ds['DySetpoint'])
+_new = [30, 30, 29, 28, 27, 26]
+_ds['DySetpoint'] = _new
+print('AE DySetpoint:', _old, '->', _new, '(~+0.7EV daylight)')
+
 # ================================================= 9. texture tuning (round 1)
 # First-light 1:1 crops (2026-09-13, outdoor daylight, base ISO): grass texture
 # smeared to watercolor by spatial NR that has nothing to denoise in full sun,
