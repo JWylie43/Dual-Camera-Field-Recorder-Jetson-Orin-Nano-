@@ -256,6 +256,22 @@ it. Field-side controls remaining: lens aperture + focus rings only.
 Still open (not IQ): motion-blur/temporal-NR check on real moving subjects
 (needs a motion video), LSC flat-field calibration, re-mount, XVS + sync.
 
+## Bring-up log (2026-09-13, evening): lens HFOV MEASURED — 74° rig geometry validated
+
+Wall measurement (Commonlands CIL391 3.25mm, 4K mode 3840 crop): W=83in at
+D=29in -> **HFOV = 110.1° (+/-1.5°)**. With the 74° camera separation:
+**~36° stitch overlap, ~184° total pano span** — the rig geometry closes
+with margin. (Spec chain predicted 110-113°; old calibration jsons are the
+1920x1200 Arducam rig — recalibrate intrinsics on these cameras before
+stitching, with a strong-distortion model: lens is -16% TV barrel.)
+
+Also found: **rkisp selfpath (video23) can hold a stale 1920x1080 crop
+window instead of scaling** — preview showed a quarter of the scene 1:1
+(and binned-mode recordings route via selfpath: set the crop selection
+explicitly or verify FOV). Live preview workaround: stream MAINPATH
+(video22) 4K->h264 10fps via udpsink to ffplay on the Mac. TODO: package
+as preview.sh; add selfpath selection reset to record_dual.sh.
+
 ## Status (2026-09-03): all three pieces DRAFTED, awaiting hardware
 
 - **Driver**: `rock5t-camera/driver/imx477.c` + Makefile + NOTES.md — Rockchip
