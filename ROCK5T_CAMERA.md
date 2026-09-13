@@ -218,6 +218,26 @@ Evbias -1.2 (accidental imx577 inheritance) -> 0; recording pipeline
 (io-mode=dmabuf + queue) = timing-clean 4K30 H.265 recordings, all baked
 into record_dual.sh.
 
+## Bring-up log (2026-09-13): IQ texture round 1 VALIDATED; encoder bitrate root-caused
+
+- Outdoor daylight eval (first fog was literally the window glass — shoot in
+  open air). Baseline 1:1 crops: grass smeared to watercolor (spatial NR at
+  full strength at base ISO) + sharpening halos (imx577 sharp_ratio=15).
+- Round 1 (gen sec. 9): ynr/bayer2dnr low-ISO x0.5, cnr x0.6, sharp_ratio->6
+  (ISO<=200 full, 400 tapered), dehaze+DRC disabled (scene-adaptive = pano
+  seam poison). **A/B verdict: grass blades fully resolved, car edges crisp
+  with zero halos. Round 1 stands.** Open round-2 candidate: shadows now run
+  deep (honest tone without adaptive DRC) — judge on midday footage whether
+  to add a small STATIC shadow lift via gamma.
+- Encoder bitrate: mpph265enc silently ignores bps when caps carry no
+  framerate (rkisp never advertises one) — 385-691Mbps files on detailed
+  content; earlier in-spec files were just cheap dark scenes. Fix (verified
+  27.4M vs 28M target): videorate ! framerate=N/1 before the encoder +
+  rc-mode=cbr. In record_dual.sh.
+- Tuning capture protocol: per scene, (1) pure video pipeline (true 30fps;
+  a tee'd PNG branch starves the dmabuf pool and videorate then pads dups),
+  (2) separate v4l2-ctl 90-frame burst -> last-frame PNG for pixel judgment.
+
 ## Status (2026-09-03): all three pieces DRAFTED, awaiting hardware
 
 - **Driver**: `rock5t-camera/driver/imx477.c` + Makefile + NOTES.md — Rockchip
