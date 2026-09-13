@@ -244,6 +244,29 @@ _new = [30, 30, 29, 28, 27, 26]
 _ds['DySetpoint'] = _new
 print('AE DySetpoint:', _old, '->', _new, '(~+0.7EV daylight)')
 
+# ======================================== 8c. AE metering grid (field-weighted)
+# Field measurement (2026-09-13, real pitch): with sky in frame the flat
+# 15x15 grid lets the sky drag the whole-frame average down — ground pinned
+# at 42/255 while the sky idles at 117 with 0.4% clip. Game film cares about
+# the FIELD; sky detail is worthless. Weight: field rows x4, horizon x2,
+# sky rows x1 (sky still counts a little, so it doesn't blow out wildly).
+# Exposure stays single-brain across cameras (cam0 AE, ae_follower mirrors).
+#
+# ORIENTATION: grid rows are sensor rows. Cameras are currently mounted
+# UPSIDE DOWN (scene sky lands on sensor-bottom rows). After the re-mount,
+# flip this to 'upright' and regenerate.
+SENSOR_ORIENTATION = 'inverted'   # 'upright' once cameras are re-mounted
+
+_rows15 = ([1]*5 + [2]*2 + [4]*8)          # upright: sky top, field bottom
+if SENSOR_ORIENTATION == 'inverted':
+    _rows15 = _rows15[::-1]
+_grid = []
+for _w in _rows15:
+    _grid += [_w]*15
+isp['ae_calib']['CommCtrl']['AecGridWeight'] = _grid
+print('AE grid: field-weighted (sky x1 / horizon x2 / field x4),',
+      SENSOR_ORIENTATION)
+
 # ================================================= 9. texture tuning (round 1)
 # First-light 1:1 crops (2026-09-13, outdoor daylight, base ISO): grass texture
 # smeared to watercolor by spatial NR that has nothing to denoise in full sun,
