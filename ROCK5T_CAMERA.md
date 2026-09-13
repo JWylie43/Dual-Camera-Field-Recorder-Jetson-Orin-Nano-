@@ -238,6 +238,24 @@ into record_dual.sh.
   a tee'd PNG branch starves the dmabuf pool and videorate then pads dups),
   (2) separate v4l2-ctl 90-frame burst -> last-frame PNG for pixel judgment.
 
+## Bring-up log (2026-09-13, later): AE setpoint raised — CAPTURE-TIME CHECKLIST COMPLETE
+
+Midday measurement: skeleton DySetpoint 16-20% (dropping when bright) left
+sunny frames at mean 44/255 with only 0.25% clip = a wasted stop of headroom
+(8-bit post-lifts cost quality). Raised to 26-30 (~+0.7EV): measured mean
+44->62, crushed shadows 33%->11%, clip UNCHANGED 0.27%. Verified visually.
+
+**Capture-time (unrecoverable) items now all handled:** highlight clipping
+safe with margin; exposure target correct at capture; NR/sharpening mild
+(post-safe direction) and validated; tone static (adaptive dehaze/DRC off —
+shadow lift is now a Resolve slider, identical on both cams); WB locked
+(uniform cast = one-slider post fix); bitrate honored; frame timing clean.
+Shadow-lift question CLOSED by use-case: open field = only player shadows,
+sunny or overcast — no deep-shade content; static tone + post grading covers
+it. Field-side controls remaining: lens aperture + focus rings only.
+Still open (not IQ): motion-blur/temporal-NR check on real moving subjects
+(needs a motion video), LSC flat-field calibration, re-mount, XVS + sync.
+
 ## Status (2026-09-03): all three pieces DRAFTED, awaiting hardware
 
 - **Driver**: `rock5t-camera/driver/imx477.c` + Makefile + NOTES.md — Rockchip
