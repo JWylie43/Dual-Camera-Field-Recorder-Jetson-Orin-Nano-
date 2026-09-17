@@ -83,22 +83,37 @@ def grid_coverage(points, w, h, gx=8, gy=5):
     return len(filled) / float(gx * gy)
 
 
-def detect_all(files, detector, cfg):
+def detect_all(files, detector, cfg, right_files=None):
     """One detection pass over every image. Returns (records, size).
 
     records: list of {path, <side>: (corners, ids) | None, <side>_n: int}
              where side is 'left'/'right' (or 'single' with --single).
-    size:    (w, h) of a single camera half - used as the calibration image size.
+    size:    (w, h) of a single camera image - used as the calibration size.
+
+    Two capture layouts:
+      combined (old rig): one file = both cameras side by side; split at mid.
+      pair mode (rock rig, right_files given): files[i] is the LEFT camera's
+      full frame and right_files[i] the RIGHT camera's, paired by sort order
+      (shoot them back-to-back per board pose; a static board needs no sync).
     """
     sides = ["single"] if cfg.single else ["left", "right"]
     records, size = [], None
-    for path in sorted(files):
+    pair_iter = (list(zip(sorted(files), sorted(right_files)))
+                 if right_files is not None else [(p, None) for p in sorted(files)])
+    for path, rpath in pair_iter:
         img = cv2.imread(path)
         if img is None:
             continue
-        mid = img.shape[1] // 2
-        halves = {"single": img, "left": img[:, :mid], "right": img[:, mid:]}
-        rec = {"path": path}
+        if rpath is not None:
+            rimg = cv2.imread(rpath)
+            if rimg is None:
+                continue
+            halves = {"left": img, "right": rimg}
+            rec = {"path": path, "path_right": rpath}
+        else:
+            mid = img.shape[1] // 2
+            halves = {"single": img, "left": img[:, :mid], "right": img[:, mid:]}
+            rec = {"path": path}
         for side in sides:
             gray = cv2.cvtColor(halves[side], cv2.COLOR_BGR2GRAY)
             if size is None:
@@ -136,7 +151,11 @@ def calibrate_intrinsics(name, records, board, size, cfg, out_dir):
             print(f"  Too few for {name}; skipping this camera.")
             return None, None, None
 
-    rms, K, dist, _, _ = cv2.calibrateCamera(all_obj, all_img, size, None, None)
+    # CIL391-class lenses (110 deg H, -16% barrel) exceed the default 5-coeff
+    # model; the rational model (k1..k6) keeps edge reprojection sane.
+    iflags = cv2.CALIB_RATIONAL_MODEL if cfg.model == "rational" else 0
+    rms, K, dist, _, _ = cv2.calibrateCamera(all_obj, all_img, size, None, None,
+                                             flags=iflags)
     w, h = size
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     hfov = math.degrees(2 * math.atan(w / (2 * fx)))
@@ -177,8 +196,11 @@ def calibrate_intrinsics(name, records, board, size, cfg, out_dir):
         img = cv2.imread(rec["path"])
         if img is None:
             continue
-        half = img if cfg.single else (
-            img[:, :img.shape[1] // 2] if name == "left" else img[:, img.shape[1] // 2:])
+        if cfg.single or rec.get("path_right"):
+            half = img if name != "right" else cv2.imread(rec["path_right"])
+        else:
+            half = (img[:, :img.shape[1] // 2] if name == "left"
+                    else img[:, img.shape[1] // 2:])
         und = cv2.undistort(half, K, dist)
         out_img = os.path.join(out_dir, f"{name}_undistort_sample.jpg")
         cv2.imwrite(out_img, und)
@@ -223,9 +245,12 @@ def calibrate_extrinsics(records, board, size, KL, dL, KR, dR, cfg, out_dir):
             return None
 
     crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6)
+    sflags = cv2.CALIB_FIX_INTRINSIC
+    if cfg.model == "rational":
+        sflags |= cv2.CALIB_RATIONAL_MODEL
     rms, KL, dL, KR, dR, R, T, _, _ = cv2.stereoCalibrate(
         obj_pts, pts_l, pts_r, KL, dL, KR, dR, size,
-        flags=cv2.CALIB_FIX_INTRINSIC, criteria=crit)
+        flags=sflags, criteria=crit)
 
     T = T.ravel()
     baseline = float(np.linalg.norm(T))                       # mm between camera centers
@@ -277,8 +302,11 @@ def _save_rectified_sample(records, size, KL, dL, KR, dR, R, T, out_dir):
         if pair is None:
             return
         img = cv2.imread(pair["path"])
-        mid = img.shape[1] // 2
-        left, right = img[:, :mid], img[:, mid:]
+        if pair.get("path_right"):
+            left, right = img, cv2.imread(pair["path_right"])
+        else:
+            mid = img.shape[1] // 2
+            left, right = img[:, :mid], img[:, mid:]
         R1, R2, P1, P2, _, _, _ = cv2.stereoRectify(
             KL, dL, KR, dR, size, R, T.reshape(3, 1), alpha=0)
         ml = cv2.initUndistortRectifyMap(KL, dL, R1, P1, size, cv2.CV_16SC2)
@@ -322,24 +350,40 @@ def main():
     ap.add_argument("--dict", default="DICT_5X5_1000", help="ArUco dictionary name")
     ap.add_argument("--single", action="store_true",
                     help="treat each image as ONE camera (intrinsics only, no stereo)")
+    ap.add_argument("--left-glob", default=None,
+                    help="pair mode (rock rig): glob for LEFT camera files, e.g. 'images/cam0_*.png'")
+    ap.add_argument("--right-glob", default=None,
+                    help="pair mode: glob for RIGHT camera files, e.g. 'images/cam1_*.png'")
+    ap.add_argument("--model", choices=["standard", "rational"], default="rational",
+                    help="distortion model (rational for the 110deg CIL391 lens; default)")
     args = ap.parse_args()
 
-    files = []
-    for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.PNG"):
-        files += glob.glob(os.path.join(args.images, ext))
-    files = sorted(set(files))
+    right_files = None
+    if args.left_glob or args.right_glob:
+        if not (args.left_glob and args.right_glob):
+            sys.exit("Pair mode needs BOTH --left-glob and --right-glob.")
+        files = sorted(set(glob.glob(args.left_glob)))
+        right_files = sorted(set(glob.glob(args.right_glob)))
+        if not files or len(files) != len(right_files):
+            sys.exit(f"Pair mode: {len(files)} left vs {len(right_files)} right files - "
+                     "need equal, nonzero counts (pairs are matched by sort order).")
+    else:
+        files = []
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.PNG"):
+            files += glob.glob(os.path.join(args.images, ext))
+        files = sorted(set(files))
     if not files:
         sys.exit(f"No images found in '{args.images}'. "
                  f"Pull them first:  scp -r joe@joe-desktop.local:/mnt/video/calib ./images")
     os.makedirs(args.out, exist_ok=True)
 
-    print(f"Found {len(files)} images in {args.images}")
+    print(f"Found {len(files)} images" + (" (paired L/R)" if right_files else f" in {args.images}"))
     print(f"Board: {args.squares_x}x{args.squares_y}, square={args.square_mm}mm, "
           f"marker={args.marker_mm}mm, dict={args.dict}")
     print("(If detection is poor, confirm these match your PRINTED board.)")
 
     board, detector = build_board(args)
-    records, size = detect_all(files, detector, args)
+    records, size = detect_all(files, detector, args, right_files=right_files)
     if size is None:
         sys.exit("No readable images found.")
 
