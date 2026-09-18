@@ -1,0 +1,21 @@
+[Unit]
+# USB-C network gadget: the Rock appears to a Mac as a network adapter over one
+# USB-C cable (10.55.0.1), for fast offload without wifi or an Ethernet dongle.
+# Install:
+#   sudo cp ~/orin-recorder/rock5t-camera/recorder/rock-usb-gadget.service \
+#           /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now rock-usb-gadget
+# Temporarily hand the Type-C port back to host use (e.g. for a USB drive):
+#   sudo systemctl stop rock-usb-gadget
+Description=USB-C network gadget (Rock as a network adapter to a host)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/radxa/orin-recorder/rock5t-camera/recorder/usb-gadget.sh up
+ExecStop=/home/radxa/orin-recorder/rock5t-camera/recorder/usb-gadget.sh down
+
+[Install]
+WantedBy=multi-user.target
