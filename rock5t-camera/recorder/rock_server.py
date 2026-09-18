@@ -171,7 +171,21 @@ def start_previews():
                     f"video/x-raw,framerate=5/1 ! jpegenc quality=80 ! "
                     f"multifilesink location={PREV_JPG[cam]}")
         log = open(f"/tmp/rec_prev{cam}.log", "w")
-        _state["gst"][cam] = subprocess.Popen(pipeline, shell=True, stdout=log, stderr=log)
+        # own process group: shell=True means Popen's pid is the shell, so only
+        # killpg reaches gst - without it previews survive the server and hold
+        # the selfpath nodes, blocking the next run (hit 2026-09-18)
+        _state["gst"][cam] = subprocess.Popen(pipeline, shell=True, stdout=log,
+                                              stderr=log, preexec_fn=os.setsid)
+
+
+def stop_previews():
+    for p in _state["gst"].values():
+        if p and p.poll() is None:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    _state["gst"] = {}
 
 
 def ae_active():
@@ -378,6 +392,15 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
+    # refuse to start on top of a previous instance's leftovers: only one
+    # process can hold a camera node, and the failure mode is a silent black
+    # preview / 0-byte take rather than an error
+    held = sh("pgrep -af 'gst-launch.*video(2[23]|3[12])'").stdout.strip()
+    if held:
+        print("Camera nodes are already in use:\n  " + held.replace("\n", "\n  "))
+        print("\nAnother rock_server/calib_server (or its orphaned children) is "
+              "running.\nClear it with:  sudo pkill -f _server.py; sudo pkill -f gst-launch")
+        raise SystemExit(1)
     resolve_subdevs()
     start_previews()
     ip = "unknown"
@@ -394,6 +417,7 @@ def main():
     finally:
         if _state["rec"]:
             stop_recording()
+        stop_previews()
 
 
 if __name__ == "__main__":

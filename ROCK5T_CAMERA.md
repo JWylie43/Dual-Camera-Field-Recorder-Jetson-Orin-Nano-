@@ -272,6 +272,34 @@ explicitly or verify FOV). Live preview workaround: stream MAINPATH
 (video22) 4K->h264 10fps via udpsink to ffplay on the Mac. TODO: package
 as preview.sh; add selfpath selection reset to record_dual.sh.
 
+## Bring-up log (2026-09-18): intrinsics solved + FIRST DUAL 4K30 RECORDING
+
+- **Intrinsics done** (cameras loose, focus locked): the CIL391 needs the
+  FISHEYE model - the rational/pinhole fit leaves a uniform ~2.6px residual
+  (model mismatch, FOV readout degenerates). cv2.fisheye: **RMS 0.233px
+  (cam0) / 0.240px (cam1)**, f 2104/2108px (matched to 0.2%), FOV
+  104.5x58.8 deg, 98% frame coverage, 46 views each. Per-unit decenter
+  measured: cam0 cx 49px left (explains the asymmetric-baseboard look),
+  cam1 cy 148px low - normal M12 tolerance, now calibrated rather than
+  assumed. Saved: calibration/rock-rig/cam{0,1}_intrinsics.json.
+  Board: charuco_board.png on a TV, 78mm squares (measured on glass).
+  **Never touch the focus rings or reseat a lens** without recalibrating
+  that camera.
+- **calib_server.py / rock_server.py**: browser panels (8081 calibration,
+  8080 recorder). Rules baked in: previews run CONTINUOUSLY on the selfpath
+  and are never stopped/restarted (a camera switcher that restarted
+  pipelines caused a lockup), snapshots/records come off the mainpath so
+  both coexist, preview children run in their own process group and are
+  killed on exit (orphans otherwise hold the nodes and silently black the
+  next run), and startup refuses to run on top of leftovers.
+- **FIRST SIMULTANEOUS DUAL 4K30 RECORDING (passed):** both cameras 238
+  frames / 7.90s / **30.000 fps, zero gaps**, 27.3 + 27.2 Mbit vs the 28M
+  target, clean decode. Two independent MKVs by design (fault isolation;
+  the stitcher pairs full-res frames by timestamp).
+- Browser note: Chrome can refuse LAN panels entirely
+  (ERR_ADDRESS_UNREACHABLE) when a planted `LocalNetworkAccessAllowedForUrls`
+  policy turns on Local Network Access enforcement. Safari is unaffected.
+
 ## Status (2026-09-03): all three pieces DRAFTED, awaiting hardware
 
 - **Driver**: `rock5t-camera/driver/imx477.c` + Makefile + NOTES.md — Rockchip
