@@ -27,6 +27,15 @@ INC=/etc/samba/rock-recordings.conf
 
 apt-get install -y samba
 
+# an earlier version of this script appended the stanza straight into
+# smb.conf; strip it so the include file below is the only definition
+if grep -q '^\[recordings\]' /etc/samba/smb.conf; then
+  cp /etc/samba/smb.conf /etc/samba/smb.conf.bak.$(date +%s)
+  sed -i '/^\[recordings\]/,/^\[[^]]*\]$/{ /^\[recordings\]/d; /^\[[^]]*\]$/!d }' \
+      /etc/samba/smb.conf
+  echo "removed the previously inlined [recordings] stanza (backup kept)"
+fi
+
 mkdir -p "$SHARE_DIR"
 chown "$USER_NAME:$USER_NAME" "$SHARE_DIR"
 
