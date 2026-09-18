@@ -51,6 +51,14 @@ if [ "$GUEST" = "1" ]; then
    force user = $USER_NAME
    create mask = 0644
    directory mask = 0755
+
+# samba publishes every account's home folder by default, so connecting as
+# Guest offers the guest account's home ("nobody") - a share that does not
+# exist and errors when opened. This include sits last in smb.conf, so these
+# values override the stock [homes] section.
+[homes]
+   available = no
+   browseable = no
 EOF
   # unknown users become the guest account instead of being rejected
   grep -qi '^[[:space:]]*map to guest' /etc/samba/smb.conf \
@@ -68,6 +76,14 @@ else
    force user = $USER_NAME
    create mask = 0644
    directory mask = 0755
+
+# samba publishes every account's home folder by default, so connecting as
+# Guest offers the guest account's home ("nobody") - a share that does not
+# exist and errors when opened. This include sits last in smb.conf, so these
+# values override the stock [homes] section.
+[homes]
+   available = no
+   browseable = no
 EOF
   MODE="password (user $USER_NAME)"
 fi
