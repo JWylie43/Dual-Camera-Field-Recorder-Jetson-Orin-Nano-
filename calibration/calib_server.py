@@ -9,7 +9,7 @@ works). Python stdlib only.
     python3 calib_server.py            # then browse to http://<rock-ip>:8081
 
 How it works around the hardware:
-  - PREVIEW comes from the ISP *selfpath* (video23/video32) at 960x540 5fps
+  - PREVIEW comes from the ISP *selfpath* (video23/video32) at 1280x720 5fps
     JPEG -> /dev/shm, served as MJPEG. The selfpath can hold a stale crop
     window (found 2026-09-13), so its crop selection is reset to the full
     3840x2160 input every time the preview starts.
@@ -85,11 +85,11 @@ def start_preview(cam):
     except FileNotFoundError:
         pass
     pipeline = (f"gst-launch-1.0 v4l2src device={c['self']} ! "
-                f"video/x-raw,format=NV12,width=960,height=540 ! videorate ! "
+                f"video/x-raw,format=NV12,width=1280,height=720 ! videorate ! "
                 f"video/x-raw,framerate=5/1 ! jpegenc quality=80 ! "
                 f"multifilesink location={PREV_JPG}")
-    _state["gst"] = subprocess.Popen(pipeline, shell=True,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log = open("/tmp/calib_gst.log", "w")
+    _state["gst"] = subprocess.Popen(pipeline, shell=True, stdout=log, stderr=log)
 
 
 def stop_preview():
