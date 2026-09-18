@@ -39,6 +39,7 @@ Outputs (in --out dir):
 """
 
 import argparse
+import re
 import glob
 import json
 import math
@@ -129,7 +130,7 @@ def detect_all(files, detector, cfg, right_files=None):
 def calibrate_intrinsics(name, records, board, size, cfg, out_dir):
     """Per-camera intrinsics from that camera's detected views. Returns
     (result_dict, K, dist) or (None, None, None) if there aren't enough views."""
-    all_obj, all_img, all_pts = [], [], []
+    all_obj, all_img, all_pts, recs_used = [], [], [], []
     used = 0
     print(f"\n=== {name.upper()} camera (intrinsics) ===")
     for rec in records:
@@ -141,6 +142,7 @@ def calibrate_intrinsics(name, records, board, size, cfg, out_dir):
                 all_obj.append(obj)
                 all_img.append(imgp)
                 all_pts.extend(imgp.reshape(-1, 2))
+                recs_used.append(rec["path"])
                 used += 1
         print(f"  {os.path.basename(rec['path']):28} corners: {rec.get(name + '_n', 0)}")
 
@@ -151,11 +153,29 @@ def calibrate_intrinsics(name, records, board, size, cfg, out_dir):
             print(f"  Too few for {name}; skipping this camera.")
             return None, None, None
 
+    if cfg.model == "fisheye":
+        return _calibrate_fisheye(name, all_obj, all_img, all_pts, recs_used,
+                                  used, board, size, cfg, out_dir, records)
+
     # CIL391-class lenses (110 deg H, -16% barrel) exceed the default 5-coeff
     # model; the rational model (k1..k6) keeps edge reprojection sane.
     iflags = cv2.CALIB_RATIONAL_MODEL if cfg.model == "rational" else 0
-    rms, K, dist, _, _ = cv2.calibrateCamera(all_obj, all_img, size, None, None,
-                                             flags=iflags)
+    rms, K, dist, _, _, _, _, pve = cv2.calibrateCameraExtended(
+        all_obj, all_img, size, None, None, flags=iflags)
+    # prune outlier views (blur / screen moire poison the fit) and refit once
+    pve = pve.ravel()
+    med = float(np.median(pve))
+    keep = [i for i, e in enumerate(pve) if e <= max(2.0 * med, 1.5)]
+    if len(keep) < len(pve) and len(keep) >= 8:
+        dropped = [(os.path.basename(recs_used[i]), round(float(pve[i]), 2))
+                   for i in range(len(pve)) if i not in keep]
+        print(f"  pruning {len(pve) - len(keep)} outlier views "
+              f"(median err {med:.2f}px): {dropped}")
+        all_obj = [all_obj[i] for i in keep]
+        all_img = [all_img[i] for i in keep]
+        rms, K, dist, _, _, _, _, pve = cv2.calibrateCameraExtended(
+            all_obj, all_img, size, None, None, flags=iflags)
+        used = len(keep)
     w, h = size
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     hfov = math.degrees(2 * math.atan(w / (2 * fx)))
@@ -208,6 +228,94 @@ def calibrate_intrinsics(name, records, board, size, cfg, out_dir):
         break
 
     return result, K, dist
+
+
+
+def _calibrate_fisheye(name, all_obj, all_img, all_pts, recs_used, used,
+                       board, size, cfg, out_dir, records):
+    """cv2.fisheye (equidistant) solve - the right projection for the CIL391
+    (110deg H, GoPro-style): the pinhole+polynomial models fit it with a
+    uniform ~2.6px residual (model mismatch), fisheye is its native shape."""
+    obj = [o.reshape(1, -1, 3).astype(np.float64) for o in all_obj]
+    img = [i.reshape(1, -1, 2).astype(np.float64) for i in all_img]
+    K = np.zeros((3, 3))
+    D = np.zeros((4, 1))
+    fflags = (cv2.CALIB_RECOMPUTE_EXTRINSIC | cv2.CALIB_FIX_SKEW)  # top-level in cv5
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 1e-7)
+    # fisheye.calibrate can throw on degenerate views; drop offenders and retry
+    names = list(recs_used)
+    for _ in range(10):
+        try:
+            rms, K, D, _, _ = cv2.fisheye.calibrate(
+                obj, img, size, K, D, flags=fflags, criteria=crit)
+            break
+        except cv2.error as e:
+            m = re.search(r"input array (\d+)", str(e))
+            if m and len(obj) > 8:
+                i = int(m.group(1))
+                print(f"  dropping degenerate view {os.path.basename(names[i])}")
+                for lst in (obj, img, names):
+                    del lst[i]
+                K = np.zeros((3, 3)); D = np.zeros((4, 1))
+            else:
+                raise
+    used = len(obj)
+    w, h = size
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    # equidistant projection: r = f * theta  ->  edge angle = (w/2)/fx radians
+    hfov = math.degrees(2 * ((w / 2 - abs(cx - w / 2)) + abs(cx - w / 2)) / (2 * fx) * 2) / 2
+    hfov = math.degrees(w / fx)
+    vfov = math.degrees(h / fy)
+    cov = grid_coverage(all_pts, w, h)
+    print(f"  model           : FISHEYE (equidistant)")
+    print(f"  images used     : {used}")
+    print(f"  image size      : {w} x {h}")
+    print(f"  RMS reproj error: {rms:.3f} px   ({'good' if rms < 1.0 else 'high - see notes'})")
+    print(f"  focal (fx, fy)  : {fx:.1f}, {fy:.1f} px")
+    print(f"  principal (cx,cy): {cx:.1f}, {cy:.1f}")
+    print(f"  distortion (k1-4): {np.round(D.ravel(), 5).tolist()}")
+    print(f"  >> FOV          : {hfov:.1f} deg horizontal, {vfov:.1f} deg vertical")
+    print(f"  frame coverage  : {cov*100:.0f}% of an 8x5 grid "
+          f"({'good' if cov > 0.8 else 'thin - add edge/corner shots'})")
+    result = {
+        "camera": name, "model": "fisheye",
+        "image_width": w, "image_height": h,
+        "rms_reproj_error_px": round(float(rms), 4),
+        "camera_matrix": K.tolist(),
+        "distortion_coefficients": D.ravel().tolist(),
+        "fov_horizontal_deg": round(hfov, 2),
+        "fov_vertical_deg": round(vfov, 2),
+        "images_used": used,
+        "board": {"squares_x": cfg.squares_x, "squares_y": cfg.squares_y,
+                  "square_mm": cfg.square_mm, "marker_mm": cfg.marker_mm,
+                  "dictionary": cfg.dict},
+    }
+    out_json = os.path.join(out_dir, f"{name}_intrinsics.json")
+    with open(out_json, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"  saved -> {out_json}")
+    # undistort sample via fisheye maps
+    for rec in records:
+        if rec.get(name) is None:
+            continue
+        imgf = cv2.imread(rec["path"])
+        if imgf is None:
+            continue
+        if cfg.single or rec.get("path_right"):
+            half = imgf if name != "right" else cv2.imread(rec["path_right"])
+        else:
+            half = (imgf[:, :imgf.shape[1] // 2] if name == "left"
+                    else imgf[:, imgf.shape[1] // 2:])
+        newK = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+            K, D, size, np.eye(3), balance=0.4)
+        m1, m2 = cv2.fisheye.initUndistortRectifyMap(
+            K, D, np.eye(3), newK, size, cv2.CV_16SC2)
+        und = cv2.remap(half, m1, m2, cv2.INTER_LINEAR)
+        out_img = os.path.join(out_dir, f"{name}_undistort_sample.jpg")
+        cv2.imwrite(out_img, und)
+        print(f"  saved -> {out_img}  (eyeball: straight lines should be straight)")
+        break
+    return result, K, D
 
 
 def calibrate_extrinsics(records, board, size, KL, dL, KR, dR, cfg, out_dir):
@@ -354,7 +462,7 @@ def main():
                     help="pair mode (rock rig): glob for LEFT camera files, e.g. 'images/cam0_*.png'")
     ap.add_argument("--right-glob", default=None,
                     help="pair mode: glob for RIGHT camera files, e.g. 'images/cam1_*.png'")
-    ap.add_argument("--model", choices=["standard", "rational"], default="rational",
+    ap.add_argument("--model", choices=["standard", "rational", "fisheye"], default="rational",
                     help="distortion model (rational for the 110deg CIL391 lens; default)")
     args = ap.parse_args()
 

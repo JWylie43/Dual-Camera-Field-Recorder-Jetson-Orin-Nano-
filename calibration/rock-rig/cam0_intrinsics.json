@@ -1,0 +1,40 @@
+{
+  "camera": "single",
+  "model": "fisheye",
+  "image_width": 3840,
+  "image_height": 2160,
+  "rms_reproj_error_px": 0.2334,
+  "camera_matrix": [
+    [
+      2104.410533045675,
+      0.0,
+      1871.272668241379
+    ],
+    [
+      0.0,
+      2104.732759358912,
+      1094.4916912948868
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "distortion_coefficients": [
+    -0.05311762511364318,
+    0.002873255849023337,
+    -0.005324071189654066,
+    0.0018045366153135792
+  ],
+  "fov_horizontal_deg": 104.55,
+  "fov_vertical_deg": 58.8,
+  "images_used": 46,
+  "board": {
+    "squares_x": 7,
+    "squares_y": 10,
+    "square_mm": 78.0,
+    "marker_mm": 58.0,
+    "dictionary": "DICT_5X5_1000"
+  }
+}
