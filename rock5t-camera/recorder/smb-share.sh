@@ -41,6 +41,21 @@ chown "$USER_NAME:$USER_NAME" "$SHARE_DIR"
 
 if [ "$GUEST" = "1" ]; then
   cat > "$INC" <<EOF
+[global]
+   # Throughput tuning (measured 2026-09-18: stock samba gave ~63 MB/s on a link
+   # that does 275). macOS asks for SMB signing by default and signing every
+   # packet is expensive on the Rock's cores; sendfile + async IO + a larger
+   # receivefile threshold let samba move large media files near link speed.
+   # Signing/encryption off = plaintext on the wire: fine for a home LAN and a
+   # direct USB-C cable, not for an untrusted network.
+   server signing = no
+   smb encrypt = off
+   use sendfile = yes
+   aio read size = 1
+   aio write size = 1
+   min receivefile size = 16384
+   socket options = TCP_NODELAY IPTOS_LOWDELAY
+
 [recordings]
    comment = ROCK 5T stereo takes
    path = $SHARE_DIR
@@ -66,6 +81,21 @@ EOF
   MODE="OPEN (no password - connect as Guest)"
 else
   cat > "$INC" <<EOF
+[global]
+   # Throughput tuning (measured 2026-09-18: stock samba gave ~63 MB/s on a link
+   # that does 275). macOS asks for SMB signing by default and signing every
+   # packet is expensive on the Rock's cores; sendfile + async IO + a larger
+   # receivefile threshold let samba move large media files near link speed.
+   # Signing/encryption off = plaintext on the wire: fine for a home LAN and a
+   # direct USB-C cable, not for an untrusted network.
+   server signing = no
+   smb encrypt = off
+   use sendfile = yes
+   aio read size = 1
+   aio write size = 1
+   min receivefile size = 16384
+   socket options = TCP_NODELAY IPTOS_LOWDELAY
+
 [recordings]
    comment = ROCK 5T stereo takes
    path = $SHARE_DIR
