@@ -53,7 +53,7 @@ button{font-size:1.4em;padding:.6em 1.2em;margin:.4em;border-radius:.5em;border:
 <button class=cam id=c1 onclick="cam('1')">Camera 1</button>
 </div>
 <img id=prev src="/preview.mjpg">
-<div><button id=snap onclick="snap()">&#128247; SNAPSHOT</button></div>
+<div><button id=snap onclick="snap()">&#128247; SNAPSHOT BOTH</button></div>
 <div id=msg></div>
 <script>
 function refresh(){fetch('/status').then(r=>r.json()).then(s=>{
@@ -63,9 +63,9 @@ function refresh(){fetch('/status').then(r=>r.json()).then(s=>{
 function cam(c){fetch('/cam?c='+c).then(()=>{
   document.getElementById('prev').src='/preview.mjpg?'+Date.now();refresh();});}
 function snap(){var b=document.getElementById('snap');b.disabled=true;
-  b.textContent='capturing...';
+  b.textContent='capturing both (~6s, hold still)...';
   fetch('/snap').then(r=>r.json()).then(s=>{
-    b.disabled=false;b.textContent='\\ud83d\\udcf7 SNAPSHOT';
+    b.disabled=false;b.textContent='\\ud83d\\udcf7 SNAPSHOT BOTH';
     document.getElementById('msg').textContent=(s.ok?('saved '+s.file+'  (total '+s.count+')'):('ERROR: '+s.error));});}
 refresh();
 </script></body></html>"""
@@ -160,7 +160,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"ok": True})
         elif path == "/snap":
             with _state["lock"]:
-                res = take_snapshot(_state["cam"])
+                res = {}
+                for cam in CAMS:
+                    r = take_snapshot(cam)
+                    res["cam" + cam] = r
+                    if not r.get("ok"):
+                        break
+                ok = all(v.get("ok") for v in res.values())
+                res = {"ok": ok,
+                       "file": " + ".join(v.get("file", "?") for v in res.values()),
+                       "count": max((v.get("count", 0) for v in res.values()), default=0),
+                       "error": "; ".join(v.get("error", "") for v in res.values() if v.get("error"))}
             self._json(res)
         elif path == "/preview.mjpg":
             self.send_response(200)
