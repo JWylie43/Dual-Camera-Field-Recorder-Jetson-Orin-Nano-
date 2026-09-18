@@ -31,13 +31,13 @@ import threading
 import time
 
 PORT = 8081
-PREV_JPG = "/dev/shm/calib_prev.jpg"
+PREV_JPG = {"0": "/dev/shm/calib_prev0.jpg", "1": "/dev/shm/calib_prev1.jpg"}
 CAMS = {
     "0": {"main": "/dev/video22", "self": "/dev/video23", "dir": os.path.expanduser("~/calib0")},
     "1": {"main": "/dev/video31", "self": "/dev/video32", "dir": os.path.expanduser("~/calib1")},
 }
 
-_state = {"cam": "0", "gst": None, "lock": threading.Lock(), "snapping": False}
+_state = {"gst": {}, "lock": threading.Lock()}
 
 PAGE = """<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Rig Calibration</title><style>
@@ -50,20 +50,13 @@ button{font-size:1.4em;padding:.6em 1.2em;margin:.4em;border-radius:.5em;border:
 #msg{min-height:1.5em;color:#8f8}
 </style></head><body>
 <h3>Rig Calibration Panel</h3>
-<div>
-<button class=cam id=c0 onclick="cam('0')">Camera 0</button>
-<button class=cam id=c1 onclick="cam('1')">Camera 1</button>
-</div>
-<img id=prev src="/preview.mjpg">
+<div>cam0</div><img src="/preview0.mjpg">
+<div>cam1</div><img src="/preview1.mjpg">
 <div><button id=snap onclick="snap()">&#128247; SNAPSHOT BOTH</button></div>
 <div id=msg></div>
 <script>
 function refresh(){fetch('/status').then(r=>r.json()).then(s=>{
-  document.getElementById('c0').className='cam'+(s.cam=='0'?' on':'');
-  document.getElementById('c1').className='cam'+(s.cam=='1'?' on':'');
-  document.getElementById('msg').textContent='cam'+s.cam+': '+s.count+' snapshots in '+s.dir;});}
-function cam(c){fetch('/cam?c='+c).then(()=>{
-  document.getElementById('prev').src='/preview.mjpg?'+Date.now();refresh();});}
+  document.getElementById('msg').textContent='cam0: '+s.count0+'  |  cam1: '+s.count1+' snapshots';});}
 function snap(){var b=document.getElementById('snap');b.disabled=true;
   b.textContent='capturing both (~6s, hold still)...';
   fetch('/snap').then(r=>r.json()).then(s=>{
@@ -77,32 +70,34 @@ def sh(cmd, timeout=30):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
 
 
-def start_preview(cam):
-    stop_preview()
-    c = CAMS[cam]
-    # clear any stale selfpath crop window (rkisp keeps the last selection)
-    sh(f"v4l2-ctl -d {c['self']} --set-selection target=crop,top=0,left=0,width=3840,height=2160")
-    try:
-        os.remove(PREV_JPG)
-    except FileNotFoundError:
-        pass
-    pipeline = (f"gst-launch-1.0 v4l2src device={c['self']} ! "
-                f"video/x-raw,format=NV12,width=1920,height=1080 ! videorate ! "
-                f"video/x-raw,framerate=5/1 ! jpegenc quality=80 ! "
-                f"multifilesink location={PREV_JPG}")
-    log = open("/tmp/calib_gst.log", "w")
-    _state["gst"] = subprocess.Popen(pipeline, shell=True, stdout=log, stderr=log)
-
-
-def stop_preview():
-    p = _state.get("gst")
-    if p and p.poll() is None:
-        p.terminate()
+def start_previews():
+    """Start BOTH cameras' preview pipelines once, at server start. They are
+    never stopped/restarted while the server runs: this vendor stack dislikes
+    pipeline teardown churn (dphy rebind oops, selfpath stale crops, a lockup
+    blamed on the old cam-switcher), so the design has no switching at all."""
+    for cam, c in CAMS.items():
+        sh(f"v4l2-ctl -d {c['self']} --set-selection target=crop,top=0,left=0,width=3840,height=2160")
         try:
-            p.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            p.kill()
-    _state["gst"] = None
+            os.remove(PREV_JPG[cam])
+        except FileNotFoundError:
+            pass
+        pipeline = (f"gst-launch-1.0 v4l2src device={c['self']} ! "
+                    f"video/x-raw,format=NV12,width=1920,height=1080 ! videorate ! "
+                    f"video/x-raw,framerate=5/1 ! jpegenc quality=80 ! "
+                    f"multifilesink location={PREV_JPG[cam]}")
+        log = open(f"/tmp/calib_gst{cam}.log", "w")
+        _state["gst"][cam] = subprocess.Popen(pipeline, shell=True, stdout=log, stderr=log)
+
+
+def stop_previews():
+    for p in _state["gst"].values():
+        if p and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                p.kill()
+    _state["gst"] = {}
 
 
 def snap_count(cam):
@@ -151,15 +146,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif path == "/status":
-            cam = _state["cam"]
-            self._json({"cam": cam, "count": snap_count(cam), "dir": CAMS[cam]["dir"]})
-        elif path == "/cam":
-            cam = self.path.split("c=")[-1][:1]
-            if cam in CAMS:
-                with _state["lock"]:
-                    _state["cam"] = cam
-                    start_preview(cam)
-            self._json({"ok": True})
+            self._json({"count0": snap_count("0"), "count1": snap_count("1")})
         elif path == "/snap":
             with _state["lock"]:
                 res = {}
@@ -174,14 +161,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        "count": max((v.get("count", 0) for v in res.values()), default=0),
                        "error": "; ".join(v.get("error", "") for v in res.values() if v.get("error"))}
             self._json(res)
-        elif path == "/preview.mjpg":
+        elif path in ("/preview0.mjpg", "/preview1.mjpg"):
+            jpg_path = PREV_JPG[path[8]]
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.end_headers()
             try:
                 while True:
                     try:
-                        with open(PREV_JPG, "rb") as f:
+                        with open(jpg_path, "rb") as f:
                             jpg = f.read()
                     except FileNotFoundError:
                         jpg = b""
@@ -201,7 +189,7 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    start_preview(_state["cam"])
+    start_previews()
     ip = "unknown"
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -214,7 +202,7 @@ def main():
     try:
         Server(("0.0.0.0", PORT), Handler).serve_forever()
     finally:
-        stop_preview()
+        stop_previews()
 
 
 if __name__ == "__main__":
