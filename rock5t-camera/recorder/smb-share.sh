@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# NOT IN USE (2026-09-18). Joe chose the USB SSD shuttle instead - mount the
+# drive from the recorder panel, copy, eject, carry it. This script and
+# usb-gadget.sh were built, measured and then reverted on purpose; they are
+# kept only as a documented fallback. Measured at the time: SMB gave ~63 MB/s
+# where the USB-C gadget link did 275, and macOS's SMB client was the ceiling.
+#
 # smb-share.sh - share ~/recordings over SMB so macOS Finder can mount it and
 # drag-and-drop takes (Finder speaks SMB natively; no macFUSE/sshfs needed).
 #

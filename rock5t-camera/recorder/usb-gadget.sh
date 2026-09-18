@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# NOT IN USE (2026-09-18). Joe chose the USB SSD shuttle instead; this is kept
+# as a documented fallback. It worked well (275 MB/s with a USB 3 cable).
+#
 # usb-gadget.sh - present the ROCK 5T to a USB-C host (your Mac) as a NETWORK
 # adapter, so one cable gives a private high-speed link for pulling recordings.
 #
