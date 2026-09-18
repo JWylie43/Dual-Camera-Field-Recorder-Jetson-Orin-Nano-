@@ -32,6 +32,7 @@ import time
 
 PORT = 8081
 PREV_JPG = {"0": "/dev/shm/calib_prev0.jpg", "1": "/dev/shm/calib_prev1.jpg"}
+FULL_JPG = {"0": "/dev/shm/calib_full0.jpg", "1": "/dev/shm/calib_full1.jpg"}
 CAMS = {
     "0": {"main": "/dev/video22", "self": "/dev/video23", "dir": os.path.expanduser("~/calib0")},
     "1": {"main": "/dev/video31", "self": "/dev/video32", "dir": os.path.expanduser("~/calib1")},
@@ -58,7 +59,7 @@ button{font-size:1.4em;padding:.6em 1.2em;margin:.4em;border-radius:.5em;border:
 function refresh(){fetch('/status').then(r=>r.json()).then(s=>{
   document.getElementById('msg').textContent='cam0: '+s.count0+'  |  cam1: '+s.count1+' snapshots';});}
 function snap(){var b=document.getElementById('snap');b.disabled=true;
-  b.textContent='capturing both (~6s, hold still)...';
+  b.textContent='capturing...';
   fetch('/snap').then(r=>r.json()).then(s=>{
     b.disabled=false;b.textContent='\\ud83d\\udcf7 SNAPSHOT BOTH';
     document.getElementById('msg').textContent=(s.ok?('saved '+s.file+'  (total '+s.count+')'):('ERROR: '+s.error));});}
@@ -87,6 +88,14 @@ def start_previews():
                     f"multifilesink location={PREV_JPG[cam]}")
         log = open(f"/tmp/calib_gst{cam}.log", "w")
         _state["gst"][cam] = subprocess.Popen(pipeline, shell=True, stdout=log, stderr=log)
+        # full-res grabber: latest 4K frame always fresh in /dev/shm, so a
+        # snapshot is just a file copy (instant) - no per-tap pipeline starts
+        full = (f"gst-launch-1.0 v4l2src device={c['main']} ! "
+                f"video/x-raw,format=NV12,width=3840,height=2160 ! videorate ! "
+                f"video/x-raw,framerate=2/1 ! jpegenc quality=97 ! "
+                f"multifilesink location={FULL_JPG[cam]}")
+        logf = open(f"/tmp/calib_gst_full{cam}.log", "w")
+        _state["gst"][cam + "f"] = subprocess.Popen(full, shell=True, stdout=logf, stderr=logf)
 
 
 def stop_previews():
@@ -103,24 +112,28 @@ def stop_previews():
 def snap_count(cam):
     d = CAMS[cam]["dir"]
     try:
-        return len([f for f in os.listdir(d) if f.endswith(".png")])
+        return len([f for f in os.listdir(d) if f.endswith((".png", ".jpg"))])
     except FileNotFoundError:
         return 0
 
 
 def take_snapshot(cam):
+    """Copy the grabber's latest full-res frame - effectively instant."""
     c = CAMS[cam]
+    src = FULL_JPG[cam]
+    try:
+        age = time.time() - os.path.getmtime(src)
+    except FileNotFoundError:
+        return {"ok": False, "error": f"no full-res frame yet from cam{cam} grabber"}
+    if age > 3:
+        return {"ok": False, "error": f"cam{cam} full-res frame is stale ({age:.0f}s) - grabber dead? see /tmp/calib_gst_full{cam}.log"}
     os.makedirs(c["dir"], exist_ok=True)
     idx = snap_count(cam)
-    out = os.path.join(c["dir"], f"img_{idx:03d}.png")
-    r = sh(f"v4l2-ctl -d {c['main']} --set-fmt-video=width=3840,height=2160,pixelformat=NV12 "
-           f"--stream-mmap --stream-count=45 --stream-to=/tmp/calib_snap.nv12", timeout=20)
-    if r.returncode != 0:
-        return {"ok": False, "error": (r.stderr or "capture failed").strip()[:200]}
-    r = sh(f"ffmpeg -loglevel error -f rawvideo -pix_fmt nv12 -s 3840x2160 "
-           f"-i /tmp/calib_snap.nv12 -update 1 -y {out}", timeout=30)
-    if r.returncode != 0 or not os.path.exists(out):
-        return {"ok": False, "error": (r.stderr or "png convert failed").strip()[:200]}
+    out = os.path.join(c["dir"], f"img_{idx:03d}.jpg")
+    with open(src, "rb") as f:
+        data = f.read()
+    with open(out, "wb") as f:
+        f.write(data)
     return {"ok": True, "file": os.path.basename(out), "count": snap_count(cam)}
 
 
