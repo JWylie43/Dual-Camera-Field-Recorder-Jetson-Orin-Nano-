@@ -1,0 +1,35 @@
+[Unit]
+# Web control panel for the ROCK 5T stereo recorder (previews + record button).
+# Install:
+#   sudo cp ~/orin-recorder/rock5t-camera/recorder/rock-recorder.service \
+#           /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now rock-recorder
+# Then it is up at http://<rock-ip>:8080 on every boot.
+# Logs:    journalctl -u rock-recorder -f
+# Manual:  sudo systemctl stop rock-recorder   (before running the script by hand,
+#          or by-hand runs fail: only one process can hold a camera node)
+Description=ROCK 5T stereo recorder web panel
+Documentation=file:///home/radxa/orin-recorder/ROCK5T_CAMERA.md
+# rkaiq_3A drives the ISP's exposure/colour; without it frames are unusable
+After=network-online.target rkaiq_3A.service
+Wants=network-online.target rkaiq_3A.service
+
+[Service]
+Type=simple
+User=radxa
+Group=radxa
+SupplementaryGroups=video
+WorkingDirectory=/home/radxa/orin-recorder
+ExecStart=/usr/bin/python3 /home/radxa/orin-recorder/rock5t-camera/recorder/rock_server.py
+# the camera pipeline settles a few seconds after the sensors probe (~12s);
+# starting into a half-ready pipeline just makes the first previews fail
+ExecStartPre=/bin/sleep 8
+Restart=on-failure
+RestartSec=10
+# kill the gst children too (they run in their own process groups)
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
