@@ -17,6 +17,14 @@
 #
 # NOTE: the Type-C port is dual-role, so it is either the gadget link OR a host
 # port - if your USB drive lives there, move it to a blue USB-A 3.0 port.
+#
+# USE A USB 3 CABLE. Measured 2026-09-18: a USB 2.0-only cable (the kind bundled
+# with phones - identical to look at) silently enumerates high-speed and caps the
+# link at 31 MB/s; a real USB 3 cable gives super-speed and 275 MB/s. Check with:
+#     cat /sys/class/udc/*/current_speed     # want super-speed, not high-speed
+#
+# And do NOT rsync onto the SMB mount - it managed 4 MB/s on a 31 MB/s link.
+# Finder drag-and-drop, cp, scp, or rsync-over-ssh are all fine.
 set -euo pipefail
 
 G=/sys/kernel/config/usb_gadget/rock
