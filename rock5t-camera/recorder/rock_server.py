@@ -41,7 +41,11 @@ import threading
 import time
 
 PORT = 8080
-REC_DIR = os.path.expanduser("~/recordings")
+# under sudo, "~" is root's home - keep takes in the real user's home so the
+# usual scp/ls paths work
+_SUDO_USER = os.environ.get("SUDO_USER")
+_HOME = os.path.expanduser(f"~{_SUDO_USER}") if _SUDO_USER else os.path.expanduser("~")
+REC_DIR = os.path.join(_HOME, "recordings")
 PREV_JPG = {"0": "/dev/shm/rec_prev0.jpg", "1": "/dev/shm/rec_prev1.jpg"}
 CAMS = {
     "0": {"main": "/dev/video22", "self": "/dev/video23",
@@ -193,6 +197,34 @@ def start_recording():
                                               preexec_fn=os.setsid)
     _state["rec_name"] = name
     _state["rec_started"] = time.time()
+
+    # A pipeline that can't open its device (another server holding it, e.g.
+    # calib_server's grabbers) dies instantly and leaves a 0-byte file. Catch
+    # that here and report WHY, instead of listing empty takes.
+    time.sleep(2)
+    dead = []
+    for cam, p in _state["rec"].items():
+        if p.poll() is not None:
+            tail = ""
+            try:
+                with open(f"/tmp/rec_cam{cam}.log") as fh:
+                    lines = [ln for ln in fh.read().splitlines() if ln.strip()]
+                tail = " | ".join(lines[-3:])
+            except OSError:
+                pass
+            dead.append(f"cam{cam} pipeline died: {tail[:300]}")
+    if dead:
+        for cam, p in _state["rec"].items():
+            if p.poll() is None:
+                os.killpg(os.getpgid(p.pid), signal.SIGINT)
+        for f in glob.glob(os.path.join(REC_DIR, f"{name}_cam*.mkv")):
+            if os.path.getsize(f) == 0:
+                os.remove(f)
+        _state["rec"] = {}
+        _state["rec_name"] = None
+        _state["rec_started"] = None
+        return {"ok": False, "msg": "; ".join(dead)}
+
     return {"ok": True, "msg": f"recording {name}"}
 
 
