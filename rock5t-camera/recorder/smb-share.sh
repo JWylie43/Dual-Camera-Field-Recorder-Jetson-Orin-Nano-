@@ -51,10 +51,9 @@ if [ "$GUEST" = "1" ]; then
    server signing = no
    smb encrypt = off
    use sendfile = yes
-   aio read size = 1
-   aio write size = 1
-   min receivefile size = 16384
-   socket options = TCP_NODELAY IPTOS_LOWDELAY
+   # NOTE: do not add 'socket options' or aio/min-receivefile overrides here.
+   # Tried 2026-09-18 and throughput HALVED (63 -> 32 MB/s); modern samba
+   # picks better values than hand-tuning does.
 
 [recordings]
    comment = ROCK 5T stereo takes
@@ -91,10 +90,9 @@ else
    server signing = no
    smb encrypt = off
    use sendfile = yes
-   aio read size = 1
-   aio write size = 1
-   min receivefile size = 16384
-   socket options = TCP_NODELAY IPTOS_LOWDELAY
+   # NOTE: do not add 'socket options' or aio/min-receivefile overrides here.
+   # Tried 2026-09-18 and throughput HALVED (63 -> 32 MB/s); modern samba
+   # picks better values than hand-tuning does.
 
 [recordings]
    comment = ROCK 5T stereo takes
