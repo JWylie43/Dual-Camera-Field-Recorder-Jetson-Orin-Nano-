@@ -17,9 +17,10 @@ Wants=network-online.target rkaiq_3A.service
 
 [Service]
 Type=simple
-User=radxa
-Group=radxa
-SupplementaryGroups=video
+# runs as root so the panel can mount/unmount the offload drive itself -
+# no privileged helper script or sudoers rule to maintain. The panel has no
+# login and is reachable by anyone on the network it is attached to, so put a
+# password on the field hotspot (see ROCK5T_CAMERA.md).
 WorkingDirectory=/home/radxa/orin-recorder
 ExecStart=/usr/bin/python3 /home/radxa/orin-recorder/rock5t-camera/recorder/rock_server.py
 # the camera pipeline settles a few seconds after the sensors probe (~12s);

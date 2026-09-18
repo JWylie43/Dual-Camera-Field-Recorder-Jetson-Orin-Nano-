@@ -6,7 +6,7 @@ The Rock-side successor to the Orin's recorder/server.py, in the same visual
 language, stripped to what the field needs: two live previews, one record
 button, and a Manage Files page. Python stdlib only (no flask).
 
-    python3 rock_server.py          # http://<rock-ip>:8080
+    sudo python3 rock_server.py     # http://<rock-ip>:8080  (root: mounts USB)
     # or let systemd run it at boot: see rock-recorder.service
 
 No image-quality UI by design: exposure/colour live in the tuned IQ file
@@ -33,6 +33,7 @@ import glob
 import http.server
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -50,10 +51,11 @@ CAMS = {
     "1": {"main": "/dev/video31", "self": "/dev/video32"},
 }
 
-# under sudo/systemd, "~" may be root's home - keep takes where scp expects them
-_USER = os.environ.get("SUDO_USER") or os.environ.get("USER") or ""
-_HOME = os.path.expanduser(f"~{_USER}") if _USER not in ("", "root") else os.path.expanduser("~")
-REC_DIR = os.path.join(_HOME, "recordings")
+# This panel runs as ROOT (see rock-recorder.service) so it can mount USB
+# drives itself - no privileged helper script. Takes therefore go to an
+# explicit path, not "~", which would be /root under systemd.
+PANEL_USER = "radxa"
+REC_DIR = f"/home/{PANEL_USER}/recordings"
 
 _state = {
     "gst": {},                      # continuous preview procs (cam -> Popen)
@@ -81,7 +83,7 @@ def human(n):
 
 def storage_info():
     try:
-        st = os.statvfs(REC_DIR if os.path.isdir(REC_DIR) else _HOME)
+        st = os.statvfs(REC_DIR if os.path.isdir(REC_DIR) else f"/home/{PANEL_USER}")
     except OSError:
         return None
     total = st.f_blocks * st.f_frsize
@@ -93,7 +95,7 @@ def storage_info():
             "hours": round(hours, 1)}
 
 
-USB_HELPER = "/usr/local/sbin/rock-usb-mount"   # root-owned, see usb-mount.sh
+MNT = "/mnt/usb"
 
 
 def usb_candidates():
@@ -120,19 +122,38 @@ def usb_candidates():
 
 
 def mount_usb(dev):
-    if not os.path.exists(USB_HELPER):
-        return {"ok": False, "msg": f"{USB_HELPER} not installed - see usb-mount.sh header"}
-    r = sh(f"sudo -n {USB_HELPER} mount {dev}", timeout=45)
-    ok = r.returncode == 0
-    return {"ok": ok, "msg": (r.stdout or r.stderr).strip()[:300]}
+    """Mount a removable partition at /mnt/usb. We run as root, so this is a
+    direct call - but still refuse anything that is not a /dev/sdXN partition,
+    so a bad request can never be aimed at the NVMe system disk."""
+    if not re.fullmatch(r"/dev/sd[a-z][0-9]+", dev or ""):
+        return {"ok": False, "msg": f"refusing '{dev}': not a /dev/sdXN partition"}
+    if not os.path.exists(dev):
+        return {"ok": False, "msg": f"no such device: {dev}"}
+    os.makedirs(MNT, exist_ok=True)
+    if sh(f"mountpoint -q {MNT}").returncode == 0:
+        return {"ok": True, "msg": f"already mounted at {MNT}"}
+    fstype = sh(f"lsblk -no FSTYPE {dev}").stdout.strip().splitlines()[:1]
+    fstype = fstype[0] if fstype else ""
+    # vfat/exfat/ntfs carry no unix ownership: map them to the panel user so
+    # the takes are readable over ssh too
+    if fstype in ("exfat", "vfat", "ntfs", "ntfs3"):
+        uid = sh(f"id -u {PANEL_USER}").stdout.strip()
+        gid = sh(f"id -g {PANEL_USER}").stdout.strip()
+        opts = f"-o uid={uid},gid={gid},noatime"
+    else:
+        opts = "-o noatime"
+    r = sh(f"mount {opts} {dev} {MNT}", timeout=45)
+    if r.returncode != 0:
+        return {"ok": False, "msg": (r.stderr or "mount failed").strip()[:300]}
+    return {"ok": True, "msg": f"mounted {dev} ({fstype or 'auto'}) -> {MNT}"}
 
 
 def umount_usb():
-    if not os.path.exists(USB_HELPER):
-        return {"ok": False, "msg": f"{USB_HELPER} not installed"}
-    r = sh(f"sudo -n {USB_HELPER} umount", timeout=60)
-    ok = r.returncode == 0
-    return {"ok": ok, "msg": (r.stdout or r.stderr).strip()[:300]}
+    sh("sync", timeout=60)
+    r = sh(f"umount {MNT}", timeout=60)
+    if r.returncode != 0:
+        return {"ok": False, "msg": (r.stderr or "unmount failed - drive in use?").strip()[:300]}
+    return {"ok": True, "msg": "unmounted - safe to unplug"}
 
 
 def usb_targets():
@@ -259,8 +280,17 @@ def stop_recording():
     _state["rec"] = {}
     _state["rec_name"] = None
     _state["rec_started"] = None
-    sizes = [f"{os.path.basename(f)} {human(os.path.getsize(f))}"
-             for f in sorted(glob.glob(os.path.join(REC_DIR, f"{name}_cam*.mkv")))]
+    files = sorted(glob.glob(os.path.join(REC_DIR, f"{name}_cam*.mkv")))
+    # created by a root process: give them to the panel user so ssh/scp and
+    # manual cleanup do not need sudo
+    try:
+        uid = int(sh(f"id -u {PANEL_USER}").stdout.strip())
+        gid = int(sh(f"id -g {PANEL_USER}").stdout.strip())
+        for f in files:
+            os.chown(f, uid, gid)
+    except (ValueError, OSError):
+        pass
+    sizes = [f"{os.path.basename(f)} {human(os.path.getsize(f))}" for f in files]
     return {"ok": True, "msg": "saved " + ", ".join(sizes) + ("; " + "; ".join(warn) if warn else "")}
 
 
