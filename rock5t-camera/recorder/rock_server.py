@@ -93,6 +93,48 @@ def storage_info():
             "hours": round(hours, 1)}
 
 
+USB_HELPER = "/usr/local/sbin/rock-usb-mount"   # root-owned, see usb-mount.sh
+
+
+def usb_candidates():
+    """Unmounted removable partitions we could mount (nothing hardcoded)."""
+    out = []
+    r = sh("lsblk -J -o PATH,SIZE,FSTYPE,LABEL,MOUNTPOINT,TRAN,HOTPLUG,TYPE")
+    try:
+        tree = json.loads(r.stdout or "{}").get("blockdevices", [])
+    except json.JSONDecodeError:
+        return out
+
+    def walk(nodes, removable=False):
+        for n in nodes:
+            rem = removable or n.get("tran") == "usb" or n.get("hotplug") in (True, "1")
+            if (n.get("type") == "part" and rem and not n.get("mountpoint")
+                    and n.get("fstype")):
+                out.append({"dev": n.get("path"), "size": n.get("size"),
+                            "fstype": n.get("fstype"),
+                            "label": n.get("label") or os.path.basename(n.get("path", ""))})
+            walk(n.get("children") or [], rem)
+
+    walk(tree)
+    return out
+
+
+def mount_usb(dev):
+    if not os.path.exists(USB_HELPER):
+        return {"ok": False, "msg": f"{USB_HELPER} not installed - see usb-mount.sh header"}
+    r = sh(f"sudo -n {USB_HELPER} mount {dev}", timeout=45)
+    ok = r.returncode == 0
+    return {"ok": ok, "msg": (r.stdout or r.stderr).strip()[:300]}
+
+
+def umount_usb():
+    if not os.path.exists(USB_HELPER):
+        return {"ok": False, "msg": f"{USB_HELPER} not installed"}
+    r = sh(f"sudo -n {USB_HELPER} umount", timeout=60)
+    ok = r.returncode == 0
+    return {"ok": ok, "msg": (r.stdout or r.stderr).strip()[:300]}
+
+
 def usb_targets():
     """Mounted removable drives we could offload to (auto-detected, no config)."""
     out = []
@@ -455,9 +497,17 @@ async function load(){
   recording = s.recording; usbPath = s.usb.length ? s.usb[0].path : '';
   $('recbanner').style.display = recording ? 'block' : 'none';
   $('storage').innerHTML = storageHtml(s.storage);
-  $('usb').innerHTML = s.usb.length
-    ? '&#128189; USB: <b>'+esc(s.usb[0].name)+'</b> ('+s.usb[0].free+' free) &rarr; copies land in <i>rock-recordings/</i>'
-    : 'No USB drive mounted &mdash; plug one in and hit Refresh to enable copying.';
+  if(s.usb.length){
+    $('usb').innerHTML = '&#128189; USB: <b>'+esc(s.usb[0].name)+'</b> ('+s.usb[0].free
+      +' free) &rarr; copies land in <i>rock-recordings/</i> '
+      +'<button class="fbtn ghost" onclick="eject()">&#9167; Eject</button>';
+  } else if(s.usb_avail.length){
+    $('usb').innerHTML = s.usb_avail.map(d =>
+      '&#128189; <b>'+esc(d.label)+'</b> '+esc(d.size)+' '+esc(d.fstype)+' ('+esc(d.dev)+') '
+      +'<button class="fbtn go" onclick="mount(\\''+esc(d.dev)+'\\')">&#9660; Mount</button>').join('<br>');
+  } else {
+    $('usb').innerHTML = 'No USB drive detected &mdash; plug one in and hit Refresh.';
+  }
   $('btnxfer').disabled = recording || !s.usb.length;
   $('rows').innerHTML = s.takes.map(f =>
     '<tr><td><input type="checkbox" class="pick" value="'+esc(f.name)+'" onchange="sel()"></td>'
@@ -472,6 +522,16 @@ async function load(){
   $('xferbar').style.width = x.pct + '%';
   $('xferfile').textContent = x.error ? ('ERROR: ' + x.error) : x.file;
   if(x.active) setTimeout(load, 1000);
+}
+async function mount(dev){
+  $('note').textContent = 'mounting '+dev+'\\u2026';
+  const r = await (await fetch('/api/mount?dev='+encodeURIComponent(dev))).json();
+  $('note').textContent = r.msg || ''; load();
+}
+async function eject(){
+  $('note').textContent = 'flushing and unmounting\\u2026';
+  const r = await (await fetch('/api/umount')).json();
+  $('note').textContent = r.msg || ''; load();
 }
 async function xfer(){
   const names = selected(); if(!names.length) return alert('select some takes first');
@@ -532,8 +592,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json(stop_recording())
         elif path == "/api/files":
             self._json({"takes": list_takes(), "storage": storage_info(),
-                        "usb": usb_targets(), "recording": bool(_state["rec"]),
-                        "xfer": _xfer})
+                        "usb": usb_targets(), "usb_avail": usb_candidates(),
+                        "recording": bool(_state["rec"]), "xfer": _xfer})
+        elif path == "/api/mount":
+            self._json(mount_usb(q.get("dev", "")))
+        elif path == "/api/umount":
+            self._json(umount_usb())
         elif path == "/api/transfer":
             names = [n for n in q.get("names", "").split("|") if n]
             self._json(start_transfer(names, q.get("dest", "")))
