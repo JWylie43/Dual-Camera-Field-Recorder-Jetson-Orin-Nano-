@@ -1,0 +1,33 @@
+{
+  "PLACEHOLDER": true,
+  "note": "design values, NOT a calibration - assumes perfect mounting. Replace by running calibrate.py on the housed rig.",
+  "rotation_matrix": [
+    [
+      0.27563735581699916,
+      0.0,
+      -0.9612616959383189
+    ],
+    [
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.9612616959383189,
+      0.0,
+      0.27563735581699916
+    ]
+  ],
+  "translation_mm": [
+    -60.0,
+    0.0,
+    0.0
+  ],
+  "baseline_mm": 60.0,
+  "toe_in_angle_deg": 74.0,
+  "rotation_euler_deg": {
+    "pitch_x": 0.0,
+    "yaw_toe_y": -74.0,
+    "roll_z": 0.0
+  }
+}

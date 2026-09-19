@@ -140,11 +140,21 @@ static vector<int> g_partPct, g_partDone, g_partTotal;
 // and console) so you can reproduce a tuned render manually.
 static string g_cmd;
 
-static void loadIntrinsics(const string &path, Mat &K, vector<double> &D)
+// Which projection the calibration describes. The Orin rig's lenses were mild
+// enough for the pinhole+polynomial model; the ROCK rig's CIL391 (110 deg,
+// -16% barrel) is a fisheye and only fits the equidistant model - the polynomial
+// fit leaves a uniform ~2.6px residual. calibrate.py writes "model":"fisheye"
+// for those, and every projection below branches on it.
+static bool g_fisheyeL = false, g_fisheyeR = false;
+
+static void loadIntrinsics(const string &path, Mat &K, vector<double> &D,
+                           bool *isFisheye = nullptr)
 {
     ifstream f(path);
     if (!f.is_open()) { cerr << "Cannot open " << path << endl; exit(1); }
     json j; f >> j;
+    if (isFisheye)
+        *isFisheye = (j.contains("model") && j["model"].get<string>() == "fisheye");
     K = Mat::eye(3, 3, CV_64F);
     for (int r = 0; r < 3; r++)
         for (int c = 0; c < 3; c++)
@@ -166,6 +176,23 @@ static Mat loadRotation(const string &path)
     return R;
 }
 
+// Equidistant (Kannala-Brandt) projection: radius grows with the ANGLE, not its
+// tangent, which is what a fisheye lens actually does. Mirrors cv::fisheye.
+static inline void applyFisheye(double x, double y, const vector<double> &D,
+                                double &xd, double &yd)
+{
+    double k1 = D.size() > 0 ? D[0] : 0, k2 = D.size() > 1 ? D[1] : 0;
+    double k3 = D.size() > 2 ? D[2] : 0, k4 = D.size() > 3 ? D[3] : 0;
+    double r = sqrt(x * x + y * y);
+    if (r < 1e-12) { xd = x; yd = y; return; }
+    double th = atan(r);
+    double t2 = th * th;
+    double thd = th * (1 + k1 * t2 + k2 * t2 * t2 + k3 * t2 * t2 * t2 + k4 * t2 * t2 * t2 * t2);
+    double scale = thd / r;
+    xd = x * scale;
+    yd = y * scale;
+}
+
 static inline void applyDistortion(double x, double y, const vector<double> &D,
                                    double &xd, double &yd)
 {
@@ -182,7 +209,8 @@ static inline void applyDistortion(double x, double y, const vector<double> &D,
 
 static void buildCylMap(const Mat &K, const vector<double> &D, const Mat &R_cam_from_left,
                         const vector<double> &theta, const vector<double> &hval,
-                        int w, int h, Mat &mapx, Mat &mapy, Mat &valid)
+                        int w, int h, Mat &mapx, Mat &mapy, Mat &valid,
+                        bool fisheye = false)
 {
     int OW = (int)theta.size(), OH = (int)hval.size();
     mapx.create(OH, OW, CV_32F);
@@ -210,7 +238,8 @@ static void buildCylMap(const Mat &K, const vector<double> &D, const Mat &R_cam_
             double czr = r20 * dx + r21 * dy + r22 * dz;
             if (czr <= 1e-6) { mx[xx] = my[xx] = -1.f; continue; }
             double xn = cxr / czr, yn = cyr / czr, xd, yd;
-            applyDistortion(xn, yn, D, xd, yd);
+            if (fisheye) applyFisheye(xn, yn, D, xd, yd);
+            else         applyDistortion(xn, yn, D, xd, yd);
             double u = fx * xd + cx, v = fy * yd + cy;
             if (u >= 0 && u < w && v >= 0 && v < h)
             { mx[xx] = (float)u; my[xx] = (float)v; vv[xx] = 1; }
@@ -225,13 +254,17 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
 {
     StitchMaps m;
     double fcyl = KL.at<double>(0, 0);
-    double halfL = atan(w / (2 * KL.at<double>(0, 0)));
-    double halfR = atan(w / (2 * KR.at<double>(0, 0)));
+    // half-FOV differs by model: pinhole atan(x/f) vs equidistant x/f
+    double halfL = g_fisheyeL ? (w / (2 * KL.at<double>(0, 0)))
+                              : atan(w / (2 * KL.at<double>(0, 0)));
+    double halfR = g_fisheyeR ? (w / (2 * KR.at<double>(0, 0)))
+                              : atan(w / (2 * KR.at<double>(0, 0)));
     double yawR = atan2(R.at<double>(2, 0), R.at<double>(2, 2));
     double pad = 3.0 * CV_PI / 180.0;
     double thetaMin = min(-halfL, yawR - halfR) - pad;
     double thetaMax = max(halfL, yawR + halfR) + pad;
-    double vhalf = atan(h / (2 * KL.at<double>(1, 1)));
+    double vhalf = g_fisheyeL ? (h / (2 * KL.at<double>(1, 1)))
+                              : atan(h / (2 * KL.at<double>(1, 1)));
     m.OW = min((int)((thetaMax - thetaMin) * fcyl), 12000);
     m.OH = min((int)(2 * tan(vhalf) * fcyl), 4000);
     vector<double> theta(m.OW), hval(m.OH);
@@ -239,8 +272,9 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
     for (int i = 0; i < m.OH; i++) hval[i] = (i - m.OH / 2.0) / fcyl;
 
     Mat mapLx, mapLy, mapRx, mapRy, okL, okR;
-    buildCylMap(KL, DL, Mat::eye(3, 3, CV_64F), theta, hval, w, h, mapLx, mapLy, okL);
-    buildCylMap(KR, DR, R, theta, hval, w, h, mapRx, mapRy, okR);
+    buildCylMap(KL, DL, Mat::eye(3, 3, CV_64F), theta, hval, w, h, mapLx, mapLy, okL,
+                g_fisheyeL);
+    buildCylMap(KR, DR, R, theta, hval, w, h, mapRx, mapRy, okR, g_fisheyeR);
 
     vector<int> overlapCols;
     for (int x = 0; x < m.OW; x++)
@@ -488,7 +522,131 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
 // like a remuxed MKV) and only falls back to sequential grab for un-indexed files.
 // This is what makes --jobs actually parallel: each child jumps straight to its chunk
 // instead of grab-skipping from frame 0. Un-indexed input -> slow grab (remux to fix).
-static bool seekFrame(VideoCapture &cap, int n)
+
+// ---------------------------------------------------------------- dual input
+// The ROCK rig records TWO independent files (one per camera) instead of the
+// Orin's single side-by-side frame. PairCapture opens both and hands the rest
+// of this program exactly what it already expects: one frame with LEFT|RIGHT
+// concatenated. Nothing downstream (warpHalves, maps, composite) changes.
+//
+// Pairing is driven by the FILENAME so that --jobs children and the tuner
+// inherit it with no extra plumbing:
+//     --source take_..._cam0.mkv   ->  also opens take_..._cam1.mkv
+//     --source "left.mkv::right.mkv"  (explicit, any names)
+// A single path that matches neither stays single-file (the Orin's format).
+//
+// g_pairOffset shifts one stream against the other: >0 skips N frames of the
+// RIGHT file, <0 skips N of the LEFT. With genlock the correct value is a small
+// constant (the two gst pipelines start a few ms apart); free-running cameras
+// drift and no constant is exactly right. tools/pair_check.py estimates it.
+static int g_pairOffset = 0;
+
+static bool resolvePairPaths(const string &src, string &L, string &R)
+{
+    size_t d = src.find("::");
+    if (d != string::npos) { L = src.substr(0, d); R = src.substr(d + 2); return true; }
+    size_t c = src.rfind("_cam0.");
+    if (c != string::npos)
+    {
+        L = src;
+        R = src.substr(0, c) + "_cam1." + src.substr(c + 6);
+        if (std::filesystem::exists(R)) return true;
+    }
+    L = src; R.clear();
+    return false;
+}
+
+class PairCapture
+{
+public:
+    PairCapture() = default;
+    explicit PairCapture(const string &src) { open(src); }
+
+    bool open(const string &src)
+    {
+        release();
+        string L, R;
+        paired_ = resolvePairPaths(src, L, R);
+        if (!a_.open(L)) return false;
+        if (paired_ && !b_.open(R)) { a_.release(); paired_ = false; return false; }
+        if (paired_)
+        {
+            // apply the constant offset once, at open, by pre-skipping frames
+            int skipB = g_pairOffset > 0 ? g_pairOffset : 0;
+            int skipA = g_pairOffset < 0 ? -g_pairOffset : 0;
+            for (int i = 0; i < skipA; i++) a_.grab();
+            for (int i = 0; i < skipB; i++) b_.grab();
+            cout << "  paired input: " << std::filesystem::path(L).filename().string()
+                 << " + " << std::filesystem::path(R).filename().string();
+            if (g_pairOffset) cout << "  (offset " << g_pairOffset << " frames)";
+            cout << "\n";
+        }
+        return true;
+    }
+
+    bool isOpened() const { return a_.isOpened() && (!paired_ || b_.isOpened()); }
+    void release() { a_.release(); b_.release(); paired_ = false; }
+
+    double get(int prop) const
+    {
+        double va = const_cast<VideoCapture &>(a_).get(prop);
+        if (!paired_) return va;
+        double vb = const_cast<VideoCapture &>(b_).get(prop);
+        // the pair is only as long as its shorter half
+        if (prop == CAP_PROP_FRAME_COUNT) return min(va, vb);
+        return va;
+    }
+
+    bool set(int prop, double v)
+    {
+        bool ok = a_.set(prop, v);
+        if (paired_)
+        {
+            // keep the streams' relative offset when seeking
+            double vb = v;
+            if (prop == CAP_PROP_POS_FRAMES) vb = v + g_pairOffset;
+            ok = b_.set(prop, vb) && ok;
+        }
+        return ok;
+    }
+
+    bool grab() { bool ok = a_.grab(); if (paired_) ok = b_.grab() && ok; return ok; }
+
+    // retrieve() pairs with grab() for scrubbing: decode whatever grab() staged
+    bool retrieve(Mat &out)
+    {
+        if (!paired_) return a_.retrieve(out);
+        Mat fa, fb;
+        if (!a_.retrieve(fa) || fa.empty()) return false;
+        if (!b_.retrieve(fb) || fb.empty()) return false;
+        if (fa.rows != fb.rows || fa.type() != fb.type()) return false;
+        hconcat(fa, fb, out);
+        return true;
+    }
+
+    bool read(Mat &out)
+    {
+        if (!paired_) return a_.read(out);
+        Mat fa, fb;
+        if (!a_.read(fa) || fa.empty()) return false;
+        if (!b_.read(fb) || fb.empty()) return false;
+        if (fa.rows != fb.rows || fa.type() != fb.type())
+        {
+            cerr << "pair mismatch: " << fa.cols << "x" << fa.rows
+                 << " vs " << fb.cols << "x" << fb.rows << " - cannot concatenate\n";
+            return false;
+        }
+        hconcat(fa, fb, out);
+        return true;
+    }
+
+private:
+    VideoCapture a_, b_;
+    bool paired_ = false;
+};
+
+template <class Cap>
+static bool seekFrame(Cap &cap, int n)
 {
     if (n <= 0) return true;
     cap.set(CAP_PROP_POS_FRAMES, (double)n);          // attempt indexed seek
@@ -582,7 +740,7 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
                               const string &outDir, const string &outFile = "",
                               std::atomic<int> *prog = nullptr, const string &progFile = "")
 {
-    VideoCapture cap(source);
+    PairCapture cap(source);
     if (!cap.isOpened()) return "ERROR: cannot open video";
     double fps = cap.get(CAP_PROP_FPS);
     if (fps <= 0) fps = 30.0;
@@ -1072,6 +1230,7 @@ static string buildCliCommand(const string &source, const string &calibDir,
     auto q = [](const string &s) { return "\"" + s + "\""; };
     string exe = exePath(); if (exe.empty()) exe = "StitchPipeline";
     string c = q(exe) + " --source " + q(source);
+    if (g_pairOffset) c += " --pair-offset " + to_string(g_pairOffset);
     if (!calibDir.empty())    c += " --calib-dir " + q(calibDir);
     if (degrees != 0.0)       c += " --degrees " + to_string(degrees);
     if (seamArg >= 0)         c += " --seam " + to_string(seamArg);
@@ -1115,7 +1274,7 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
     int totalFrames = 1;
     StitchMaps m;
     string curLeft, curRight;            // first-frame preview (data: URIs)
-    VideoCapture frameCap;               // persistent for /frame scrubbing
+    PairCapture frameCap;                // persistent for /frame scrubbing
     int frameCapPos = -1;
 
     // Open a file: build the stitch maps and the first-frame preview. Returns
@@ -1126,7 +1285,7 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
         if (!isVid) { frame = imread(path); }
         else
         {
-            VideoCapture cap(path);
+            PairCapture cap(path);
             if (!cap.isOpened()) return "cannot open video";
             tf = (int)cap.get(CAP_PROP_FRAME_COUNT);
             if (tf < 1 || tf > 100000000) { double fps = cap.get(CAP_PROP_FPS); tf = probeFrames(path, fps > 0 ? fps : 30.0); }
@@ -1439,10 +1598,16 @@ static string exePath()
 #endif
 }
 
+// A directory counts as a calibration if it holds either naming scheme:
+// cam0/cam1 (ROCK rig) or left/right (Orin rig). Without the cam0 test an
+// explicit --calib-dir pointing at a ROCK calibration was silently REJECTED and
+// the search walked up to the old rig's folder - producing a plausible-looking
+// panorama built from the wrong camera model. Found 2026-09-19.
 static bool hasCalib(const fs::path &dir)
 {
     std::error_code ec;
-    return fs::exists(dir / "left_intrinsics.json", ec);
+    return fs::exists(dir / "left_intrinsics.json", ec)
+        || fs::exists(dir / "cam0_intrinsics.json", ec);
 }
 
 // Resolve the calibration directory. Priority:
@@ -1736,6 +1901,7 @@ static int runParallelJobs(const string &source, const string &calibDir,
             + " --shift-y " + to_string(a.shiftY) + " --bands " + to_string(a.bands)
             + (a.exposure ? "" : " --no-exposure") + (a.smartSeam ? "" : " --no-smart-seam")
             + (cropArg.empty() ? "" : " --crop " + q(cropArg))
+            + (g_pairOffset ? " --pair-offset " + to_string(g_pairOffset) : "")
             + " --jobs 1 --start " + to_string(s) + " --end " + to_string(e)
             + " --venc " + q(resolvedEnc) + " --bitrate " + q(g_vbitrate)
             + " --progress-file " + q(prg)
@@ -1849,6 +2015,7 @@ int main(int argc, char **argv)
     int jobs = stoi(argVal(argc, argv, "--jobs", "4"));    // parallel child processes (video); default 4
     if (hasArg(argc, argv, "--no-jobs")) jobs = 1;         // force everything into this one process
     string cropArg = argVal(argc, argv, "--crop", "");     // read early; child processes need it too
+    g_pairOffset = stoi(argVal(argc, argv, "--pair-offset", "0"));
     string progFile = argVal(argc, argv, "--progress-file", "");  // a child writes its progress here (parallel)
 
     // Video-encoder selection (globals consumed by chooseVideoEncoder / stitchVideoFile).
@@ -1877,8 +2044,15 @@ int main(int argc, char **argv)
     cout << "Calibration: " << calibDir << "\n";
     Mat KL, KR, R;
     vector<double> DL, DR;
-    loadIntrinsics(calibDir + "/left_intrinsics.json", KL, DL);
-    loadIntrinsics(calibDir + "/right_intrinsics.json", KR, DR);
+    // the ROCK rig names its files cam0/cam1; the Orin rig used left/right
+    auto pick = [&](const string &a, const string &b) {
+        return std::filesystem::exists(calibDir + "/" + a) ? calibDir + "/" + a
+                                                           : calibDir + "/" + b;
+    };
+    loadIntrinsics(pick("cam0_intrinsics.json", "left_intrinsics.json"), KL, DL, &g_fisheyeL);
+    loadIntrinsics(pick("cam1_intrinsics.json", "right_intrinsics.json"), KR, DR, &g_fisheyeR);
+    if (g_fisheyeL || g_fisheyeR)
+        cout << "calibration model: fisheye (equidistant)\n";
     R = loadRotation(calibDir + "/stereo_extrinsics.json");
 
     // Interactive tuner — the default when no --source is given, and whenever
@@ -1897,7 +2071,7 @@ int main(int argc, char **argv)
     if (!video) frame = imread(source);
     else
     {
-        VideoCapture cap(source);
+        PairCapture cap(source);
         if (cap.isOpened())
         {
             totalFrames = (int)cap.get(CAP_PROP_FRAME_COUNT);
