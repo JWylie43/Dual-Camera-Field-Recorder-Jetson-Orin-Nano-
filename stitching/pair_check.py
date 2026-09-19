@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-pair_check.py - verify a Veery take's two camera files before stitching, and
-work out the frame offset between them.
+pair_check.py - verify a Veery take's two camera files before stitching.
+
+The stitcher now estimates the frame offset itself (--pair-offset defaults to
+"auto"), so this script is for the HEALTH checks: frame counts, timing gaps and
+dropped/duplicated frames. Run it when a take looks wrong, not every time.
 
     python3 pair_check.py take_20260918_181903_cam0.mkv
     python3 pair_check.py left.mkv right.mkv --seconds 120
@@ -166,8 +169,9 @@ def main():
         print("    confident.")
 
     print(f"\n== stitch with ==")
-    flag = f" --pair-offset {shift}" if shift else ""
-    print(f"  ./build/StitchPipeline --source \"{left}\"{flag} --calib-dir ../calibration\n")
+    print(f"  ./build/StitchPipeline --source \"{left}\" --tune")
+    print("  (the stitcher estimates this same offset itself - --pair-offset defaults to")
+    print(f"   'auto'. Pass --pair-offset {shift} only to pin it, or 0 to disable.)\n")
 
 
 if __name__ == "__main__":

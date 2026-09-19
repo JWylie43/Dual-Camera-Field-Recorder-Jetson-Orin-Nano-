@@ -29,6 +29,25 @@
 //              OpenCL context and the GPU scheduler overlaps them - the way to actually
 //              fill the GPU. Tune N to your GPU's saturation knee (watch GPU% + VRAM).
 //   --no-jobs  (or --jobs 1) run everything in this one process - no parallelism.
+//
+// Two-file takes (the Veery/ROCK recorder writes one file per camera):
+//   --source take_..._cam0.mkv   finds _cam1 automatically and pairs them in memory.
+//   --pair-offset auto  (DEFAULT) estimates the frame offset between the two files by
+//              cross-correlating per-frame brightness over the first seconds - the same
+//              method as pair_check.py, so no separate step is needed. Prints the
+//              offset, its correlation and its margin. --pair-offset N pins a value
+//              (0 disables). While the cameras FREE-RUN no single offset is right for a
+//              whole take (they drift apart); with XVS genlock it is a true constant.
+//
+// Output size:
+//   The panorama size is DERIVED from the calibration, not configured: the cylinder's
+//   radius in pixels equals the left camera's focal length, so the centre of frame is
+//   sampled about 1:1. That is why the numbers look arbitrary (868px focal -> 2660 wide;
+//   2104px focal -> 6774 wide).
+//   --scale F  renders the cylinder at F times that radius: SAME field of view, fewer
+//              pixels - it lowers pixel density, it does not crop (that is --crop).
+//              Implemented by shrinking the radius before the maps are built, so the
+//              frame is rendered once at the smaller size rather than downscaled after.
 //   Requires ffmpeg on PATH for the concat. Images and --tune always run single-process.
 //
 // Warp device: the stitching/warp always runs on the CPU (the OpenCL/GPU warp was
@@ -49,6 +68,7 @@
 #include <cmath>
 #include <string>
 #include <sstream>
+#include <iomanip>
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
@@ -248,12 +268,16 @@ static void buildCylMap(const Mat &K, const vector<double> &D, const Mat &R_cam_
     }
 }
 
+// --scale renders the cylinder at a lower angular resolution (smaller radius)
+// rather than downscaling a full-size render: same field of view, fewer pixels.
+static double g_scale = 1.0;
+
 static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
                                   const Mat &KR, const vector<double> &DR,
                                   const Mat &R, int w, int h, int seamArg)
 {
     StitchMaps m;
-    double fcyl = KL.at<double>(0, 0);
+    double fcyl = KL.at<double>(0, 0) * g_scale;
     // half-FOV differs by model: pinhole atan(x/f) vs equidistant x/f
     double halfL = g_fisheyeL ? (w / (2 * KL.at<double>(0, 0)))
                               : atan(w / (2 * KL.at<double>(0, 0)));
@@ -295,7 +319,19 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
 
     cout << "panorama " << m.OW << "x" << m.OH
          << ", right yaw " << yawR * 180.0 / CV_PI << " deg, hard seam @ " << m.seam
-         << (overlapCols.empty() ? "  [!! no overlap]" : "") << "\n";
+         << (overlapCols.empty() ? "  [!! no overlap]" : "")
+         << (g_scale != 1.0 ? "  (--scale " + to_string(g_scale).substr(0, 4) + ")" : "")
+         << "\n";
+    // The size above is DERIVED, not chosen: the cylinder's radius in pixels is the
+    // left camera's focal length, so the pano samples the source ~1:1 at frame centre.
+    // Past 4096 wide, hardware H.264 is out and we fall back to HEVC - which most
+    // browsers and YouTube uploads would rather not have.
+    if (m.OW > 4096 && g_scale == 1.0)
+        cout << "  note: > 4096 wide, so this encodes as HEVC. --scale "
+             << std::fixed << std::setprecision(2) << (4096.0 / m.OW)
+             << std::defaultfloat << " keeps the full field of view at "
+             << (int)(m.OW * (4096.0 / m.OW)) << "x" << (int)(m.OH * (4096.0 / m.OW))
+             << " and re-enables H.264.\n";
     return m;
 }
 
@@ -540,6 +576,8 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
 // constant (the two gst pipelines start a few ms apart); free-running cameras
 // drift and no constant is exactly right. tools/pair_check.py estimates it.
 static int g_pairOffset = 0;
+static bool g_pairAuto = true;    // --pair-offset N disables; "auto" forces
+static bool g_pairResolved = false;
 
 static bool resolvePairPaths(const string &src, string &L, string &R)
 {
@@ -556,6 +594,84 @@ static bool resolvePairPaths(const string &src, string &L, string &R)
     return false;
 }
 
+
+// Estimate the frame offset between the two camera files by cross-correlating
+// per-frame mean brightness. Runs once per process, on the first few seconds.
+//
+// Why brightness: it is the cheapest signal that both cameras share. Anything
+// that changes the light (clouds, someone crossing, a pan) moves both series
+// together, and the shift that lines them up is the frame offset.
+//
+// Caveat worth keeping in mind: while the cameras FREE-RUN this converges on
+// whatever fits the analysed window, but the true offset drifts across a take,
+// so no single number stays right. With XVS genlock the offset is a genuine
+// constant and this is exact.
+static int estimatePairOffset(const string &lp, const string &rp,
+                              int maxShift = 15, double seconds = 5.0)
+{
+    VideoCapture ca(lp), cb(rp);
+    if (!ca.isOpened() || !cb.isOpened()) return 0;
+    double fps = ca.get(CAP_PROP_FPS); if (fps <= 0) fps = 30.0;
+    int want = (int)(seconds * fps) + 2 * maxShift;
+
+    auto series = [&](VideoCapture &c) {
+        vector<double> v; Mat f, g;
+        for (int i = 0; i < want; i++)
+        {
+            if (!c.read(f) || f.empty()) break;
+            resize(f, g, Size(32, 18), 0, 0, INTER_AREA);
+            cvtColor(g, g, COLOR_BGR2GRAY);
+            v.push_back(mean(g)[0]);
+        }
+        return v;
+    };
+    vector<double> A = series(ca), B = series(cb);
+    ca.release(); cb.release();
+    size_t n = min(A.size(), B.size());
+    if (n < 30) return 0;
+
+    vector<double> xs, ys;
+    auto score = [&](int sh) {
+        xs.clear(); ys.clear();
+        for (size_t i = 0; i < n; i++)
+        {
+            long ia = (long)i + (sh > 0 ? sh : 0);
+            long ib = (long)i + (sh < 0 ? -sh : 0);
+            if (ia >= (long)A.size() || ib >= (long)B.size()) break;
+            xs.push_back(A[ia]); ys.push_back(B[ib]);
+        }
+        if (xs.size() < 20) return -2.0;
+        double mx = 0, my = 0;
+        for (size_t i = 0; i < xs.size(); i++) { mx += xs[i]; my += ys[i]; }
+        mx /= xs.size(); my /= ys.size();
+        double num = 0, dxx = 0, dyy = 0;
+        for (size_t i = 0; i < xs.size(); i++)
+        {
+            double dx = xs[i] - mx, dy = ys[i] - my;
+            num += dx * dy; dxx += dx * dx; dyy += dy * dy;
+        }
+        double den = sqrt(dxx * dyy);
+        return den > 0 ? num / den : -2.0;
+    };
+
+    int best = 0; double bestScore = -2.0, runnerUp = -2.0;
+    for (int sh = -maxShift; sh <= maxShift; sh++)
+    {
+        double v = score(sh);
+        if (v > bestScore) { bestScore = v; best = sh; }
+    }
+    for (int sh = -maxShift; sh <= maxShift; sh++)
+        if (abs(sh - best) > 1) runnerUp = max(runnerUp, score(sh));
+
+    cout << "  auto pair-offset: " << best << " frames (correlation "
+         << std::fixed << std::setprecision(3) << bestScore
+         << ", margin " << (bestScore - runnerUp) << ")";
+    if (bestScore < 0.5) cout << "  [weak - cameras free-running?]";
+    else if (bestScore - runnerUp < 0.05) cout << "  [ambiguous]";
+    cout << std::defaultfloat << "\n";
+    return best;
+}
+
 class PairCapture
 {
 public:
@@ -569,6 +685,11 @@ public:
         paired_ = resolvePairPaths(src, L, R);
         if (!a_.open(L)) return false;
         if (paired_ && !b_.open(R)) { a_.release(); paired_ = false; return false; }
+        if (paired_ && g_pairAuto && !g_pairResolved)
+        {
+            g_pairOffset = estimatePairOffset(L, R);
+            g_pairResolved = true;
+        }
         if (paired_)
         {
             // apply the constant offset once, at open, by pre-skipping frames
@@ -1245,7 +1366,8 @@ static string buildCliCommand(const string &source, const string &calibDir,
     auto q = [](const string &s) { return "\"" + s + "\""; };
     string exe = exePath(); if (exe.empty()) exe = "StitchPipeline";
     string c = q(exe) + " --source " + q(source);
-    if (g_pairOffset) c += " --pair-offset " + to_string(g_pairOffset);
+    c += " --pair-offset " + to_string(g_pairOffset);   // resolved value, not "auto"
+    if (g_scale != 1.0) c += " --scale " + to_string(g_scale);
     if (!calibDir.empty())    c += " --calib-dir " + q(calibDir);
     if (degrees != 0.0)       c += " --degrees " + to_string(degrees);
     if (seamArg >= 0)         c += " --seam " + to_string(seamArg);
@@ -1921,7 +2043,8 @@ static int runParallelJobs(const string &source, const string &calibDir,
             + " --shift-y " + to_string(a.shiftY) + " --bands " + to_string(a.bands)
             + (a.exposure ? "" : " --no-exposure") + (a.smartSeam ? "" : " --no-smart-seam")
             + (cropArg.empty() ? "" : " --crop " + q(cropArg))
-            + (g_pairOffset ? " --pair-offset " + to_string(g_pairOffset) : "")
+            + " --pair-offset " + to_string(g_pairOffset)
+            + (g_scale != 1.0 ? " --scale " + to_string(g_scale) : "")
             + " --jobs 1 --start " + to_string(s) + " --end " + to_string(e)
             + " --venc " + q(resolvedEnc) + " --bitrate " + q(g_vbitrate)
             + " --progress-file " + q(prg)
@@ -2035,7 +2158,12 @@ int main(int argc, char **argv)
     int jobs = stoi(argVal(argc, argv, "--jobs", "4"));    // parallel child processes (video); default 4
     if (hasArg(argc, argv, "--no-jobs")) jobs = 1;         // force everything into this one process
     string cropArg = argVal(argc, argv, "--crop", "");     // read early; child processes need it too
-    g_pairOffset = stoi(argVal(argc, argv, "--pair-offset", "0"));
+    {   // --pair-offset N pins the offset; "auto" (the default) estimates it
+        string po = argVal(argc, argv, "--pair-offset", "auto");
+        if (po != "auto") { g_pairOffset = stoi(po); g_pairAuto = false; g_pairResolved = true; }
+    }
+    g_scale = stod(argVal(argc, argv, "--scale", "1.0"));
+    if (g_scale <= 0.05 || g_scale > 1.0) { cerr << "--scale must be in (0.05, 1]\n"; return 1; }
     string progFile = argVal(argc, argv, "--progress-file", "");  // a child writes its progress here (parallel)
 
     // Video-encoder selection (globals consumed by chooseVideoEncoder / stitchVideoFile).
