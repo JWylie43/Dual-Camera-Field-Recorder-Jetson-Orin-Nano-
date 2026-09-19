@@ -470,14 +470,31 @@ $('start').onclick = async () => { $('start').disabled = true;
 $('stop').onclick = async () => { $('stop').disabled = true;
   const r = await (await fetch('/stop')).json();
   $('msg').textContent = r.msg || ''; refresh(); };
+// two-tap confirm instead of confirm(): no browser dialog to be blocked or
+// dismissed, and easier to hit on a phone. Second tap must land within 5s.
+let offArmed = 0;
 async function poweroff(){
-  if(!confirm('Shut down Veery?\n\nWait for the lights to go out before unplugging.')) return;
-  $('off').disabled = true;
-  const r = await (await fetch('/poweroff')).json();
-  $('msg').textContent = r.msg || '';
-  if(r.ok){ document.body.innerHTML =
-    '<div class="wrap"><h1>&#9211; Shutting down\u2026</h1><div class="card">'
-    + 'Safe to unplug once the board\'s lights are off.</div></div>'; }
+  const b = $('off');
+  if(Date.now() - offArmed > 5000){
+    offArmed = Date.now();
+    b.textContent = 'Tap again to confirm shutdown';
+    b.style.background = '#b3271e';
+    setTimeout(() => { if(Date.now() - offArmed >= 5000){
+      b.innerHTML = '&#9211; Shut Down'; b.style.background = ''; } }, 5200);
+    return;
+  }
+  offArmed = 0; b.disabled = true; b.textContent = 'shutting down\u2026';
+  try{
+    const r = await (await fetch('/poweroff')).json();
+    if(r.ok){ document.body.innerHTML =
+      '<div class="wrap"><h1>&#9211; Shutting down\u2026</h1><div class="card">'
+      + 'Safe to unplug once the board\'s lights are off.</div></div>'; }
+    else { $('msg').textContent = r.msg || 'shutdown refused';
+           b.disabled = false; b.innerHTML = '&#9211; Shut Down'; b.style.background=''; }
+  }catch(e){
+    $('msg').textContent = 'shutdown request failed: ' + e;
+    b.disabled = false; b.innerHTML = '&#9211; Shut Down'; b.style.background='';
+  }
 }
 setInterval(refresh, 1500); refresh();
 </script></body></html>""".replace("%CSS%", CSS)
