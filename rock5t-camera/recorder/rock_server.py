@@ -389,6 +389,7 @@ CSS = """
  button { width:100%; padding:22px; font-size:1.3rem; font-weight:700; border:0;
           border-radius:12px; margin:8px 0; color:#fff; }
  #start { background:#1f8a3b; } #stop { background:#b3271e; }
+ #off { background:#444; font-size:1rem; padding:14px; }
  button:disabled { opacity:.35; }
  .btnlink { display:block; text-align:center; text-decoration:none; padding:18px;
             font-size:1.15rem; font-weight:700; border-radius:12px; margin:8px 0;
@@ -419,9 +420,9 @@ PAGE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Stereo Rig</title>
+<title>Veery</title>
 <style>%CSS%</style></head><body><div class="wrap">
- <h1>&#127909; Stereo Rig</h1>
+ <h1>&#127909; Veery</h1>
  <div class="card" style="padding:6px">
    <div class="cams">
      <figure><img id="p0" src="/preview0.mjpg" alt="cam0"><figcaption>cam0</figcaption></figure>
@@ -436,6 +437,7 @@ PAGE = """<!doctype html>
  <button id="start">&#9679; Start Recording</button>
  <button id="stop" disabled>&#9632; Stop Recording</button>
  <a id="manage" href="/files" class="btnlink">&#128193; Manage Files</a>
+ <button id="off" onclick="poweroff()">&#9211; Shut Down</button>
  <div class="muted" id="msg"></div>
 </div>
 <script>
@@ -459,6 +461,7 @@ async function refresh(){
     $('start').disabled = s.recording;
     $('stop').disabled = !s.recording;
     $('manage').classList.toggle('disabled', s.recording);
+    $('off').disabled = s.recording;
   }catch(e){ $('statetext').textContent = 'server unreachable'; }
 }
 $('start').onclick = async () => { $('start').disabled = true;
@@ -467,6 +470,15 @@ $('start').onclick = async () => { $('start').disabled = true;
 $('stop').onclick = async () => { $('stop').disabled = true;
   const r = await (await fetch('/stop')).json();
   $('msg').textContent = r.msg || ''; refresh(); };
+async function poweroff(){
+  if(!confirm('Shut down Veery?\n\nWait for the lights to go out before unplugging.')) return;
+  $('off').disabled = true;
+  const r = await (await fetch('/poweroff')).json();
+  $('msg').textContent = r.msg || '';
+  if(r.ok){ document.body.innerHTML =
+    '<div class="wrap"><h1>&#9211; Shutting down\u2026</h1><div class="card">'
+    + 'Safe to unplug once the board\'s lights are off.</div></div>'; }
+}
 setInterval(refresh, 1500); refresh();
 </script></body></html>""".replace("%CSS%", CSS)
 
@@ -620,6 +632,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/stop":
             with _state["lock"]:
                 self._json(stop_recording())
+        elif path == "/poweroff":
+            with _state["lock"]:
+                if _state["rec"]:
+                    self._json({"ok": False, "msg": "stop the recording first"})
+                else:
+                    stop_previews()
+                    sh("sync")
+                    # answer the browser before the box goes down
+                    subprocess.Popen("sleep 2; systemctl poweroff", shell=True,
+                                     start_new_session=True)
+                    self._json({"ok": True, "msg": "shutting down"})
         elif path == "/api/files":
             self._json({"takes": list_takes(), "storage": storage_info(),
                         "usb": usb_targets(), "usb_avail": usb_candidates(),
