@@ -1,15 +1,15 @@
 [Unit]
-# Web control panel for the ROCK 5T stereo recorder (previews + record button).
+# Web control panel for Veery, the ROCK 5T stereo camera (previews + record button).
 # Install:
-#   sudo cp ~/orin-recorder/rock5t-camera/recorder/rock-recorder.service \
+#   sudo cp ~/orin-recorder/rock5t-camera/recorder/veery.service \
 #           /etc/systemd/system/
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable --now rock-recorder
+#   sudo systemctl enable --now veery
 # Then it is up at http://<rock-ip>:8080 on every boot.
-# Logs:    journalctl -u rock-recorder -f
-# Manual:  sudo systemctl stop rock-recorder   (before running the script by hand,
+# Logs:    journalctl -u veery -f
+# Manual:  sudo systemctl stop veery   (before running the script by hand,
 #          or by-hand runs fail: only one process can hold a camera node)
-Description=ROCK 5T stereo recorder web panel
+Description=Veery stereo camera - web control panel
 Documentation=file:///home/radxa/orin-recorder/ROCK5T_CAMERA.md
 # rkaiq_3A drives the ISP's exposure/colour; without it frames are unusable
 After=network-online.target rkaiq_3A.service
@@ -22,7 +22,7 @@ Type=simple
 # login and is reachable by anyone on the network it is attached to, so put a
 # password on the field hotspot (see ROCK5T_CAMERA.md).
 WorkingDirectory=/home/radxa/orin-recorder
-ExecStart=/usr/bin/python3 /home/radxa/orin-recorder/rock5t-camera/recorder/rock_server.py
+ExecStart=/usr/bin/python3 /home/radxa/orin-recorder/rock5t-camera/recorder/veery_server.py
 # the camera pipeline settles a few seconds after the sensors probe (~12s);
 # starting into a half-ready pipeline just makes the first previews fail
 ExecStartPre=/bin/sleep 8

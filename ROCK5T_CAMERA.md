@@ -285,7 +285,7 @@ as preview.sh; add selfpath selection reset to record_dual.sh.
   Board: charuco_board.png on a TV, 78mm squares (measured on glass).
   **Never touch the focus rings or reseat a lens** without recalibrating
   that camera.
-- **calib_server.py / rock_server.py**: browser panels (8081 calibration,
+- **calib_server.py / veery_server.py**: browser panels (8081 calibration,
   8080 recorder). Rules baked in: previews run CONTINUOUSLY on the selfpath
   and are never stopped/restarted (a camera switcher that restarted
   pipelines caused a lockup), snapshots/records come off the mainpath so
