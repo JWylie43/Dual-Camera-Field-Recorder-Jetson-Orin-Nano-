@@ -488,7 +488,7 @@ async function poweroff(){
     const r = await (await fetch('/poweroff')).json();
     if(r.ok){ document.body.innerHTML =
       '<div class="wrap"><h1>&#9211; Shutting down\u2026</h1><div class="card">'
-      + 'Safe to unplug once the board\'s lights are off.</div></div>'; }
+      + 'Safe to unplug once the lights on the board go out.</div></div>'; }
     else { $('msg').textContent = r.msg || 'shutdown refused';
            b.disabled = false; b.innerHTML = '&#9211; Shut Down'; b.style.background=''; }
   }catch(e){
@@ -755,3 +755,20 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# --- development note ------------------------------------------------------
+# The page scripts are plain strings, so a stray quote silently kills the WHOLE
+# <script> block (symptom: buttons do nothing, status never updates, console
+# says "Can't find variable: <handler>"). An apostrophe in "board's" cost an
+# hour once. After editing PAGE/FILES_PAGE, check them:
+#
+#   python3 - <<'EOF'
+#   import re; src=open('veery_server.py').read(); ns={}
+#   for pat in (r'^CSS = """.*?"""', r'^PAGE = """.*?"""\.replace\("%CSS%", CSS\)',
+#               r'^FILES_PAGE = """.*?"""\.replace\("%CSS%", CSS\)'):
+#       exec(re.search(pat, src, re.S|re.M).group(0), ns)
+#   for name in ('PAGE','FILES_PAGE'):
+#       open(f'/tmp/{name}.js','w').write(ns[name].split('<script>')[1].split('</script>')[0])
+#   EOF
+#   node --check /tmp/PAGE.js && node --check /tmp/FILES_PAGE.js
