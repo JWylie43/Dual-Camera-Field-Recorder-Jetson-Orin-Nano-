@@ -686,11 +686,15 @@ static string devNull() {
 #endif
 }
 static bool ffmpegAvailable() { return runShell("ffmpeg -version " + devNull()) == 0; }
-static bool encoderInitializes(const string &name)
+static bool encoderInitializes(const string &name, int w = 64, int h = 64)
 {
-    // one-frame null encode; nonzero exit => encoder missing or can't init here
+    // One-frame null encode AT THE REAL OUTPUT SIZE: hardware encoders have
+    // dimension limits (h264_videotoolbox refuses beyond ~4096 wide), and this
+    // rig's panorama is ~6774 wide. Probing at 64x64 approved an encoder that
+    // then died on the first real frame. Found 2026-09-19.
     return runShell("ffmpeg -hide_banner -loglevel error -f lavfi "
-                    "-i color=c=black:s=64x64:r=30 -frames:v 1 -an -c:v " + name +
+                    "-i color=c=black:s=" + to_string(w) + "x" + to_string(h) +
+                    ":r=30 -frames:v 1 -an -c:v " + name +
                     " -f null - " + devNull()) == 0;
 }
 
@@ -701,17 +705,28 @@ static bool encoderInitializes(const string &name)
 //   3. software libx264
 // Nothing is hardcoded to a particular GPU - candidates are probed at runtime, so this
 // works on any machine and quietly degrades to CPU when no hardware encoder is usable.
-static string chooseVideoEncoder()
+static string chooseVideoEncoder(int w = 64, int h = 64)
 {
     if (!g_vencExplicit.empty()) return g_vencExplicit;
     if (g_forceCpu) return "libx264";
     vector<string> cands =
 #ifdef __APPLE__
-        {"h264_videotoolbox"};
+        // HEVC handles far larger frames than H.264 on VideoToolbox, so it is the
+        // fallback before giving up on hardware entirely for a wide panorama.
+        {"h264_videotoolbox", "hevc_videotoolbox"};
 #else
-        {"h264_nvenc", "h264_amf", "h264_qsv"};
+        {"h264_nvenc", "h264_amf", "h264_qsv", "hevc_nvenc", "hevc_amf", "hevc_qsv"};
 #endif
-    for (const auto &c : cands) if (encoderInitializes(c)) return c;
+    for (const auto &c : cands)
+        if (encoderInitializes(c, w, h))
+        {
+            if (c.rfind("hevc", 0) == 0)
+                cout << "note: " << w << "x" << h << " is too large for this machine's "
+                     << "H.264 hardware encoder - using " << c << " (H.265)\n";
+            return c;
+        }
+    cout << "note: no hardware encoder accepts " << w << "x" << h
+         << " - falling back to libx264 (CPU, slower)\n";
     return "libx264";
 }
 
@@ -754,7 +769,7 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
     // is already required for the default --jobs concat and audio-attach. If it isn't
     // on PATH we fall back to OpenCV's own H.264 writer (avc1) so a bare install still
     // stitches - on macOS that path is itself VideoToolbox-backed.
-    string venc = chooseVideoEncoder();
+    string venc = chooseVideoEncoder(m.OW, m.OH);
     bool useFfmpeg = ffmpegAvailable();
     FILE *pipe = nullptr;
     VideoWriter writer;
@@ -1250,7 +1265,8 @@ static string buildCliCommand(const string &source, const string &calibDir,
 static int runParallelJobs(const string &source, const string &calibDir,
                            double degrees, int seamArg, const Align &a,
                            const string &cropArg, int startFrame, int endFrame,
-                           const string &outFile, int jobs, std::atomic<int> *prog = nullptr);
+                           const string &outFile, int jobs, std::atomic<int> *prog = nullptr,
+                           int panoW = 64, int panoH = 64);
 // Forward decl: after a video stitch, optionally mux the recording's audio in.
 static string attachAudioToStitch(const string &stitchedOut, const string &source,
                                   const string &explicitSidecar);
@@ -1441,7 +1457,8 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                     {
                         string fo = of.empty() ? (outDir + "/stitched_video.mp4") : of;
                         int rc = runParallelJobs(src, calib, dg, seamVal, a, cropStr,
-                                                 startFrame, endRes, fo, jobs, &g_percent);
+                                                 startFrame, endRes, fo, jobs, &g_percent,
+                                                 mm.OW, mm.OH);
                         res = rc == 0 ? fo : string("ERROR: parallel stitch failed (see console)");
                     }
                     else                                           // single-process (image, or --no-jobs)
@@ -1860,7 +1877,8 @@ static string attachAudioToStitch(const string &stitchedOut, const string &sourc
 static int runParallelJobs(const string &source, const string &calibDir,
                            double degrees, int seamArg, const Align &a,
                            const string &cropArg, int startFrame, int endFrame,
-                           const string &outFile, int jobs, std::atomic<int> *prog)
+                           const string &outFile, int jobs, std::atomic<int> *prog,
+                           int panoW, int panoH)
 {
     auto q = [](const string &s) { return "\"" + s + "\""; };   // quote for the shell
 
@@ -1873,7 +1891,7 @@ static int runParallelJobs(const string &source, const string &calibDir,
 
     // Resolve the encoder ONCE in the parent and pin it for every child via --venc, so
     // all parts share identical codec params (required for the lossless -c copy concat).
-    string resolvedEnc = chooseVideoEncoder();
+    string resolvedEnc = chooseVideoEncoder(panoW, panoH);
     cout << "jobs: encoder " << resolvedEnc << " @ " << g_vbitrate << " for all parts\n";
 
     fs::path op(outFile);
@@ -2099,8 +2117,13 @@ int main(int argc, char **argv)
         int endResolved = endFrame >= 0 ? endFrame : (totalFrames > 0 ? totalFrames - 1 : -1);
         if (endResolved >= startFrame)
         {
+            // size the panorama up front: the parent resolves ONE encoder for all
+            // children, and that choice depends on the output dimensions
+            StitchMaps pm = buildStitchMaps(KL, DL, KR, DR, R,
+                                            frame.cols / 2, frame.rows, seamArg);
             int rc = runParallelJobs(source, calibDir, degrees, seamArg, a, cropArg,
-                                     startFrame, endResolved, finalOut, jobs);
+                                     startFrame, endResolved, finalOut, jobs, nullptr,
+                                     pm.OW, pm.OH);
             if (rc == 0 && wantAudio) attachAudioToStitch(finalOut, source, audioFile);
             return rc;
         }
