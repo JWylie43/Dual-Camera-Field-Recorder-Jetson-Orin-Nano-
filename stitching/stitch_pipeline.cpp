@@ -331,7 +331,8 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
              << std::fixed << std::setprecision(2) << (4096.0 / m.OW)
              << std::defaultfloat << " keeps the full field of view at "
              << (int)(m.OW * (4096.0 / m.OW)) << "x" << (int)(m.OH * (4096.0 / m.OW))
-             << " and re-enables H.264.\n";
+             << " and re-enables H.264. (So does a --crop under 4096 wide - the crop is\n"
+             << "  applied before the encoder is chosen, so it counts against the limit.)\n";
     return m;
 }
 
@@ -2246,9 +2247,19 @@ int main(int argc, char **argv)
         if (endResolved >= startFrame)
         {
             // size the panorama up front: the parent resolves ONE encoder for all
-            // children, and that choice depends on the output dimensions
+            // children, and that choice depends on the output dimensions.
+            // The crop must be applied FIRST - the children each encode the cropped
+            // frame, so sizing the encoder on the full canvas picked HEVC for outputs
+            // that were comfortably inside H.264's 4096 limit once cropped.
             StitchMaps pm = buildStitchMaps(KL, DL, KR, DR, R,
                                             frame.cols / 2, frame.rows, seamArg);
+            if (!cropArg.empty())
+            {
+                int cx = 0, cy = 0, cw = 0, ch = 0;
+                if (sscanf(cropArg.c_str(), "%d,%d,%d,%d", &cx, &cy, &cw, &ch) == 4
+                    && cw > 0 && ch > 0)
+                    pm = cropMaps(pm, cx, cy, cw, ch);
+            }
             int rc = runParallelJobs(source, calibDir, degrees, seamArg, a, cropArg,
                                      startFrame, endResolved, finalOut, jobs, nullptr,
                                      pm.OW, pm.OH);
